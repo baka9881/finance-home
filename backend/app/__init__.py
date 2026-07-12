@@ -1,0 +1,2 @@
+"""Personal finance application backend."""
+

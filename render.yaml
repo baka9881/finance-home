@@ -1,0 +1,22 @@
+services:
+  - type: web
+    name: finance-home-api
+    runtime: python
+    plan: free
+    rootDir: backend
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn app.main:app --host 0.0.0.0 --port $PORT
+    healthCheckPath: /api/health
+    envVars:
+      - key: PYTHON_VERSION
+        value: 3.11.11
+      - key: APP_MODE
+        value: personal
+      - key: FINANCE_DB_URL
+        sync: false
+      - key: FINANCE_APP_PASSWORD
+        sync: false
+      - key: FINANCE_AUTH_SECRET
+        generateValue: true
+      - key: FINANCE_ALLOWED_ORIGINS
+        sync: false
