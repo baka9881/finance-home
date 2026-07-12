@@ -124,7 +124,10 @@ export default function InvestmentsPage() {
     queryKey: ["positions", ownerFilter],
     queryFn: () => api<Position[]>(`/positions?owner=${ownerFilter}`),
   });
-  const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => api<Account[]>("/accounts") });
+  const accounts = useQuery({
+    queryKey: ["accounts", ownerFilter],
+    queryFn: () => api<Account[]>(`/accounts?owner=${ownerFilter}`),
+  });
 
   const createTrade = useMutation({
     mutationFn: (payload: Record<string, unknown>) =>

@@ -37,7 +37,10 @@ function componentValue(key: string, value: number | null) {
 
 export default function AnalysisPage() {
   const health = useQuery({ queryKey: ["health"], queryFn: () => api<HealthScore>("/analysis/health") });
-  const dashboard = useQuery({ queryKey: ["dashboard"], queryFn: () => api<Dashboard>("/dashboard") });
+  const dashboard = useQuery({
+    queryKey: ["dashboard", "all"],
+    queryFn: () => api<Dashboard>("/dashboard?owner=all"),
+  });
 
   const data = health.data;
   const tone = scoreTone(data?.score ?? null);

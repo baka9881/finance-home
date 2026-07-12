@@ -15,7 +15,9 @@ import {
   X,
 } from "lucide-react";
 import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
 import { api, AUTH_REQUIRED, clearAuthToken, getAuthToken, setAuthToken } from "./api";
+import { prefetchPrimaryData, prefetchSecondaryData, preloadPageModules } from "./appQueries";
 import { ownerFilterOptions, useOwnerFilter } from "./ownerFilter";
 import { Button, cn, Input, Select } from "./ui";
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
@@ -241,7 +243,27 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
 function FinanceApp() {
   const [compact, setCompact] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
+  const [ownerFilter] = useOwnerFilter();
+  const queryClient = useQueryClient();
   const showGlobalOwnerFilter = useShowGlobalOwnerFilter();
+
+  useEffect(() => {
+    const moduleTimer = window.setTimeout(() => {
+      void preloadPageModules();
+    }, 100);
+    const primaryTimer = window.setTimeout(() => {
+      void prefetchPrimaryData(queryClient, ownerFilter);
+    }, 250);
+    const secondaryTimer = window.setTimeout(() => {
+      void prefetchSecondaryData(queryClient);
+    }, 1_500);
+
+    return () => {
+      window.clearTimeout(moduleTimer);
+      window.clearTimeout(primaryTimer);
+      window.clearTimeout(secondaryTimer);
+    };
+  }, [ownerFilter, queryClient]);
 
   return (
     <div className="min-h-screen bg-canvas">

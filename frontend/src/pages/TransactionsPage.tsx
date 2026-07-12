@@ -81,7 +81,10 @@ export default function TransactionsPage() {
   const [mapping, setMapping] = useState<Record<string, string>>({});
   const [importResult, setImportResult] = useState<Record<string, unknown> | null>(null);
 
-  const accounts = useQuery({ queryKey: ["accounts"], queryFn: () => api<Account[]>("/accounts") });
+  const accounts = useQuery({
+    queryKey: ["accounts", ownerFilter],
+    queryFn: () => api<Account[]>(`/accounts?owner=${ownerFilter}`),
+  });
   const categories = useQuery({ queryKey: ["categories"], queryFn: () => api<Category[]>("/categories") });
   const transactions = useQuery({
     queryKey: ["transactions", month, accountFilter, ownerFilter],
