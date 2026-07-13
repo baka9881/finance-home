@@ -1,4 +1,4 @@
-import { FormEvent, useState } from "react";
+import { FormEvent, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Banknote,
@@ -26,8 +26,12 @@ import {
   FormContext,
   FormStep,
   Input,
+  MobileWizardActions,
+  MobileWizardProgress,
+  MobileWizardStep,
   PageHeader,
   Select,
+  validateWizardStep,
   money,
 } from "../ui";
 
@@ -156,6 +160,8 @@ export default function AccountsPage() {
   const [customInstitution, setCustomInstitution] = useState("");
   const [accountName, setAccountName] = useState("");
   const [useCustomAccountName, setUseCustomAccountName] = useState(false);
+  const [accountStep, setAccountStep] = useState(1);
+  const accountFormRef = useRef<HTMLFormElement>(null);
 
   const selectedInstitution =
     institutionChoice === customInstitutionValue ? customInstitution.trim() : institutionChoice;
@@ -176,7 +182,13 @@ export default function AccountsPage() {
 
   function openCreateDialog() {
     resetAccountDraft();
+    setAccountStep(1);
     setCreateOpen(true);
+  }
+
+  function closeCreateDialog() {
+    setCreateOpen(false);
+    setAccountStep(1);
   }
 
   function shouldReplaceDraftName() {
@@ -382,13 +394,15 @@ export default function AccountsPage() {
 
       <Dialog
         open={createOpen}
-        onClose={() => setCreateOpen(false)}
+        onClose={closeCreateDialog}
         title="新增帳戶"
         description="帳戶餘額和交易明細分開記錄。"
         size="lg"
       >
-        <form className="space-y-5" onSubmit={submitAccount}>
+        <form ref={accountFormRef} className="space-y-5" onSubmit={submitAccount}>
           <FormContext value="建立新的財務帳戶" />
+          <MobileWizardProgress current={accountStep} labels={["帳戶資料", "帳戶分類", "餘額與所有人"]} />
+          <MobileWizardStep step={1} current={accountStep}>
           <FormStep number={1} title="這是什麼帳戶？" description="先選常用名稱與金融機構，清單沒有也可以自訂。">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="帳戶名稱" hint="清單沒有的話選「其他 / 自訂」。">
@@ -441,6 +455,8 @@ export default function AccountsPage() {
             </Field>
           </div>
           </FormStep>
+          </MobileWizardStep>
+          <MobileWizardStep step={2} current={accountStep}>
           <FormStep number={2} title="這個帳戶怎麼分類？" tone="blue">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="帳戶類型">
@@ -464,6 +480,8 @@ export default function AccountsPage() {
             </Field>
           </div>
           </FormStep>
+          </MobileWizardStep>
+          <MobileWizardStep step={3} current={accountStep}>
           <FormStep number={3} title="目前有多少錢？" description="這會成為第一筆餘額快照。" tone="purple">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="幣別">
@@ -474,7 +492,7 @@ export default function AccountsPage() {
               </Select>
             </Field>
             <Field label="目前餘額">
-              <Input name="opening_balance" type="number" step="any" placeholder="0" />
+              <Input name="opening_balance" type="number" inputMode="decimal" step="any" placeholder="0" />
             </Field>
           </div>
           <Field label="餘額日期">
@@ -490,6 +508,8 @@ export default function AccountsPage() {
             </Select>
           </Field>
           </FormStep>
+          </MobileWizardStep>
+          <MobileWizardStep step={3} current={accountStep}>
           <details className="rounded-2xl border border-slate-200 px-4 py-3">
             <summary className="cursor-pointer list-none text-sm font-medium text-slate-600">其他設定（流動資產、持倉計算）</summary>
             <div className="mt-4 space-y-3">
@@ -511,17 +531,23 @@ export default function AccountsPage() {
               )}
             </div>
           </details>
+          </MobileWizardStep>
           {createAccount.isError && (
             <p className="text-sm text-red-600">{(createAccount.error as Error).message}</p>
           )}
-          <div className="flex justify-end gap-3 pt-2">
-            <Button type="button" variant="ghost" onClick={() => setCreateOpen(false)}>
-              取消
-            </Button>
-            <Button type="submit" disabled={createAccount.isPending}>
-              {createAccount.isPending ? "建立中…" : "建立帳戶"}
-            </Button>
-          </div>
+          <MobileWizardActions
+            current={accountStep}
+            total={3}
+            onPrevious={() => setAccountStep((step) => Math.max(1, step - 1))}
+            onNext={() => {
+              if (validateWizardStep(accountFormRef.current, accountStep)) {
+                setAccountStep((step) => Math.min(3, step + 1));
+              }
+            }}
+            onCancel={closeCreateDialog}
+            submitLabel={createAccount.isPending ? "建立中…" : "建立帳戶"}
+            pending={createAccount.isPending}
+          />
         </form>
       </Dialog>
 

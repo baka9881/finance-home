@@ -1,7 +1,8 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bitcoin,
+  ChevronDown,
   Clock3,
   LineChart,
   Plus,
@@ -23,10 +24,14 @@ import {
   FormContext,
   FormStep,
   Input,
+  MobileWizardActions,
+  MobileWizardProgress,
+  MobileWizardStep,
   PageHeader,
   Select,
   money,
   number,
+  validateWizardStep,
 } from "../ui";
 
 const markets = [
@@ -119,6 +124,8 @@ export default function InvestmentsPage() {
   const [tradeQuantity, setTradeQuantity] = useState("");
   const [tradeTotalAmount, setTradeTotalAmount] = useState("");
   const [refreshMessage, setRefreshMessage] = useState("");
+  const [tradeStep, setTradeStep] = useState(1);
+  const tradeFormRef = useRef<HTMLFormElement>(null);
 
   const positions = useQuery({
     queryKey: ["positions", ownerFilter],
@@ -301,7 +308,13 @@ export default function InvestmentsPage() {
     const initialAccount =
       investmentAccounts.find((account) => account.id === firstPosition?.account_id) || investmentAccounts[0];
     resetTradeDraft(initialAccount, firstPosition);
+    setTradeStep(1);
     setCreateOpen(true);
+  }
+
+  function closeTradeDialog() {
+    setCreateOpen(false);
+    setTradeStep(1);
   }
 
   function changeMarket(nextMarket: string) {
@@ -412,7 +425,72 @@ export default function InvestmentsPage() {
             action={<Button onClick={() => openTradeDialog("buy")}>買入第一筆</Button>}
           />
         ) : (
-          <div className="overflow-x-auto">
+          <>
+          <div className="divide-y divide-slate-100 md:hidden">
+            {positions.data.map((position) => (
+              <details key={position.id} className="group px-4 py-4">
+                <summary className="cursor-pointer list-none">
+                  <div className="flex items-start gap-3">
+                    <div className={`grid size-11 shrink-0 place-items-center rounded-xl ${position.market === "CRYPTO" ? "bg-amber-50 text-amber-600" : "bg-blue-50 text-blue-700"}`}>
+                      {position.market === "CRYPTO" ? <Bitcoin size={19} /> : <LineChart size={19} />}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate font-semibold text-slate-800">{position.symbol}</p>
+                          <p className="mt-0.5 truncate text-xs text-slate-400">{position.name || position.market}</p>
+                        </div>
+                        <div className="shrink-0 text-right">
+                          <p className="font-bold text-slate-800">{money(position.market_value_twd)}</p>
+                          <p className={`mt-0.5 text-xs font-semibold ${position.profit_twd >= 0 ? "text-emerald-700" : "text-red-600"}`}>
+                            {position.profit_twd >= 0 ? "+" : ""}{money(position.profit_twd)} · {number(position.profit_pct || 0, 2)}%
+                          </p>
+                        </div>
+                      </div>
+                      <div className="mt-3 flex items-center justify-between gap-3 text-xs text-slate-500">
+                        <span>持有 {number(position.quantity, 8)}</span>
+                        <span className="flex items-center gap-1">查看細項 <ChevronDown size={14} className="transition group-open:rotate-180" /></span>
+                      </div>
+                    </div>
+                  </div>
+                </summary>
+                <div className="mt-4 grid grid-cols-2 gap-3 border-t border-slate-100 pt-4 text-sm">
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <p className="text-xs text-slate-400">目前價格</p>
+                    <p className="mt-1 font-semibold text-slate-800">{money(position.price, position.currency)}</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <p className="text-xs text-slate-400">平均成本</p>
+                    <p className="mt-1 font-semibold text-slate-800">{money(position.average_cost, position.currency)}</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <p className="text-xs text-slate-400">持倉帳戶</p>
+                    <p className="mt-1 font-medium text-slate-700">{position.account_name}（{position.owner_label}）</p>
+                  </div>
+                  <div className="rounded-xl bg-slate-50 p-3">
+                    <p className="text-xs text-slate-400">資料狀態</p>
+                    <div className="mt-1"><Badge tone={position.stale ? "amber" : "green"}>{position.price_source}</Badge></div>
+                    <p className="mt-1 text-xs text-slate-400">{position.price_date || "尚無行情"}</p>
+                  </div>
+                  <div className="col-span-2 flex justify-end">
+                    <Button
+                      variant="danger"
+                      className="h-11"
+                      onClick={() => {
+                        if (window.confirm(`確定刪除 ${position.symbol}？這會從持倉列表移除。`)) {
+                          deletePosition.mutate(position.id);
+                        }
+                      }}
+                      disabled={deletePosition.isPending}
+                    >
+                      <Trash2 size={15} /> 刪除持倉
+                    </Button>
+                  </div>
+                </div>
+              </details>
+            ))}
+          </div>
+          <div className="hidden overflow-x-auto md:block">
             <table className="w-full min-w-[900px]">
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/80 text-left text-xs font-semibold uppercase tracking-wider text-slate-400">
@@ -489,16 +567,17 @@ export default function InvestmentsPage() {
               </tbody>
             </table>
           </div>
+          </>
         )}
       </Card>
 
       <Dialog
         open={createOpen}
-        onClose={() => setCreateOpen(false)}
+        onClose={closeTradeDialog}
         title={tradeSide === "buy" ? "買入投資" : "賣出投資"}
         description="依照三個步驟填寫，儲存前可以先確認帳戶與持倉會怎麼變化。"
       >
-        <form className="space-y-4" onSubmit={submitTrade}>
+        <form ref={tradeFormRef} className="space-y-4" onSubmit={submitTrade}>
           {investmentAccounts.length === 0 && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
               請先到「帳戶」建立證券或加密貨幣帳戶。
@@ -513,6 +592,9 @@ export default function InvestmentsPage() {
             )}
           />
 
+          <MobileWizardProgress current={tradeStep} labels={["選擇標的", "交易金額", "帳戶與確認"]} />
+
+          <MobileWizardStep step={1} current={tradeStep}>
           <FormStep number={1} title={tradeSide === "buy" ? "要買什麼？" : "要賣哪一筆？"}>
             {tradeSide === "buy" ? (
               <>
@@ -567,7 +649,9 @@ export default function InvestmentsPage() {
               </Field>
             )}
           </FormStep>
+          </MobileWizardStep>
 
+          <MobileWizardStep step={2} current={tradeStep}>
           <FormStep number={2} title="這次交易多少？" tone="blue">
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label={tradeSide === "buy" ? "買入數量" : "賣出數量"}>
@@ -579,9 +663,10 @@ export default function InvestmentsPage() {
                   max={tradeSide === "sell" ? selectedSellPosition?.quantity : undefined}
                   value={tradeQuantity}
                   onChange={(event) => setTradeQuantity(event.target.value)}
+                  inputMode="decimal"
                   placeholder="0"
                   required
-                  autoFocus
+                  autoFocus={tradeStep === 2}
                 />
               </Field>
               <Field label="成交總額" hint={tradeSide === "buy" ? "這次總共付多少" : "這次總共拿回多少"}>
@@ -596,6 +681,7 @@ export default function InvestmentsPage() {
                     min="0"
                     value={tradeTotalAmount}
                     onChange={(event) => setTradeTotalAmount(event.target.value)}
+                    inputMode="decimal"
                     placeholder="0"
                     required
                   />
@@ -606,7 +692,9 @@ export default function InvestmentsPage() {
               <p className="text-xs text-slate-500">推算成交單價：{money(estimatedUnitPrice, selectedCurrency)}</p>
             )}
           </FormStep>
+          </MobileWizardStep>
 
+          <MobileWizardStep step={3} current={tradeStep}>
           <FormStep number={3} title="錢和持倉放哪裡？" tone="purple">
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label={tradeSide === "buy" ? "從哪個帳戶扣款" : "賣出的錢進哪個帳戶"}>
@@ -669,10 +757,20 @@ export default function InvestmentsPage() {
             </div>
           )}
           {createTrade.isError && <p className="text-sm text-red-600">{(createTrade.error as Error).message}</p>}
-          <div className="flex justify-end gap-3">
-            <Button type="button" variant="ghost" onClick={() => setCreateOpen(false)}>取消</Button>
-            <Button type="submit" disabled={submitDisabled}>{submitButtonText}</Button>
-          </div>
+          </MobileWizardStep>
+          <MobileWizardActions
+            current={tradeStep}
+            total={3}
+            onPrevious={() => setTradeStep((step) => Math.max(1, step - 1))}
+            onNext={() => {
+              if (validateWizardStep(tradeFormRef.current, tradeStep)) {
+                setTradeStep((step) => Math.min(3, step + 1));
+              }
+            }}
+            onCancel={closeTradeDialog}
+            submitLabel={submitButtonText}
+            pending={submitDisabled}
+          />
         </form>
       </Dialog>
     </>

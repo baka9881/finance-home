@@ -131,7 +131,7 @@ export default function AnalysisPage() {
                     <CartesianGrid vertical={false} stroke="#e8eeeb" strokeDasharray="4 4" />
                     <XAxis dataKey="month" tickLine={false} axisLine={false} />
                     <YAxis width={70} tickLine={false} axisLine={false} tickFormatter={(value) => `${value / 1000}k`} />
-                    <Tooltip formatter={(value) => money(Number(value))} cursor={{ fill: "#f4f8f6" }} />
+                    <Tooltip formatter={(value) => money(Number(value))} cursor={{ fill: "rgba(35, 132, 95, .08)" }} />
                     <Bar dataKey="income" name="收入" fill="#23845f" radius={[5, 5, 0, 0]} maxBarSize={34} />
                     <Bar dataKey="expense" name="支出" fill="#f1a15b" radius={[5, 5, 0, 0]} maxBarSize={34} />
                   </BarChart>

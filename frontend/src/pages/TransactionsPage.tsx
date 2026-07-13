@@ -1,10 +1,11 @@
-import { FormEvent, type ReactNode, useEffect, useMemo, useState } from "react";
+import { FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   ArrowDownLeft,
   ArrowRightLeft,
   ArrowUpRight,
   Check,
+  ChevronDown,
   FileSpreadsheet,
   Link2,
   Plus,
@@ -25,9 +26,13 @@ import {
   FormContext,
   FormStep,
   Input,
+  MobileWizardActions,
+  MobileWizardProgress,
+  MobileWizardStep,
   PageHeader,
   Select,
   money,
+  validateWizardStep,
 } from "../ui";
 
 interface TransferSuggestion {
@@ -80,6 +85,10 @@ export default function TransactionsPage() {
   const [inspection, setInspection] = useState<CsvInspection | null>(null);
   const [mapping, setMapping] = useState<Record<string, string>>({});
   const [importResult, setImportResult] = useState<Record<string, unknown> | null>(null);
+  const [manualStep, setManualStep] = useState(1);
+  const [accountTransferStep, setAccountTransferStep] = useState(1);
+  const manualFormRef = useRef<HTMLFormElement>(null);
+  const accountTransferFormRef = useRef<HTMLFormElement>(null);
 
   const accounts = useQuery({
     queryKey: ["accounts", ownerFilter],
@@ -261,6 +270,7 @@ export default function TransactionsPage() {
     setLoanAccountId("");
     createTransaction.reset();
     createLoanPayment.reset();
+    setManualStep(1);
     setManualOpen(true);
   }
 
@@ -271,17 +281,28 @@ export default function TransactionsPage() {
     setLoanAccountId("");
     createTransaction.reset();
     createLoanPayment.reset();
+    setManualStep(1);
   }
 
   function chooseManualScenario(scenario: ManualScenario) {
     if (scenario === "transfer") {
       closeManualDialog();
+      setAccountTransferStep(1);
       setAccountTransferOpen(true);
       return;
     }
+    setManualStep(1);
     setManualScenario(scenario);
     setManualKind(scenario);
     setLoanAccountId("");
+  }
+
+  function closeAccountTransferDialog() {
+    setAccountTransferOpen(false);
+    setAccountTransferStep(1);
+    setTransferFromAccountId("");
+    setTransferToAccountId("");
+    createAccountTransfer.reset();
   }
 
   function submitManual(event: FormEvent<HTMLFormElement>) {
@@ -397,7 +418,96 @@ export default function TransactionsPage() {
             action={<Button onClick={() => setImportOpen(true)}>匯入交易</Button>}
           />
         ) : (
-          <div className="overflow-x-auto">
+          <>
+          <div className="divide-y divide-slate-100 md:hidden">
+            {filteredTransactions.map((transaction) => (
+              <details key={transaction.id} className="group px-4 py-4">
+                <summary className="cursor-pointer list-none">
+                  <div className="flex items-start gap-3">
+                    <div
+                      className={`grid size-11 shrink-0 place-items-center rounded-xl ${
+                        transaction.base_amount >= 0
+                          ? "bg-emerald-50 text-emerald-700"
+                          : "bg-orange-50 text-orange-700"
+                      }`}
+                    >
+                      {transaction.base_amount >= 0 ? <ArrowDownLeft size={18} /> : <ArrowUpRight size={18} />}
+                    </div>
+                    <div className="min-w-0 flex-1">
+                      <div className="flex items-start justify-between gap-3">
+                        <div className="min-w-0">
+                          <p className="truncate font-semibold text-slate-800">{transaction.description}</p>
+                          <p className="mt-0.5 truncate text-xs text-slate-400">{transaction.account_name}</p>
+                        </div>
+                        <p className={`shrink-0 font-bold ${transaction.base_amount >= 0 ? "text-emerald-700" : "text-slate-800"}`}>
+                          {transaction.base_amount >= 0 ? "+" : "−"}{money(Math.abs(transaction.base_amount))}
+                        </p>
+                      </div>
+                      <div className="mt-3 flex items-center justify-between gap-3 text-xs text-slate-500">
+                        <span>{transaction.transaction_date} · {kindLabels[transaction.transaction_kind] || transaction.transaction_kind}</span>
+                        <span className="flex items-center gap-1">查看細項 <ChevronDown size={14} className="transition group-open:rotate-180" /></span>
+                      </div>
+                    </div>
+                  </div>
+                </summary>
+                <div className="mt-4 space-y-3 border-t border-slate-100 pt-4">
+                  <div className="grid grid-cols-2 gap-3 text-sm">
+                    <div className="rounded-xl bg-slate-50 p-3">
+                      <p className="text-xs text-slate-400">來源</p>
+                      <p className="mt-1 font-medium text-slate-700">{transaction.source === "csv" ? "CSV 匯入" : "手動新增"}</p>
+                    </div>
+                    <div className="rounded-xl bg-slate-50 p-3">
+                      <p className="text-xs text-slate-400">類型</p>
+                      <div className="mt-1">
+                        <Badge tone={transaction.transaction_kind === "transfer" ? "blue" : transaction.base_amount >= 0 ? "green" : "slate"}>
+                          {kindLabels[transaction.transaction_kind] || transaction.transaction_kind}
+                        </Badge>
+                      </div>
+                    </div>
+                  </div>
+                  <Field label="分類">
+                    <Select
+                      className="h-11"
+                      value={transaction.category_id || ""}
+                      onChange={(event) =>
+                        updateTransaction.mutate({
+                          id: transaction.id,
+                          payload: { category_id: Number(event.target.value) },
+                        })
+                      }
+                    >
+                      {categories.data?.map((category) => (
+                        <option key={category.id} value={category.id}>{category.name}</option>
+                      ))}
+                    </Select>
+                  </Field>
+                  {transaction.currency !== "TWD" && (
+                    <p className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-500">
+                      原幣金額：{money(Math.abs(transaction.amount), transaction.currency)}
+                      {transaction.fx_estimated ? " · 使用估算匯率" : ""}
+                    </p>
+                  )}
+                  {transaction.source === "manual" && (
+                    <div className="flex justify-end">
+                      <Button
+                        variant="danger"
+                        className="h-11"
+                        disabled={deleteTransaction.isPending}
+                        onClick={() => {
+                          if (window.confirm("確定要刪除這筆交易嗎？帳戶餘額會同步調整回去。")) {
+                            deleteTransaction.mutate(transaction.id);
+                          }
+                        }}
+                      >
+                        <Trash2 size={15} /> 刪除交易
+                      </Button>
+                    </div>
+                  )}
+                </div>
+              </details>
+            ))}
+          </div>
+          <div className="hidden overflow-x-auto md:block">
             <table className="w-full min-w-[850px]">
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/80 text-left text-xs font-semibold uppercase tracking-wider text-slate-400">
@@ -486,6 +596,7 @@ export default function TransactionsPage() {
               </tbody>
             </table>
           </div>
+          </>
         )}
       </Card>
 
@@ -533,7 +644,7 @@ export default function TransactionsPage() {
             </p>
           </div>
         ) : (
-          <form className="space-y-5" onSubmit={submitManual}>
+          <form ref={manualFormRef} className="space-y-5" onSubmit={submitManual}>
             <input type="hidden" name="transaction_kind" value={manualKind} />
             <FormContext
               label="目前情境"
@@ -547,6 +658,7 @@ export default function TransactionsPage() {
                     setManualScenario(null);
                     setManualKind("expense");
                     setLoanAccountId("");
+                    setManualStep(1);
                   }}
                 >
                   重選
@@ -554,6 +666,9 @@ export default function TransactionsPage() {
               )}
             />
 
+            <MobileWizardProgress current={manualStep} labels={["帳戶與日期", "交易摘要", "金額與確認"]} />
+
+            <MobileWizardStep step={1} current={manualStep}>
             <FormStep number={1} title="使用哪個帳戶？">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label={manualKind === "income" ? "入帳帳戶" : "付款帳戶"}>
@@ -569,7 +684,9 @@ export default function TransactionsPage() {
                 </Field>
               </div>
             </FormStep>
+            </MobileWizardStep>
 
+            <MobileWizardStep step={2} current={manualStep}>
             <FormStep number={2} title="這筆交易是什麼？" tone="blue">
               <Field label="摘要">
                 <Input
@@ -582,11 +699,13 @@ export default function TransactionsPage() {
                           : "例如：午餐、房租"
                   }
                   required
-                  autoFocus
+                  autoFocus={manualStep === 2}
                 />
               </Field>
             </FormStep>
+            </MobileWizardStep>
 
+            <MobileWizardStep step={3} current={manualStep}>
             <FormStep number={3} title={manualKind === "loan_payment" ? "本金和利息是多少？" : "這次金額是多少？"} tone="purple">
               {manualKind === "loan_payment" ? (
               <>
@@ -607,10 +726,10 @@ export default function TransactionsPage() {
                 </div>
                 <div className="grid gap-4 sm:grid-cols-2">
                   <Field label="本金">
-                    <Input name="principal" type="number" min="0" step="any" placeholder="0" required />
+                    <Input name="principal" type="number" inputMode="decimal" min="0" step="any" placeholder="0" required />
                   </Field>
                   <Field label="利息">
-                    <Input name="interest" type="number" min="0" step="any" placeholder="0" required />
+                    <Input name="interest" type="number" inputMode="decimal" min="0" step="any" placeholder="0" required />
                   </Field>
                 </div>
                 <p className="rounded-xl bg-slate-50 p-4 text-xs leading-5 text-slate-500">
@@ -627,7 +746,7 @@ export default function TransactionsPage() {
                         : "花費金額"
                     }
                   >
-                    <Input name="amount" type="number" min="0" step="any" placeholder="0" required />
+                    <Input name="amount" type="number" inputMode="decimal" min="0" step="any" placeholder="0" required />
                   </Field>
                   <Field label="幣別">
                     <Select name="currency" defaultValue="TWD">
@@ -665,31 +784,40 @@ export default function TransactionsPage() {
                 {((createTransaction.error || createLoanPayment.error) as Error).message}
               </p>
             )}
-            <div className="flex justify-end gap-3">
-              <Button type="button" variant="ghost" onClick={closeManualDialog}>取消</Button>
-              <Button type="submit" disabled={createTransaction.isPending || createLoanPayment.isPending}>
-                {manualKind === "income"
+            </MobileWizardStep>
+            <MobileWizardActions
+              current={manualStep}
+              total={3}
+              onPrevious={() => setManualStep((step) => Math.max(1, step - 1))}
+              onNext={() => {
+                if (validateWizardStep(manualFormRef.current, manualStep)) {
+                  setManualStep((step) => Math.min(3, step + 1));
+                }
+              }}
+              onCancel={closeManualDialog}
+              submitLabel={
+                manualKind === "income"
                   ? "儲存收入"
                   : manualKind === "loan_payment"
                       ? "儲存還款"
-                      : "儲存支出"}
-              </Button>
-            </div>
+                      : "儲存支出"
+              }
+              pending={createTransaction.isPending || createLoanPayment.isPending}
+            />
           </form>
         )}
       </Dialog>
 
       <Dialog
         open={accountTransferOpen}
-        onClose={() => {
-          setAccountTransferOpen(false);
-          createAccountTransfer.reset();
-        }}
+        onClose={closeAccountTransferDialog}
         title="帳戶轉帳"
         description="從一個帳戶扣款、另一個帳戶入款；系統會標記為轉帳，不列入收入或支出。"
       >
-        <form className="space-y-5" onSubmit={submitAccountTransfer}>
+        <form ref={accountTransferFormRef} className="space-y-5" onSubmit={submitAccountTransfer}>
           <FormContext value="自己的帳戶之間移動資金" />
+          <MobileWizardProgress current={accountTransferStep} labels={["選擇帳戶", "轉帳金額", "用途與確認"]} />
+          <MobileWizardStep step={1} current={accountTransferStep}>
           <FormStep number={1} title="從哪裡轉到哪裡？">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="轉出帳戶">
@@ -723,14 +851,19 @@ export default function TransactionsPage() {
               </Select>
             </Field>
           </div>
+          {transferFromAccountId && transferFromAccountId === transferToAccountId && (
+            <p className="text-sm text-red-600">轉出與轉入帳戶不能相同。</p>
+          )}
           </FormStep>
+          </MobileWizardStep>
+          <MobileWizardStep step={2} current={accountTransferStep}>
           <FormStep number={2} title="這次轉多少？" tone="blue">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="轉帳日期">
               <Input name="transfer_date" type="date" defaultValue={new Date().toISOString().slice(0, 10)} required />
             </Field>
             <Field label={`轉出金額${transferFromAccount ? `（${transferFromAccount.currency}）` : ""}`}>
-              <Input name="amount" type="number" min="0" step="any" placeholder="0" required />
+              <Input name="amount" type="number" inputMode="decimal" min="0" step="any" placeholder="0" required />
             </Field>
           </div>
           {transferFromAccount &&
@@ -740,10 +873,12 @@ export default function TransactionsPage() {
                 label={`轉入金額（${transferToAccount.currency}，選填）`}
                 hint="不同幣別時，不填會用目前匯率估算；實際換匯金額不同時可手動填。"
               >
-              <Input name="to_amount" type="number" min="0" step="any" placeholder="不填則自動估算" />
+              <Input name="to_amount" type="number" inputMode="decimal" min="0" step="any" placeholder="不填則自動估算" />
             </Field>
           )}
           </FormStep>
+          </MobileWizardStep>
+          <MobileWizardStep step={3} current={accountTransferStep}>
           <FormStep number={3} title="這筆轉帳的用途？" description="方便之後辨認，沒有也可以留空。" tone="purple">
             <Field label="說明">
               <Input name="description" placeholder="例如：轉到交易所、現金存入銀行" />
@@ -753,28 +888,31 @@ export default function TransactionsPage() {
             <summary className="cursor-pointer list-none text-sm font-medium text-slate-600">其他設定（備註）</summary>
             <div className="mt-4"><Field label="備註"><Input name="note" placeholder="選填" /></Field></div>
           </details>
-          {transferFromAccountId && transferFromAccountId === transferToAccountId && (
-            <p className="text-sm text-red-600">轉出與轉入帳戶不能相同。</p>
-          )}
           {createAccountTransfer.isError && (
             <p className="text-sm text-red-600">{(createAccountTransfer.error as Error).message}</p>
           )}
-          <div className="flex justify-end gap-3">
-            <Button type="button" variant="ghost" onClick={() => setAccountTransferOpen(false)}>
-              取消
-            </Button>
-            <Button
-              type="submit"
-              disabled={
-                createAccountTransfer.isPending ||
-                !transferFromAccountId ||
-                !transferToAccountId ||
-                transferFromAccountId === transferToAccountId
+          </MobileWizardStep>
+          <MobileWizardActions
+            current={accountTransferStep}
+            total={3}
+            onPrevious={() => setAccountTransferStep((step) => Math.max(1, step - 1))}
+            onNext={() => {
+              if (
+                transferFromAccountId !== transferToAccountId &&
+                validateWizardStep(accountTransferFormRef.current, accountTransferStep)
+              ) {
+                setAccountTransferStep((step) => Math.min(3, step + 1));
               }
-            >
-              建立轉帳
-            </Button>
-          </div>
+            }}
+            onCancel={closeAccountTransferDialog}
+            submitLabel={createAccountTransfer.isPending ? "建立中…" : "建立轉帳"}
+            pending={
+              createAccountTransfer.isPending ||
+              !transferFromAccountId ||
+              !transferToAccountId ||
+              transferFromAccountId === transferToAccountId
+            }
+          />
         </form>
       </Dialog>
 

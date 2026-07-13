@@ -6,18 +6,22 @@ import {
   Database,
   Download,
   KeyRound,
+  Moon,
   RefreshCw,
   Save,
   Shield,
+  Sun,
   Trash2,
   Upload,
 } from "lucide-react";
 import { api } from "../api";
+import { type AppTheme, getStoredTheme, saveTheme } from "../theme";
 import type { Category } from "../types";
 import {
   Badge,
   Button,
   Card,
+  cn,
   FormStep,
   Input,
   PageHeader,
@@ -54,6 +58,7 @@ export default function SettingsPage() {
   const [message, setMessage] = useState("");
   const [marketSettingsOpen, setMarketSettingsOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
+  const [theme, setTheme] = useState<AppTheme>(() => getStoredTheme());
   const [lastBackupAt, setLastBackupAt] = useState(() => localStorage.getItem("finance:lastBackupAt") || "");
 
   const settings = useQuery({ queryKey: ["settings"], queryFn: () => api<SettingsData>("/settings") });
@@ -160,6 +165,11 @@ export default function SettingsPage() {
     event.currentTarget.reset();
   }
 
+  function changeTheme(nextTheme: AppTheme) {
+    setTheme(nextTheme);
+    saveTheme(nextTheme);
+  }
+
   return (
     <>
       <PageHeader
@@ -174,6 +184,43 @@ export default function SettingsPage() {
           <button onClick={() => setMessage("")}>×</button>
         </div>
       )}
+
+      <Card className="mb-6 p-6">
+        <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
+          <div>
+            <h2 className="font-bold text-ink">外觀模式</h2>
+            <p className="mt-1 text-sm text-slate-500">選擇舒服的畫面，設定會保存在這台裝置。</p>
+          </div>
+          <div className="grid grid-cols-2 gap-2 rounded-2xl bg-slate-50 p-1.5" role="group" aria-label="外觀模式">
+            <button
+              type="button"
+              aria-pressed={theme === "light"}
+              className={cn(
+                "flex h-11 min-w-28 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold transition",
+                theme === "light"
+                  ? "bg-white text-forest shadow-sm ring-1 ring-slate-200"
+                  : "text-slate-500 hover:bg-white/70 hover:text-slate-800",
+              )}
+              onClick={() => changeTheme("light")}
+            >
+              <Sun size={17} /> 淺色
+            </button>
+            <button
+              type="button"
+              aria-pressed={theme === "dark"}
+              className={cn(
+                "flex h-11 min-w-28 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold transition",
+                theme === "dark"
+                  ? "bg-forest text-white shadow-sm ring-1 ring-emerald-500/30"
+                  : "text-slate-500 hover:bg-white/70 hover:text-slate-800",
+              )}
+              onClick={() => changeTheme("dark")}
+            >
+              <Moon size={17} /> 深色
+            </button>
+          </div>
+        </div>
+      </Card>
 
       <div className="grid gap-6 xl:grid-cols-[1.05fr_.95fr]">
         <Card className="p-6">

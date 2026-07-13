@@ -4,7 +4,7 @@ import {
   type ReactNode,
   type SelectHTMLAttributes,
 } from "react";
-import { X } from "lucide-react";
+import { ChevronLeft, ChevronRight, X } from "lucide-react";
 import { twMerge } from "tailwind-merge";
 
 export const cn = (...values: (string | false | null | undefined)[]) =>
@@ -51,6 +51,8 @@ export function Button({
 
 export function Input({
   className,
+  type,
+  inputMode,
   ...props
 }: InputHTMLAttributes<HTMLInputElement>) {
   return (
@@ -59,6 +61,8 @@ export function Input({
         "h-11 w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none transition placeholder:text-slate-400 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10",
         className,
       )}
+      type={type}
+      inputMode={inputMode ?? (type === "number" ? "decimal" : undefined)}
       {...props}
     />
   );
@@ -169,9 +173,9 @@ export function Dialog({
   if (!open) return null;
   const widths = { md: "max-w-lg", lg: "max-w-2xl", xl: "max-w-5xl" };
   return (
-    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-4 backdrop-blur-sm">
-      <div className={cn("max-h-[92vh] w-full overflow-auto rounded-3xl bg-white shadow-2xl", widths[size])}>
-        <div className="sticky top-0 z-10 flex items-start justify-between border-b border-slate-100 bg-white/95 px-6 py-5 backdrop-blur">
+    <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-0 backdrop-blur-sm sm:p-4">
+      <div className={cn("flex h-[100dvh] max-h-[100dvh] w-full flex-col overflow-hidden rounded-none bg-white shadow-2xl sm:h-auto sm:max-h-[92vh] sm:rounded-3xl", widths[size])}>
+        <div className="z-10 flex shrink-0 items-start justify-between border-b border-slate-100 bg-white/95 px-4 py-4 backdrop-blur sm:px-6 sm:py-5">
           <div>
             <h2 className="text-xl font-bold text-ink">{title}</h2>
             {description && <p className="mt-1 text-sm text-slate-500">{description}</p>}
@@ -184,9 +188,104 @@ export function Dialog({
             <X size={20} />
           </button>
         </div>
-        <div className="p-6">{children}</div>
+        <div className="min-h-0 flex-1 overflow-y-auto overscroll-contain p-4 pb-0 sm:p-6">{children}</div>
       </div>
     </div>
+  );
+}
+
+export function MobileWizardProgress({
+  current,
+  labels,
+}: {
+  current: number;
+  labels: string[];
+}) {
+  return (
+    <div className="sm:hidden">
+      <div className="mb-2 flex items-center justify-between text-xs">
+        <span className="font-semibold text-emerald-700">步驟 {current} / {labels.length}</span>
+        <span className="text-slate-500">{labels[current - 1]}</span>
+      </div>
+      <div className="grid gap-1.5" style={{ gridTemplateColumns: `repeat(${labels.length}, minmax(0, 1fr))` }}>
+        {labels.map((label, index) => (
+          <span
+            key={label}
+            className={cn("h-1.5 rounded-full transition", index < current ? "bg-emerald-500" : "bg-slate-100")}
+          />
+        ))}
+      </div>
+    </div>
+  );
+}
+
+export function MobileWizardStep({
+  step,
+  current,
+  children,
+}: {
+  step: number;
+  current: number;
+  children: ReactNode;
+}) {
+  return (
+    <div data-wizard-step={step} className={cn(step === current ? "block" : "hidden", "sm:block")}>
+      {children}
+    </div>
+  );
+}
+
+export function validateWizardStep(form: HTMLFormElement | null, step: number) {
+  const container = form?.querySelector<HTMLElement>(`[data-wizard-step="${step}"]`);
+  if (!container) return true;
+  const controls = Array.from(
+    container.querySelectorAll<HTMLInputElement | HTMLSelectElement | HTMLTextAreaElement>("input, select, textarea"),
+  );
+  for (const control of controls) {
+    if (control.disabled || control.checkValidity()) continue;
+    control.reportValidity();
+    control.focus();
+    return false;
+  }
+  return true;
+}
+
+export function MobileWizardActions({
+  current,
+  total,
+  onPrevious,
+  onNext,
+  onCancel,
+  submitLabel,
+  pending = false,
+}: {
+  current: number;
+  total: number;
+  onPrevious: () => void;
+  onNext: () => void;
+  onCancel: () => void;
+  submitLabel: string;
+  pending?: boolean;
+}) {
+  return (
+    <>
+      <div className="mobile-safe-actions sticky bottom-0 z-20 -mx-4 mt-5 flex gap-2 border-t border-slate-100 bg-white/95 px-4 py-3 backdrop-blur sm:hidden">
+        <Button type="button" variant="secondary" className="flex-1" onClick={current === 1 ? onCancel : onPrevious}>
+          {current === 1 ? "取消" : <><ChevronLeft size={16} /> 上一步</>}
+        </Button>
+        {current < total ? (
+          <Button type="button" className="flex-1" onClick={onNext}>
+            下一步 <ChevronRight size={16} />
+          </Button>
+        ) : (
+          <Button type="submit" className="flex-1" disabled={pending}>{submitLabel}</Button>
+        )}
+      </div>
+      <div className="hidden justify-end gap-3 pt-2 sm:flex">
+        <Button type="button" variant="ghost" onClick={onCancel}>取消</Button>
+        <Button type="submit" disabled={pending}>{submitLabel}</Button>
+      </div>
+    </>
   );
 }
 
