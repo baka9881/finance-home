@@ -5,6 +5,7 @@ import hashlib
 import io
 import json
 import os
+import time
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -811,9 +812,26 @@ def _upsert_price(
         current.stale = False
 
 
+def _reuse_cached_market_price(
+    db: Session,
+    result: dict[str, Any],
+    position: Position,
+    label: str,
+    reason: str,
+) -> None:
+    latest = get_latest_price(db, position.market, position.symbol)
+    if latest:
+        result["skipped"] += 1
+        result["warnings"].append(
+            f"{label}：{reason}，已沿用 {latest.price_date.isoformat()} 的價格"
+        )
+        return
+    result["errors"].append(f"{label}：{reason}，且目前沒有可沿用的價格")
+
+
 def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
     positions = db.scalars(select(Position).where(Position.archived.is_(False))).all()
-    result = {"updated": 0, "skipped": 0, "errors": []}
+    result = {"updated": 0, "skipped": 0, "warnings": [], "errors": []}
     by_market: dict[str, list[Position]] = defaultdict(list)
     for position in positions:
         if position.manual_price is not None:
@@ -830,7 +848,11 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
             continue
         by_market[position.market].append(position)
 
-    with httpx.Client(timeout=20, follow_redirects=True) as client:
+    with httpx.Client(
+        timeout=20,
+        follow_redirects=True,
+        headers={"Accept": "application/json", "User-Agent": "FinanceHome/1.0"},
+    ) as client:
         if by_market.get("TWSE"):
             try:
                 rows = client.get(
@@ -885,7 +907,14 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
             setting = db.get(AppSetting, "alpha_vantage_api_key")
             api_key = os.getenv("ALPHA_VANTAGE_API_KEY") or (setting.value if setting else "")
             if not api_key:
-                result["errors"].append("美股行情：尚未設定 Alpha Vantage API 金鑰")
+                for position in by_market["US"]:
+                    _reuse_cached_market_price(
+                        db,
+                        result,
+                        position,
+                        f"美股 {position.symbol}",
+                        "尚未設定 Alpha Vantage API 金鑰",
+                    )
             else:
                 for position in by_market["US"]:
                     try:
@@ -899,7 +928,19 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                         ).json()
                         quote = payload.get("Global Quote", {})
                         if not quote.get("05. price"):
-                            raise ValueError(payload.get("Note") or payload.get("Information") or "查無報價")
+                            provider_message = str(
+                                payload.get("Note") or payload.get("Information") or ""
+                            ).lower()
+                            reason = (
+                                "今日免費更新額度已用完"
+                                if "rate limit" in provider_message
+                                or "requests per day" in provider_message
+                                else "暫時無法取得新報價"
+                            )
+                            _reuse_cached_market_price(
+                                db, result, position, f"美股 {position.symbol}", reason
+                            )
+                            continue
                         price_date = date.fromisoformat(
                             quote.get("07. latest trading day", date.today().isoformat())
                         )
@@ -913,24 +954,50 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                             "Alpha Vantage",
                         )
                         result["updated"] += 1
-                    except Exception as exc:
-                        result["errors"].append(f"美股 {position.symbol}：{exc}")
+                    except Exception:
+                        _reuse_cached_market_price(
+                            db,
+                            result,
+                            position,
+                            f"美股 {position.symbol}",
+                            "行情服務暫時無法連線",
+                        )
 
         if by_market.get("CRYPTO"):
             try:
                 ids = sorted({item.symbol.lower() for item in by_market["CRYPTO"]})
-                payload = client.get(
-                    "https://api.coingecko.com/api/v3/simple/price",
-                    params={
-                        "ids": ",".join(ids),
-                        "vs_currencies": "twd,usd",
-                        "include_last_updated_at": "true",
-                    },
-                ).json()
+                payload = None
+                for attempt in range(3):
+                    response = client.get(
+                        "https://api.coingecko.com/api/v3/simple/price",
+                        params={
+                            "ids": ",".join(ids),
+                            "vs_currencies": "twd,usd",
+                            "include_last_updated_at": "true",
+                        },
+                    )
+                    if response.status_code == 429 and attempt < 2:
+                        time.sleep(2**attempt)
+                        continue
+                    response.raise_for_status()
+                    candidate = response.json()
+                    if not isinstance(candidate, dict) or candidate.get("status"):
+                        raise ValueError("CoinGecko 回應格式不正確")
+                    payload = candidate
+                    break
+                if payload is None:
+                    raise ValueError("CoinGecko 暫時無法回應")
                 for position in by_market["CRYPTO"]:
                     quote = payload.get(position.symbol.lower())
                     if not quote:
-                        raise ValueError(f"查無加密貨幣 ID {position.symbol}")
+                        _reuse_cached_market_price(
+                            db,
+                            result,
+                            position,
+                            f"加密貨幣 {position.name or position.symbol}",
+                            "CoinGecko 暫時沒有回傳此代號",
+                        )
+                        continue
                     currency = position.currency.lower()
                     if currency not in quote:
                         currency = "usd"
@@ -948,8 +1015,15 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                         "CoinGecko",
                     )
                     result["updated"] += 1
-            except Exception as exc:
-                result["errors"].append(f"加密貨幣行情：{exc}")
+            except Exception:
+                for position in by_market["CRYPTO"]:
+                    _reuse_cached_market_price(
+                        db,
+                        result,
+                        position,
+                        f"加密貨幣 {position.name or position.symbol}",
+                        "CoinGecko 暫時忙碌",
+                    )
 
     db.flush()
     record_valuation(db)

@@ -151,12 +151,18 @@ export default function InvestmentsPage() {
   });
 
   const refresh = useMutation({
-    mutationFn: () => api<{ updated: number; skipped: number; errors: string[] }>("/market/refresh?force=true", { method: "POST" }),
+    mutationFn: () => api<{ updated: number; skipped: number; warnings?: string[]; errors: string[] }>("/market/refresh", { method: "POST" }),
     onSuccess: (result) => {
       client.invalidateQueries({ queryKey: ["positions"] });
       client.invalidateQueries({ queryKey: ["dashboard"] });
+      const warnings = result.warnings || [];
+      if (result.updated === 0 && result.errors.length === 0 && warnings.length === 0) {
+        setRefreshMessage("目前行情已是最新，暫時不需要再次呼叫外部服務。");
+        return;
+      }
       const summary = [`更新 ${result.updated} 筆`];
-      if (result.skipped > 0) summary.push(`跳過 ${result.skipped} 筆`);
+      if (result.skipped > 0) summary.push(`沿用 ${result.skipped} 筆現有行情`);
+      if (warnings.length > 0) summary.push(warnings.join("、"));
       if (result.errors.length > 0) summary.push(`失敗 ${result.errors.length} 筆：${result.errors.join("、")}`);
       setRefreshMessage(`行情更新完成：${summary.join("、")}。`);
     },
