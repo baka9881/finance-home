@@ -75,6 +75,19 @@ DEFAULT_RULES = [
     ("電費", "水電與通訊", "expense"),
 ]
 
+BINANCE_SPOT_SYMBOLS = {
+    "bitcoin": "BTCUSDT",
+    "ethereum": "ETHUSDT",
+    "solana": "SOLUSDT",
+    "ripple": "XRPUSDT",
+    "binancecoin": "BNBUSDT",
+    "cardano": "ADAUSDT",
+    "dogecoin": "DOGEUSDT",
+    "polkadot": "DOTUSDT",
+    "chainlink": "LINKUSDT",
+    "litecoin": "LTCUSDT",
+}
+
 
 def decimal_value(value: Any, default: Decimal = ZERO) -> Decimal:
     if value is None:
@@ -829,6 +842,38 @@ def _reuse_cached_market_price(
     result["errors"].append(f"{label}：{reason}，且目前沒有可沿用的價格")
 
 
+def _refresh_crypto_from_binance(
+    client: httpx.Client,
+    db: Session,
+    position: Position,
+) -> bool:
+    pair = BINANCE_SPOT_SYMBOLS.get(position.symbol.lower())
+    if not pair or position.currency.upper() != "USD":
+        return False
+    try:
+        response = client.get(
+            "https://data-api.binance.vision/api/v3/ticker/price",
+            params={"symbol": pair},
+        )
+        response.raise_for_status()
+        payload = response.json()
+        price = decimal_value(payload.get("price"))
+        if price <= 0:
+            return False
+        _upsert_price(
+            db,
+            "CRYPTO",
+            position.symbol,
+            date.today(),
+            price,
+            "USD",
+            "Binance",
+        )
+        return True
+    except Exception:
+        return False
+
+
 def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
     positions = db.scalars(select(Position).where(Position.archived.is_(False))).all()
     result = {"updated": 0, "skipped": 0, "warnings": [], "errors": []}
@@ -990,6 +1035,9 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                 for position in by_market["CRYPTO"]:
                     quote = payload.get(position.symbol.lower())
                     if not quote:
+                        if _refresh_crypto_from_binance(client, db, position):
+                            result["updated"] += 1
+                            continue
                         _reuse_cached_market_price(
                             db,
                             result,
@@ -1017,6 +1065,9 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                     result["updated"] += 1
             except Exception:
                 for position in by_market["CRYPTO"]:
+                    if _refresh_crypto_from_binance(client, db, position):
+                        result["updated"] += 1
+                        continue
                     _reuse_cached_market_price(
                         db,
                         result,
