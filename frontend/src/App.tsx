@@ -185,6 +185,20 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
+  const [serverStatus, setServerStatus] = useState<"waking" | "ready" | "error">("waking");
+
+  useEffect(() => {
+    const controller = new AbortController();
+
+    void api<{ status: string }>("/health", { signal: controller.signal })
+      .then(() => setServerStatus("ready"))
+      .catch((cause) => {
+        if (cause instanceof DOMException && cause.name === "AbortError") return;
+        setServerStatus("error");
+      });
+
+    return () => controller.abort();
+  }, []);
 
   async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -214,6 +228,33 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
           <h1 className="text-2xl font-bold text-ink">登入財務居</h1>
           <p className="mt-2 text-sm text-slate-500">輸入你的專屬密碼，才能查看雲端財務資料。</p>
         </div>
+        <div
+          aria-live="polite"
+          className={cn(
+            "mt-5 flex items-center gap-2 rounded-xl px-3 py-2.5 text-sm",
+            serverStatus === "ready"
+              ? "bg-emerald-50 text-emerald-700"
+              : serverStatus === "error"
+                ? "bg-amber-50 text-amber-700"
+                : "bg-sky-50 text-sky-700",
+          )}
+        >
+          <span
+            className={cn(
+              "size-2 shrink-0 rounded-full",
+              serverStatus === "ready"
+                ? "bg-emerald-500"
+                : serverStatus === "error"
+                  ? "bg-amber-500"
+                  : "animate-pulse bg-sky-500",
+            )}
+          />
+          {serverStatus === "ready"
+            ? "雲端伺服器已準備完成，可以立即登入。"
+            : serverStatus === "error"
+              ? "雲端連線較慢，按下登入後會繼續嘗試。"
+              : "正在喚醒雲端伺服器，你可以先輸入密碼。"}
+        </div>
         <form className="mt-7 space-y-4" onSubmit={submit}>
           <label className="block space-y-2">
             <span className="text-sm font-medium text-slate-700">登入密碼</span>
@@ -232,7 +273,12 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
           </label>
           {error && <p className="rounded-xl bg-red-50 px-3 py-2 text-sm text-red-600">{error}</p>}
           <Button className="w-full" type="submit" disabled={pending}>
-            <Cloud size={16} /> {pending ? "登入中…" : "登入雲端財務居"}
+            <Cloud size={16} />
+            {pending
+              ? serverStatus === "waking"
+                ? "伺服器啟動中…"
+                : "登入中…"
+              : "登入雲端財務居"}
           </Button>
         </form>
       </div>

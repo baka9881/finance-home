@@ -80,7 +80,6 @@ from .services import (
     import_csv,
     inspect_csv,
     latest_fx_rate,
-    merge_duplicate_positions,
     position_summary,
     record_valuation,
     refresh_fx_rates,
@@ -143,8 +142,6 @@ async def lifespan(_: FastAPI):
     with Session(engine) as db:
         seed_defaults(db)
         seed_demo(db)
-        merge_duplicate_positions(db)
-        record_valuation(db)
         db.commit()
     yield
 
