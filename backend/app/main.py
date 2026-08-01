@@ -81,6 +81,7 @@ from .services import (
     inspect_csv,
     latest_fx_rate,
     position_summary,
+    reclassify_uncategorized_transactions,
     record_valuation,
     refresh_fx_rates,
     refresh_market_prices,
@@ -514,6 +515,13 @@ def list_transactions(
     ]
 
 
+@app.post("/api/transactions/reclassify")
+def reclassify_transactions(db: DB, owner: str = "all"):
+    owner = validate_owner_filter(owner)
+    seed_defaults(db)
+    return reclassify_uncategorized_transactions(db, owner)
+
+
 @app.post("/api/transactions", status_code=201)
 def create_transaction(payload: TransactionCreate, db: DB):
     account = require_account(db, payload.account_id)
@@ -598,6 +606,18 @@ def update_transaction(transaction_id: int, payload: TransactionUpdate, db: DB):
                 db.add(rule)
             rule.category_id = payload.category_id
             rule.transaction_kind = payload.transaction_kind or row.transaction_kind
+            uncategorized = db.scalar(select(Category).where(Category.name == "未分類"))
+            matching_rows = db.scalars(
+                select(Transaction).where(
+                    func.lower(Transaction.description).contains(keyword.lower())
+                )
+            ).all()
+            for matching_row in matching_rows:
+                if matching_row.category_id is None or (
+                    uncategorized and matching_row.category_id == uncategorized.id
+                ):
+                    matching_row.category_id = payload.category_id
+                    matching_row.transaction_kind = payload.transaction_kind or row.transaction_kind
     db.commit()
     return {"ok": True}
 

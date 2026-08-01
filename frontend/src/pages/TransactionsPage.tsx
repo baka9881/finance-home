@@ -10,6 +10,7 @@ import {
   Link2,
   Plus,
   Search,
+  Sparkles,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -66,6 +67,37 @@ const scenarioDescriptions: Record<ManualScenario, string> = {
   loan_payment: "還款時一次填本金與利息，系統會同步降低貸款負債。",
 };
 
+function normalizedAccountMatchText(value: string) {
+  return value
+    .toLowerCase()
+    .replace(/\.[^.]+$/, "")
+    .replace(/[\s_\-./\\()（）年月]/g, "");
+}
+
+function guessImportAccountId(fileName: string, accounts: Account[], selectedAccountId: string) {
+  if (selectedAccountId && accounts.some((account) => String(account.id) === selectedAccountId)) {
+    return selectedAccountId;
+  }
+
+  const fileText = normalizedAccountMatchText(fileName);
+  const ranked = accounts
+    .map((account) => {
+      const name = normalizedAccountMatchText(account.name);
+      const institution = normalizedAccountMatchText(account.institution || "");
+      let score = 0;
+
+      if (name.length >= 2 && (fileText.includes(name) || name.includes(fileText))) score += 120;
+      if (institution.length >= 2 && fileText.includes(institution)) score += 60;
+      if (/信用卡|card/.test(fileText) && account.account_type === "credit_card") score += 35;
+
+      return { id: String(account.id), score };
+    })
+    .sort((left, right) => right.score - left.score);
+
+  if (!ranked[0] || ranked[0].score < 35 || ranked[0].score === ranked[1]?.score) return "";
+  return ranked[0].id;
+}
+
 export default function TransactionsPage() {
   const client = useQueryClient();
   const [month, setMonth] = useState(currentMonth);
@@ -85,6 +117,8 @@ export default function TransactionsPage() {
   const [inspection, setInspection] = useState<CsvInspection | null>(null);
   const [mapping, setMapping] = useState<Record<string, string>>({});
   const [importResult, setImportResult] = useState<Record<string, unknown> | null>(null);
+  const [advancedMappingOpen, setAdvancedMappingOpen] = useState(false);
+  const [classificationMessage, setClassificationMessage] = useState("");
   const [manualStep, setManualStep] = useState(1);
   const [accountTransferStep, setAccountTransferStep] = useState(1);
   const manualFormRef = useRef<HTMLFormElement>(null);
@@ -147,6 +181,12 @@ export default function TransactionsPage() {
         item.account_name.toLowerCase().includes(query),
     );
   }, [transactions.data, search]);
+  const importMappingReady = Boolean(
+    mapping.date && mapping.description && (mapping.amount || mapping.debit || mapping.credit),
+  );
+  const unclassifiedCount = filteredTransactions.filter(
+    (transaction) => transaction.category_name === "未分類",
+  ).length;
 
   const createTransaction = useMutation({
     mutationFn: (payload: Record<string, unknown>) =>
@@ -171,6 +211,23 @@ export default function TransactionsPage() {
     },
   });
 
+  const reclassifyTransactions = useMutation({
+    mutationFn: () =>
+      api<{ updated: number; remaining: number }>(
+        `/transactions/reclassify?owner=${ownerFilter}`,
+        { method: "POST" },
+      ),
+    onSuccess: (result) => {
+      setClassificationMessage(
+        result.updated
+          ? `已自動分類 ${result.updated} 筆交易。`
+          : "目前沒有能自動辨識的未分類交易。",
+      );
+      client.invalidateQueries({ queryKey: ["transactions"] });
+      client.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+  });
+
   const deleteTransaction = useMutation({
     mutationFn: (id: number) => api(`/transactions/${id}`, { method: "DELETE" }),
     onSuccess: () => {
@@ -186,7 +243,7 @@ export default function TransactionsPage() {
       body.append("file", file);
       return api<CsvInspection>("/transactions/import/inspect", { method: "POST", body });
     },
-    onSuccess: (data) => {
+    onSuccess: (data, file) => {
       setInspection(data);
       const guessed: Record<string, string> = {};
       for (const column of data.columns) {
@@ -199,6 +256,11 @@ export default function TransactionsPage() {
         if (!guessed.currency && /幣別|currency/.test(normalized)) guessed.currency = column;
         if (!guessed.balance && /餘額|balance/.test(normalized)) guessed.balance = column;
       }
+      const guessedAccountId = guessImportAccountId(file.name, accounts.data || [], accountFilter);
+      if (guessedAccountId) guessed.account_id = guessedAccountId;
+      setAdvancedMappingOpen(
+        !guessed.date || !guessed.description || (!guessed.amount && !guessed.debit && !guessed.credit),
+      );
       setMapping(guessed);
     },
   });
@@ -355,6 +417,7 @@ export default function TransactionsPage() {
     setInspection(null);
     setMapping({});
     setImportResult(null);
+    setAdvancedMappingOpen(false);
     inspectMutation.reset();
     importMutation.reset();
   }
@@ -378,8 +441,8 @@ export default function TransactionsPage() {
       />
 
       <Card className="mb-5 p-4">
-        <div className="grid gap-3 sm:grid-cols-3">
-          <div className="relative">
+        <div className="grid min-w-0 gap-3 sm:grid-cols-3">
+          <div className="relative min-w-0">
             <Search className="absolute left-3 top-3.5 text-slate-400" size={16} />
             <Input
               className="pl-9"
@@ -388,7 +451,12 @@ export default function TransactionsPage() {
               onChange={(event) => setSearch(event.target.value)}
             />
           </div>
-          <Input type="month" value={month} onChange={(event) => setMonth(event.target.value)} />
+          <Input
+            className="min-w-0 max-w-full"
+            type="month"
+            value={month}
+            onChange={(event) => setMonth(event.target.value)}
+          />
           <Select value={accountFilter} onChange={(event) => setAccountFilter(event.target.value)}>
             <option value="">全部帳戶</option>
             {accountFilterOptions.map((account) => (
@@ -404,10 +472,39 @@ export default function TransactionsPage() {
         <p className="text-sm text-slate-500">
           共 <strong className="text-slate-800">{filteredTransactions.length}</strong> 筆交易
         </p>
-        <Button variant="ghost" onClick={() => setTransferOpen(true)}>
-          <Link2 size={16} /> 尋找帳戶間轉帳
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          {unclassifiedCount > 0 && (
+            <Button
+              variant="secondary"
+              onClick={() => {
+                setClassificationMessage("");
+                reclassifyTransactions.mutate();
+              }}
+              disabled={reclassifyTransactions.isPending}
+            >
+              <Sparkles size={16} />
+              {reclassifyTransactions.isPending
+                ? "整理中…"
+                : `自動整理 ${unclassifiedCount} 筆未分類`}
+            </Button>
+          )}
+          <Button variant="ghost" onClick={() => setTransferOpen(true)}>
+            <Link2 size={16} /> 尋找帳戶間轉帳
+          </Button>
+        </div>
       </div>
+
+      {(classificationMessage || reclassifyTransactions.isError) && (
+        <div className={`mb-5 rounded-xl px-4 py-3 text-sm ${
+          reclassifyTransactions.isError
+            ? "bg-red-50 text-red-700"
+            : "bg-emerald-50 text-emerald-700"
+        }`}>
+          {reclassifyTransactions.isError
+            ? (reclassifyTransactions.error as Error).message
+            : classificationMessage}
+        </div>
+      )}
 
       <Card className="overflow-hidden">
         {!filteredTransactions.length ? (
@@ -469,12 +566,18 @@ export default function TransactionsPage() {
                     <Select
                       className="h-11"
                       value={transaction.category_id || ""}
-                      onChange={(event) =>
+                      onChange={(event) => {
+                        const categoryId = Number(event.target.value);
+                        const category = categories.data?.find((item) => item.id === categoryId);
                         updateTransaction.mutate({
                           id: transaction.id,
-                          payload: { category_id: Number(event.target.value) },
-                        })
-                      }
+                          payload: {
+                            category_id: categoryId,
+                            create_rule: category?.name !== "未分類",
+                            rule_keyword: transaction.description,
+                          },
+                        });
+                      }}
                     >
                       {categories.data?.map((category) => (
                         <option key={category.id} value={category.id}>{category.name}</option>
@@ -547,12 +650,18 @@ export default function TransactionsPage() {
                       <Select
                         className="h-9 min-w-32"
                         value={transaction.category_id || ""}
-                        onChange={(event) =>
+                        onChange={(event) => {
+                          const categoryId = Number(event.target.value);
+                          const category = categories.data?.find((item) => item.id === categoryId);
                           updateTransaction.mutate({
                             id: transaction.id,
-                            payload: { category_id: Number(event.target.value) },
-                          })
-                        }
+                            payload: {
+                              category_id: categoryId,
+                              create_rule: category?.name !== "未分類",
+                              rule_keyword: transaction.description,
+                            },
+                          });
+                        }}
                       >
                         {categories.data?.map((category) => (
                           <option key={category.id} value={category.id}>
@@ -923,8 +1032,8 @@ export default function TransactionsPage() {
           resetImport();
         }}
         title="匯入交易 CSV"
-        description="檔案只會傳送到這台電腦上的本機服務。"
-        size="xl"
+        description="選擇帳戶即可匯入，日期、摘要與金額會自動辨識。"
+        size="lg"
       >
         {!inspection ? (
           <div>
@@ -980,50 +1089,96 @@ export default function TransactionsPage() {
         ) : (
           <div className="space-y-6">
             <div className="flex items-center justify-between rounded-xl bg-slate-50 px-4 py-3 text-sm">
-              <span className="font-medium text-slate-700">{csvFile?.name}</span>
-              <span className="text-slate-400">{inspection.total_rows} 列 · {inspection.encoding}</span>
+              <div className="min-w-0">
+                <p className="truncate font-medium text-slate-700">{csvFile?.name}</p>
+                <p className="mt-1 text-xs text-slate-400">{inspection.total_rows} 筆交易 · {inspection.encoding}</p>
+              </div>
+              <Button variant="ghost" className="shrink-0" onClick={resetImport}>更換檔案</Button>
             </div>
-            <div className="grid gap-4 md:grid-cols-3">
-              <Field label="匯入至帳戶">
-                <Select
-                  value={mapping.account_id || ""}
-                  onChange={(event) => setMapping({ ...mapping, account_id: event.target.value })}
-                >
-                  <option value="">選擇帳戶</option>
-                  {accounts.data?.map((account) => (
-                    <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
-                  ))}
-                </Select>
-              </Field>
-              <MappingSelect label="日期欄位 *" value={mapping.date} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, date: value })} />
-              <MappingSelect label="摘要欄位 *" value={mapping.description} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, description: value })} />
-              <MappingSelect label="單一金額欄位" value={mapping.amount} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, amount: value })} />
-              <MappingSelect label="支出／借方欄位" value={mapping.debit} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, debit: value })} />
-              <MappingSelect label="收入／貸方欄位" value={mapping.credit} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, credit: value })} />
-              <MappingSelect label="幣別欄位" value={mapping.currency} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, currency: value })} />
-              <MappingSelect label="餘額欄位" value={mapping.balance} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, balance: value })} />
+
+            <div className={`rounded-2xl border p-4 ${
+              importMappingReady
+                ? "border-emerald-200 bg-emerald-50/70"
+                : "border-amber-200 bg-amber-50/70"
+            }`}>
+              <div className="flex items-start gap-3">
+                <span className={`mt-0.5 grid size-8 shrink-0 place-items-center rounded-full ${
+                  importMappingReady ? "bg-emerald-100 text-emerald-700" : "bg-amber-100 text-amber-700"
+                }`}>
+                  <Check size={17} />
+                </span>
+                <div>
+                  <p className={`font-semibold ${importMappingReady ? "text-emerald-900" : "text-amber-900"}`}>
+                    {importMappingReady ? "欄位已自動辨識" : "有欄位無法辨識"}
+                  </p>
+                  <p className={`mt-1 text-sm leading-6 ${importMappingReady ? "text-emerald-700" : "text-amber-700"}`}>
+                    {importMappingReady
+                      ? "日期、摘要與金額都已準備完成，不需要另外設定。"
+                      : "請展開下方的進階欄位設定，補上缺少的欄位。"}
+                  </p>
+                </div>
+              </div>
             </div>
-            <div className="overflow-x-auto rounded-xl border border-slate-200">
-              <table className="w-full min-w-[650px] text-xs">
-                <thead className="bg-slate-50">
-                  <tr>{inspection.columns.map((column) => <th key={column} className="px-3 py-3 text-left font-semibold text-slate-500">{column}</th>)}</tr>
-                </thead>
-                <tbody className="divide-y divide-slate-100">
-                  {inspection.sample.slice(0, 4).map((row, index) => (
-                    <tr key={index}>{inspection.columns.map((column) => <td key={column} className="max-w-48 truncate px-3 py-3 text-slate-600">{row[column]}</td>)}</tr>
-                  ))}
-                </tbody>
-              </table>
+
+            <Field label="要匯入哪個帳戶？">
+              <Select
+                value={mapping.account_id || ""}
+                onChange={(event) => setMapping({ ...mapping, account_id: event.target.value })}
+              >
+                <option value="">請選擇帳戶</option>
+                {accounts.data?.map((account) => (
+                  <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
+                ))}
+              </Select>
+            </Field>
+
+            <div>
+              <p className="mb-2 text-sm font-semibold text-slate-700">內容預覽</p>
+              <div className="divide-y divide-slate-100 overflow-hidden rounded-2xl border border-slate-200">
+                {inspection.sample.slice(0, 3).map((row, index) => {
+                  const amount = mapping.amount
+                    ? row[mapping.amount]
+                    : row[mapping.debit] || row[mapping.credit] || "—";
+                  return (
+                    <div key={index} className="flex items-center gap-3 px-4 py-3 text-sm">
+                      <span className="shrink-0 text-slate-400">{row[mapping.date] || "—"}</span>
+                      <span className="min-w-0 flex-1 truncate font-medium text-slate-700">
+                        {row[mapping.description] || "—"}
+                      </span>
+                      <span className="shrink-0 font-semibold text-slate-700">{amount}</span>
+                    </div>
+                  );
+                })}
+              </div>
+              {inspection.total_rows > 3 && (
+                <p className="mt-2 text-center text-xs text-slate-400">另外還有 {inspection.total_rows - 3} 筆</p>
+              )}
             </div>
-            <p className="text-xs leading-5 text-slate-400">
-              若檔案使用單一正負金額欄位，只需選擇「單一金額」。若收入和支出分開，請改選收入與支出欄位。
-            </p>
+
+            <details
+              className="group rounded-2xl border border-slate-200 bg-white"
+              open={advancedMappingOpen}
+              onToggle={(event) => setAdvancedMappingOpen(event.currentTarget.open)}
+            >
+              <summary className="flex cursor-pointer list-none items-center justify-between px-4 py-3 text-sm font-medium text-slate-600">
+                進階欄位設定
+                <ChevronDown className="transition group-open:rotate-180" size={17} />
+              </summary>
+              <div className="grid gap-4 border-t border-slate-100 p-4 sm:grid-cols-2">
+                <MappingSelect label="日期欄位 *" value={mapping.date} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, date: value })} />
+                <MappingSelect label="摘要欄位 *" value={mapping.description} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, description: value })} />
+                <MappingSelect label="單一金額欄位" value={mapping.amount} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, amount: value })} />
+                <MappingSelect label="支出／借方欄位" value={mapping.debit} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, debit: value })} />
+                <MappingSelect label="收入／貸方欄位" value={mapping.credit} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, credit: value })} />
+                <MappingSelect label="幣別欄位" value={mapping.currency} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, currency: value })} />
+                <MappingSelect label="餘額欄位" value={mapping.balance} columns={inspection.columns} onChange={(value) => setMapping({ ...mapping, balance: value })} />
+              </div>
+            </details>
             {importMutation.isError && <p className="text-sm text-red-600">{(importMutation.error as Error).message}</p>}
-            <div className="flex justify-between">
-              <Button variant="ghost" onClick={resetImport}>重新選擇</Button>
+            <div className="flex justify-end">
               <Button
                 onClick={() => importMutation.mutate()}
-                disabled={!mapping.account_id || !mapping.date || !mapping.description || (!mapping.amount && !mapping.debit && !mapping.credit) || importMutation.isPending}
+                disabled={!mapping.account_id || !importMappingReady || importMutation.isPending}
               >
                 {importMutation.isPending ? "匯入中…" : `匯入 ${inspection.total_rows} 筆資料`}
               </Button>

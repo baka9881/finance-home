@@ -16,7 +16,7 @@ import pandas as pd
 from sqlalchemy import Date as SQLDate
 from sqlalchemy import DateTime as SQLDateTime
 from sqlalchemy import Numeric as SQLNumeric
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, or_, select, text
 from sqlalchemy.orm import Session
 
 from .database import (
@@ -62,17 +62,49 @@ DEFAULT_CATEGORIES = [
 DEFAULT_RULES = [
     ("薪資", "薪資", "income"),
     ("salary", "薪資", "income"),
+    ("國外交易手續費", "利息與費用", "expense"),
+    ("手續費", "利息與費用", "expense"),
+    ("年費", "利息與費用", "expense"),
     ("uber", "交通", "expense"),
     ("高鐵", "交通", "expense"),
     ("台鐵", "交通", "expense"),
+    ("臺灣鐵路", "交通", "expense"),
     ("捷運", "交通", "expense"),
+    ("wemo", "交通", "expense"),
+    ("加油站", "交通", "expense"),
+    ("中油", "交通", "expense"),
     ("全聯", "餐飲", "expense"),
     ("家樂福", "餐飲", "expense"),
     ("便利商店", "餐飲", "expense"),
+    ("統一超商", "餐飲", "expense"),
+    ("7-eleven", "餐飲", "expense"),
+    ("萊爾富", "餐飲", "expense"),
+    ("ok超商", "餐飲", "expense"),
+    ("麥當勞", "餐飲", "expense"),
+    ("mcdonald", "餐飲", "expense"),
+    ("黑松", "餐飲", "expense"),
+    ("星巴克", "餐飲", "expense"),
+    ("蝦皮", "購物", "expense"),
+    ("shopee", "購物", "expense"),
+    ("momo", "購物", "expense"),
+    ("pchome", "購物", "expense"),
+    ("東大騎士", "購物", "expense"),
+    ("steam", "娛樂", "expense"),
+    ("健身工廠", "娛樂", "expense"),
+    ("運動中心", "娛樂", "expense"),
     ("netflix", "訂閱", "expense"),
     ("spotify", "訂閱", "expense"),
+    ("apple.com/bill", "訂閱", "expense"),
+    ("youtube", "訂閱", "expense"),
+    ("disney+", "訂閱", "expense"),
+    ("adobe", "訂閱", "expense"),
+    ("藥局", "醫療", "expense"),
+    ("診所", "醫療", "expense"),
+    ("醫院", "醫療", "expense"),
     ("電信", "水電與通訊", "expense"),
     ("電費", "水電與通訊", "expense"),
+    ("水費", "水電與通訊", "expense"),
+    ("瓦斯", "水電與通訊", "expense"),
 ]
 
 BINANCE_SPOT_SYMBOLS = {
@@ -110,6 +142,27 @@ def seed_defaults(db: Session) -> None:
                     icon=icon,
                 )
             )
+        db.commit()
+
+    categories = {item.name: item.id for item in db.scalars(select(Category)).all()}
+    existing_keywords = {
+        keyword.lower()
+        for keyword in db.scalars(select(ClassificationRule.keyword)).all()
+    }
+    added_rules = 0
+    for keyword, category, kind in DEFAULT_RULES:
+        if keyword.lower() in existing_keywords or category not in categories:
+            continue
+        db.add(
+            ClassificationRule(
+                keyword=keyword,
+                category_id=categories[category],
+                transaction_kind=kind,
+            )
+        )
+        existing_keywords.add(keyword.lower())
+        added_rules += 1
+    if added_rules:
         db.commit()
 
 
@@ -156,19 +209,6 @@ def merge_duplicate_positions(db: Session) -> int:
         db.commit()
     return merged
 
-    if db.scalar(select(func.count(ClassificationRule.id))) == 0:
-        categories = {item.name: item.id for item in db.scalars(select(Category)).all()}
-        for keyword, category, kind in DEFAULT_RULES:
-            db.add(
-                ClassificationRule(
-                    keyword=keyword,
-                    category_id=categories[category],
-                    transaction_kind=kind,
-                )
-            )
-        db.commit()
-
-
 def transaction_fingerprint(
     account_id: int, transaction_date: date, amount: Decimal, description: str
 ) -> str:
@@ -194,6 +234,38 @@ def classify_transaction(db: Session, description: str, amount: Decimal) -> tupl
         )
     )
     return (fallback.id if fallback else None), category_kind
+
+
+def reclassify_uncategorized_transactions(db: Session, owner: str = "all") -> dict[str, int]:
+    uncategorized = db.scalar(select(Category).where(Category.name == "未分類"))
+    if not uncategorized:
+        return {"updated": 0, "remaining": 0}
+
+    query = select(Transaction).where(
+        or_(Transaction.category_id.is_(None), Transaction.category_id == uncategorized.id)
+    )
+    if owner != "all":
+        query = query.join(Account).where(Account.owner == owner)
+
+    rows = db.scalars(query).all()
+    updated = 0
+    for row in rows:
+        category_id, kind = classify_transaction(db, row.description, decimal_value(row.amount))
+        if category_id and category_id != uncategorized.id:
+            row.category_id = category_id
+            row.transaction_kind = kind
+            updated += 1
+
+    if updated:
+        db.commit()
+
+    remaining_query = select(func.count(Transaction.id)).where(
+        or_(Transaction.category_id.is_(None), Transaction.category_id == uncategorized.id)
+    )
+    if owner != "all":
+        remaining_query = remaining_query.join(Account).where(Account.owner == owner)
+    remaining = int(db.scalar(remaining_query) or 0)
+    return {"updated": updated, "remaining": remaining}
 
 
 def latest_fx_rate(db: Session, currency: str, on_date: date | None = None) -> tuple[Decimal, bool]:

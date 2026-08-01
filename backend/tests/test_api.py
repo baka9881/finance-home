@@ -149,6 +149,37 @@ def test_csv_import_big5_and_duplicate_detection(client: TestClient):
     assert sorted(item["base_amount"] for item in rows) == [-80, 30000]
 
 
+def test_reclassify_existing_uncategorized_transactions(client: TestClient):
+    account_id = create_account(client, "信用卡", "liability")
+    categories = client.get("/api/categories").json()
+    uncategorized = next(item for item in categories if item["name"] == "未分類")
+    today = date.today().isoformat()
+
+    for description in ("APPLE.COM/BILL", "統一超商－品冠", "國外交易手續費 -APPLE.", "陌生商家"):
+        response = client.post(
+            "/api/transactions",
+            json={
+                "account_id": account_id,
+                "transaction_date": today,
+                "description": description,
+                "amount": -100,
+                "transaction_kind": "expense",
+                "category_id": uncategorized["id"],
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    result = client.post("/api/transactions/reclassify")
+    assert result.status_code == 200, result.text
+    assert result.json() == {"updated": 3, "remaining": 1}
+
+    rows = {item["description"]: item["category_name"] for item in client.get("/api/transactions").json()}
+    assert rows["APPLE.COM/BILL"] == "訂閱"
+    assert rows["統一超商－品冠"] == "餐飲"
+    assert rows["國外交易手續費 -APPLE."] == "利息與費用"
+    assert rows["陌生商家"] == "未分類"
+
+
 def test_budget_goal_and_health_score(client: TestClient):
     account = create_account(client, "生活帳戶")
     categories = client.get("/api/categories").json()

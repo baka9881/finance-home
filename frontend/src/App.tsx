@@ -320,7 +320,7 @@ function FinanceApp() {
         onMobileClose={() => setMobileOpen(false)}
       />
       <div className={cn("transition-all duration-300", compact ? "lg:pl-[86px]" : "lg:pl-[250px]")}>
-        <div className="sticky top-0 z-20 flex h-16 items-center justify-between border-b border-slate-200/80 bg-canvas/90 px-4 backdrop-blur lg:hidden">
+        <div className="mobile-app-header sticky top-0 z-20 flex items-center justify-between border-b border-slate-200/80 bg-canvas/90 px-4 backdrop-blur lg:hidden">
           <button
             className="rounded-xl border border-slate-200 bg-white p-2.5 text-slate-700"
             onClick={() => setMobileOpen(true)}
