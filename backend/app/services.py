@@ -6,6 +6,7 @@ import io
 import json
 import os
 import time
+import unicodedata
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
@@ -218,14 +219,15 @@ def transaction_fingerprint(
 
 
 def classify_transaction(db: Session, description: str, amount: Decimal) -> tuple[int | None, str]:
-    lowered = description.lower()
+    normalized_description = unicodedata.normalize("NFKC", description).casefold()
     rules = db.scalars(
         select(ClassificationRule)
         .where(ClassificationRule.enabled.is_(True))
         .order_by(ClassificationRule.priority.asc(), ClassificationRule.id.asc())
     ).all()
     for rule in rules:
-        if rule.keyword.lower() in lowered:
+        normalized_keyword = unicodedata.normalize("NFKC", rule.keyword).casefold()
+        if normalized_keyword in normalized_description:
             return rule.category_id, rule.transaction_kind
     category_kind = "income" if amount > 0 else "expense"
     fallback = db.scalar(

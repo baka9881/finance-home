@@ -155,7 +155,13 @@ def test_reclassify_existing_uncategorized_transactions(client: TestClient):
     uncategorized = next(item for item in categories if item["name"] == "未分類")
     today = date.today().isoformat()
 
-    for description in ("APPLE.COM/BILL", "統一超商－品冠", "國外交易手續費 -APPLE.", "陌生商家"):
+    for description in (
+        "APPLE.COM/BILL",
+        "統一超商－品冠",
+        "國外交易手續費 -APPLE.",
+        "ＷｅＭｏＳｃｏｏｔｅ",
+        "陌生商家",
+    ):
         response = client.post(
             "/api/transactions",
             json={
@@ -171,12 +177,13 @@ def test_reclassify_existing_uncategorized_transactions(client: TestClient):
 
     result = client.post("/api/transactions/reclassify")
     assert result.status_code == 200, result.text
-    assert result.json() == {"updated": 3, "remaining": 1}
+    assert result.json() == {"updated": 4, "remaining": 1}
 
     rows = {item["description"]: item["category_name"] for item in client.get("/api/transactions").json()}
     assert rows["APPLE.COM/BILL"] == "訂閱"
     assert rows["統一超商－品冠"] == "餐飲"
     assert rows["國外交易手續費 -APPLE."] == "利息與費用"
+    assert rows["ＷｅＭｏＳｃｏｏｔｅ"] == "交通"
     assert rows["陌生商家"] == "未分類"
 
 
