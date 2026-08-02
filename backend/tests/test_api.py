@@ -10,6 +10,7 @@ from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
 
 from app import main as main_module
+from app import services as services_module
 from app.database import Base, get_db
 from app.main import app
 from app.services import seed_defaults
@@ -83,6 +84,78 @@ def test_account_balance_and_dashboard(client: TestClient):
     assert payload["assets"] == 100000
     assert payload["liabilities"] == 12000
     assert payload["net_worth"] == 88000
+
+
+def test_binance_spot_sync_updates_holdings_without_double_counting(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
+    fx = client.post(
+        "/api/fx/manual",
+        json={
+            "currency": "USD",
+            "rate_date": date.today().isoformat(),
+            "rate_to_twd": 32,
+        },
+    )
+    assert fx.status_code == 200, fx.text
+    account_response = client.post(
+        "/api/accounts",
+        json={
+            "name": "幣安現貨",
+            "institution": "Binance",
+            "account_type": "crypto",
+            "nature": "asset",
+            "currency": "TWD",
+            "is_liquid": True,
+            "opening_balance": 999999,
+            "opening_date": date.today().isoformat(),
+        },
+    )
+    assert account_response.status_code == 201, account_response.text
+    account_id = account_response.json()["id"]
+
+    balances = [
+        {"asset": "BTC", "free": "0.5", "locked": "0"},
+        {"asset": "USDT", "free": "100", "locked": "0"},
+    ]
+    monkeypatch.setattr(
+        services_module,
+        "_fetch_binance_spot_snapshot",
+        lambda _key, _secret: (balances, {"BTCUSDT": services_module.Decimal("60000")}),
+    )
+    connected = client.post(
+        "/api/exchanges/binance/connect",
+        json={"account_id": account_id, "api_key": "read-only-key", "api_secret": "read-only-secret"},
+    )
+    assert connected.status_code == 200, connected.text
+
+    account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
+    assert account["balance_twd"] == 3200
+    assert account["investments_twd"] == 960000
+    assert account["total_twd"] == 963200
+    assert account["valuation_mode"] == "auto_estimate"
+    positions = client.get("/api/positions").json()
+    assert len(positions) == 1
+    assert positions[0]["symbol"] == "bitcoin"
+    assert positions[0]["quantity"] == 0.5
+    assert positions[0]["price"] == 60000
+
+    status = client.get("/api/exchanges/binance").json()
+    assert status[0]["connected"] is True
+    skipped = client.post("/api/exchanges/sync")
+    assert skipped.status_code == 200
+    assert skipped.json()["skipped"] == 1
+
+    balances.clear()
+    balances.append({"asset": "USDT", "free": "125", "locked": "0"})
+    refreshed = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert refreshed.status_code == 200, refreshed.text
+    assert refreshed.json()["updated"] == 1
+    assert client.get("/api/positions").json() == []
+    account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
+    assert account["total_twd"] == 4000
 
 
 def test_transfer_does_not_pollute_cashflow(client: TestClient):

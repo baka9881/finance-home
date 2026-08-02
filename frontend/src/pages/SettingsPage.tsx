@@ -1,6 +1,7 @@
 import { FormEvent, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
+  Bitcoin,
   BookOpen,
   Check,
   Database,
@@ -52,11 +53,28 @@ interface Rule {
   enabled: boolean;
 }
 
+interface BinanceConnection {
+  account_id: number;
+  account_name: string;
+  owner: "me" | "partner" | "shared";
+  owner_label: string;
+  connected: boolean;
+  last_sync_at?: string;
+}
+
+interface ExchangeSyncResult {
+  connected: number;
+  updated: number;
+  skipped: number;
+  errors: string[];
+}
+
 export default function SettingsPage() {
   const client = useQueryClient();
   const restoreInput = useRef<HTMLInputElement>(null);
   const [message, setMessage] = useState("");
   const [marketSettingsOpen, setMarketSettingsOpen] = useState(false);
+  const [exchangeSettingsOpen, setExchangeSettingsOpen] = useState(false);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [theme, setTheme] = useState<AppTheme>(() => getStoredTheme());
   const [lastBackupAt, setLastBackupAt] = useState(() => localStorage.getItem("finance:lastBackupAt") || "");
@@ -65,6 +83,10 @@ export default function SettingsPage() {
   const fx = useQuery({ queryKey: ["fx"], queryFn: () => api<FxRate[]>("/fx") });
   const rules = useQuery({ queryKey: ["rules"], queryFn: () => api<Rule[]>("/rules") });
   const categories = useQuery({ queryKey: ["categories"], queryFn: () => api<Category[]>("/categories") });
+  const binanceConnections = useQuery({
+    queryKey: ["binance-connections"],
+    queryFn: () => api<BinanceConnection[]>("/exchanges/binance"),
+  });
   const latestFxDate = fx.data?.reduce((latest, rate) => (rate.rate_date > latest ? rate.rate_date : latest), "") || "";
 
   const saveSettings = useMutation({
@@ -83,6 +105,46 @@ export default function SettingsPage() {
     onSuccess: (result) => {
       client.invalidateQueries({ queryKey: ["fx"] });
       setMessage(`央行匯率更新完成，寫入 ${result.saved} 筆資料。`);
+    },
+  });
+  const connectBinance = useMutation({
+    mutationFn: (payload: { account_id: number; api_key: string; api_secret: string }) =>
+      api("/exchanges/binance/connect", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ["binance-connections"] });
+      client.invalidateQueries({ queryKey: ["accounts"] });
+      client.invalidateQueries({ queryKey: ["positions"] });
+      client.invalidateQueries({ queryKey: ["dashboard"] });
+      setExchangeSettingsOpen(false);
+      setMessage("幣安已連接，交易所餘額與持倉已同步。");
+    },
+  });
+  const syncBinance = useMutation({
+    mutationFn: (accountId?: number) =>
+      api<ExchangeSyncResult>(
+        `/exchanges/sync?force=true${accountId ? `&account_id=${accountId}` : ""}`,
+        { method: "POST" },
+      ),
+    onSuccess: (result) => {
+      client.invalidateQueries({ queryKey: ["binance-connections"] });
+      client.invalidateQueries({ queryKey: ["accounts"] });
+      client.invalidateQueries({ queryKey: ["positions"] });
+      client.invalidateQueries({ queryKey: ["dashboard"] });
+      setMessage(
+        result.errors.length
+          ? `同步未完成：${result.errors.join("、")}`
+          : `交易所同步完成，更新 ${result.updated} 個帳戶。`,
+      );
+    },
+  });
+  const disconnectBinance = useMutation({
+    mutationFn: (accountId: number) => api(`/exchanges/binance/${accountId}`, { method: "DELETE" }),
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ["binance-connections"] });
+      setMessage("已停止交易所自動同步；既有持倉資料會保留。");
     },
   });
   const manualFx = useMutation({
@@ -141,6 +203,16 @@ export default function SettingsPage() {
     const form = new FormData(event.currentTarget);
     saveSettings.mutate(String(form.get("api_key") || ""));
     event.currentTarget.reset();
+  }
+
+  function submitBinance(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const form = new FormData(event.currentTarget);
+    connectBinance.mutate({
+      account_id: Number(form.get("account_id")),
+      api_key: String(form.get("api_key") || ""),
+      api_secret: String(form.get("api_secret") || ""),
+    });
   }
 
   function submitManualFx(event: FormEvent<HTMLFormElement>) {
@@ -319,6 +391,121 @@ export default function SettingsPage() {
           )}
         </Card>
       </div>
+
+      <Card className="mt-6 p-6">
+        <div className="flex flex-col justify-between gap-5 lg:flex-row lg:items-start">
+          <div className="flex items-start gap-4">
+            <div className="rounded-2xl bg-amber-50 p-3 text-amber-700"><Bitcoin size={20} /></div>
+            <div>
+              <div className="flex flex-wrap items-center gap-2">
+                <h2 className="font-bold text-ink">交易所自動同步</h2>
+                <Badge tone={binanceConnections.data?.some((item) => item.connected) ? "green" : "amber"}>
+                  {binanceConnections.data?.some((item) => item.connected) ? "已連接幣安" : "尚未連接"}
+                </Badge>
+              </div>
+              <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-500">
+                開啟財務居後會自動同步幣安現貨餘額與持倉，持續使用時每十五分鐘更新一次。帳戶總值會自動避免與持倉重複加總。
+              </p>
+              <p className="mt-2 text-xs leading-5 text-amber-700">
+                請建立只有讀取權限的 API Key，務必關閉現貨交易、合約交易與提領權限。
+              </p>
+            </div>
+          </div>
+          <div className="flex shrink-0 flex-wrap gap-2">
+            {binanceConnections.data?.some((item) => item.connected) && (
+              <Button
+                variant="secondary"
+                onClick={() => syncBinance.mutate(undefined)}
+                disabled={syncBinance.isPending}
+              >
+                <RefreshCw size={15} className={syncBinance.isPending ? "animate-spin" : ""} />
+                立即同步
+              </Button>
+            )}
+            <Button variant="ghost" onClick={() => setExchangeSettingsOpen((value) => !value)}>
+              <KeyRound size={15} /> {exchangeSettingsOpen ? "收起設定" : "連接交易所"}
+            </Button>
+          </div>
+        </div>
+
+        {binanceConnections.data?.some((item) => item.connected) && (
+          <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+            {binanceConnections.data.filter((item) => item.connected).map((item) => (
+              <div key={item.account_id} className="rounded-2xl border border-slate-100 p-4">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="font-semibold text-slate-800">{item.account_name}</p>
+                    <p className="mt-1 text-xs text-slate-400">所有人：{item.owner_label}</p>
+                  </div>
+                  <Badge tone="green">自動同步</Badge>
+                </div>
+                <p className="mt-3 text-xs text-slate-500">
+                  上次同步：{item.last_sync_at
+                    ? new Date(`${item.last_sync_at}Z`).toLocaleString("zh-TW", { hour12: false })
+                    : "尚未同步"}
+                </p>
+                <div className="mt-3 flex gap-2">
+                  <Button
+                    variant="secondary"
+                    onClick={() => syncBinance.mutate(item.account_id)}
+                    disabled={syncBinance.isPending}
+                  >
+                    同步
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      if (window.confirm("停止同步後會保留目前帳戶與持倉資料，確定要停止嗎？")) {
+                        disconnectBinance.mutate(item.account_id);
+                      }
+                    }}
+                    disabled={disconnectBinance.isPending}
+                  >
+                    停止同步
+                  </Button>
+                </div>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {exchangeSettingsOpen && (
+          <form className="mt-5 space-y-4" onSubmit={submitBinance}>
+            <div className="grid gap-3 lg:grid-cols-3">
+              <FormStep number={1} title="同步到哪個帳戶？">
+                <Select name="account_id" required>
+                  <option value="">選擇交易所帳戶</option>
+                  {binanceConnections.data?.map((item) => (
+                    <option key={item.account_id} value={item.account_id}>
+                      {item.account_name}（{item.owner_label}）{item.connected ? "－已連接" : ""}
+                    </option>
+                  ))}
+                </Select>
+              </FormStep>
+              <FormStep number={2} title="貼上 API Key" tone="blue">
+                <Input name="api_key" type="password" autoComplete="off" placeholder="Binance API Key" required />
+              </FormStep>
+              <FormStep number={3} title="貼上 Secret Key" tone="purple">
+                <Input name="api_secret" type="password" autoComplete="off" placeholder="Binance Secret Key" required />
+              </FormStep>
+            </div>
+            <div className="flex justify-end">
+              <Button type="submit" disabled={connectBinance.isPending || !binanceConnections.data?.length}>
+                <Save size={15} /> {connectBinance.isPending ? "驗證並同步中…" : "安全連接並同步"}
+              </Button>
+            </div>
+            {connectBinance.isError && (
+              <p className="text-sm text-red-600">{(connectBinance.error as Error).message}</p>
+            )}
+            {!binanceConnections.data?.length && (
+              <p className="text-sm text-amber-700">請先到帳戶頁新增「加密貨幣交易所」帳戶。</p>
+            )}
+            <p className="text-xs leading-5 text-slate-400">
+              幣安不會提供歷史平均成本；原本已填的成本會保留，新同步進來的幣種會先以第一次同步價格作為成本基準。
+            </p>
+          </form>
+        )}
+      </Card>
 
       <Card className="mt-6 overflow-hidden">
         <div className="border-b border-slate-100 px-6 py-5">

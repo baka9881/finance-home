@@ -54,6 +54,7 @@ from .schemas import (
     AccountUpdate,
     AuthLogin,
     BalanceCreate,
+    BinanceConnectionCreate,
     BudgetCreate,
     FxRateCreate,
     GoalCreate,
@@ -70,11 +71,13 @@ from .schemas import (
 )
 from .services import (
     account_summary,
+    binance_connection_statuses,
     calculate_dashboard,
     calculate_health_score,
     classify_transaction,
     create_balance_snapshot,
     decimal_value,
+    disconnect_binance_account,
     export_backup,
     get_latest_balance,
     import_csv,
@@ -88,6 +91,7 @@ from .services import (
     restore_backup,
     seed_defaults,
     seed_demo,
+    sync_binance_account,
     transaction_fingerprint,
     OWNER_LABELS,
 )
@@ -1544,6 +1548,65 @@ def dashboard(db: DB, owner: str = "all"):
 @app.get("/api/analysis/health")
 def financial_health(db: DB):
     return calculate_health_score(db)
+
+
+@app.get("/api/exchanges/binance")
+def get_binance_connections(db: DB):
+    return binance_connection_statuses(db)
+
+
+@app.post("/api/exchanges/binance/connect")
+def connect_binance(payload: BinanceConnectionCreate, db: DB):
+    account = require_account(db, payload.account_id)
+    try:
+        result = sync_binance_account(
+            db,
+            account,
+            force=True,
+            api_key=payload.api_key.strip(),
+            api_secret=payload.api_secret.strip(),
+            save_credentials=True,
+        )
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+    return {"connected": True, **result}
+
+
+@app.delete("/api/exchanges/binance/{account_id}")
+def disconnect_binance(account_id: int, db: DB):
+    account = require_account(db, account_id)
+    disconnect_binance_account(db, account.id)
+    return {"ok": True}
+
+
+@app.post("/api/exchanges/sync")
+def sync_exchanges(db: DB, account_id: int | None = None, force: bool = False):
+    connections = binance_connection_statuses(db)
+    connected_ids = {
+        item["account_id"] for item in connections if item["connected"]
+    }
+    if account_id is not None:
+        if account_id not in connected_ids:
+            raise HTTPException(422, "這個交易所帳戶尚未連接幣安")
+        connected_ids = {account_id}
+
+    results: list[dict[str, Any]] = []
+    errors: list[str] = []
+    for connected_id in sorted(connected_ids):
+        account = require_account(db, connected_id)
+        try:
+            results.append(sync_binance_account(db, account, force=force))
+        except ValueError as exc:
+            db.rollback()
+            errors.append(f"{account.name}：{exc}")
+    return {
+        "connected": len(connected_ids),
+        "updated": sum(1 for item in results if item.get("updated")),
+        "skipped": sum(1 for item in results if item.get("skipped")),
+        "results": results,
+        "errors": errors,
+    }
 
 
 @app.get("/api/settings")

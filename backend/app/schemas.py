@@ -170,6 +170,12 @@ class SettingsUpdate(BaseModel):
     alpha_vantage_api_key: str | None = None
 
 
+class BinanceConnectionCreate(BaseModel):
+    account_id: int
+    api_key: str = Field(min_length=8, max_length=200)
+    api_secret: str = Field(min_length=8, max_length=300)
+
+
 class BackupPayload(BaseModel):
     version: int = 1
     exported_at: datetime

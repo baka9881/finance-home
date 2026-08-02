@@ -311,6 +311,25 @@ function FinanceApp() {
     };
   }, [ownerFilter, queryClient]);
 
+  useEffect(() => {
+    const syncExchanges = () => {
+      void api<{ updated: number }>("/exchanges/sync", { method: "POST" })
+        .then((result) => {
+          if (!result.updated) return;
+          void queryClient.invalidateQueries({ queryKey: ["accounts"] });
+          void queryClient.invalidateQueries({ queryKey: ["positions"] });
+          void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+        })
+        .catch(() => undefined);
+    };
+    const exchangeTimer = window.setTimeout(syncExchanges, 800);
+    const exchangeInterval = window.setInterval(syncExchanges, 15 * 60 * 1_000);
+    return () => {
+      window.clearTimeout(exchangeTimer);
+      window.clearInterval(exchangeInterval);
+    };
+  }, [queryClient]);
+
   return (
     <div className="min-h-screen bg-canvas">
       <Sidebar

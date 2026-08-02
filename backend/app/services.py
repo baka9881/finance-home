@@ -1,19 +1,24 @@
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
+import hmac
 import io
 import json
 import os
+import secrets
 import time
 import unicodedata
 from collections import defaultdict
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from typing import Any
+from urllib.parse import urlencode
 
 import httpx
 import pandas as pd
+from cryptography.fernet import Fernet, InvalidToken
 from sqlalchemy import Date as SQLDate
 from sqlalchemy import DateTime as SQLDateTime
 from sqlalchemy import Numeric as SQLNumeric
@@ -35,6 +40,7 @@ from .database import (
     Transaction,
     TransferLink,
     ValuationSnapshot,
+    DATA_DIR,
 )
 
 
@@ -120,6 +126,20 @@ BINANCE_SPOT_SYMBOLS = {
     "chainlink": "LINKUSDT",
     "litecoin": "LTCUSDT",
 }
+
+BINANCE_ASSET_SYMBOLS = {
+    "BTC": "bitcoin",
+    "ETH": "ethereum",
+    "SOL": "solana",
+    "XRP": "ripple",
+    "BNB": "binancecoin",
+    "ADA": "cardano",
+    "DOGE": "dogecoin",
+    "DOT": "polkadot",
+    "LINK": "chainlink",
+    "LTC": "litecoin",
+}
+BINANCE_CASH_ASSETS = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD"}
 
 
 def decimal_value(value: Any, default: Decimal = ZERO) -> Decimal:
@@ -916,12 +936,307 @@ def _reuse_cached_market_price(
     result["errors"].append(f"{label}：{reason}，且目前沒有可沿用的價格")
 
 
+def _binance_setting_key(account_id: int, suffix: str) -> str:
+    return f"binance:{account_id}:{suffix}"
+
+
+def _get_setting_value(db: Session, key: str) -> str:
+    row = db.get(AppSetting, key)
+    return row.value if row else ""
+
+
+def _set_setting_value(db: Session, key: str, value: str) -> None:
+    row = db.get(AppSetting, key)
+    if not row:
+        row = AppSetting(key=key, value="")
+        db.add(row)
+    row.value = value
+
+
+def _credential_cipher() -> Fernet:
+    secret = (
+        os.getenv("FINANCE_CREDENTIAL_SECRET", "").strip()
+        or os.getenv("FINANCE_AUTH_SECRET", "").strip()
+        or os.getenv("FINANCE_APP_PASSWORD", "").strip()
+    )
+    if not secret:
+        local_key_path = DATA_DIR / ".credential.key"
+        if local_key_path.exists():
+            secret = local_key_path.read_text(encoding="utf-8").strip()
+        else:
+            DATA_DIR.mkdir(parents=True, exist_ok=True)
+            secret = secrets.token_urlsafe(48)
+            local_key_path.write_text(secret, encoding="utf-8")
+    key = base64.urlsafe_b64encode(hashlib.sha256(secret.encode("utf-8")).digest())
+    return Fernet(key)
+
+
+def encrypt_credential(value: str) -> str:
+    encrypted = _credential_cipher().encrypt(value.strip().encode("utf-8")).decode("ascii")
+    return f"enc:v1:{encrypted}"
+
+
+def decrypt_credential(value: str) -> str:
+    if not value.startswith("enc:v1:"):
+        raise ValueError("交易所連線憑證格式不正確，請重新連線")
+    try:
+        return _credential_cipher().decrypt(value.removeprefix("enc:v1:").encode("ascii")).decode("utf-8")
+    except InvalidToken as exc:
+        raise ValueError("交易所連線憑證無法解密，請重新連線") from exc
+
+
+def binance_connection_statuses(db: Session) -> list[dict[str, Any]]:
+    accounts = db.scalars(
+        select(Account)
+        .where(Account.account_type == "crypto", Account.archived.is_(False))
+        .order_by(Account.name)
+    ).all()
+    result: list[dict[str, Any]] = []
+    for account in accounts:
+        api_key = _get_setting_value(db, _binance_setting_key(account.id, "api_key"))
+        api_secret = _get_setting_value(db, _binance_setting_key(account.id, "api_secret"))
+        result.append(
+            {
+                "account_id": account.id,
+                "account_name": account.name,
+                "owner": account.owner,
+                "owner_label": OWNER_LABELS.get(account.owner, account.owner),
+                "connected": bool(api_key and api_secret),
+                "last_sync_at": _get_setting_value(
+                    db, _binance_setting_key(account.id, "last_sync_at")
+                ) or None,
+            }
+        )
+    return result
+
+
+def disconnect_binance_account(db: Session, account_id: int) -> None:
+    keys = [
+        _binance_setting_key(account_id, suffix)
+        for suffix in ("api_key", "api_secret", "last_sync_at", "position_ids")
+    ]
+    db.execute(delete(AppSetting).where(AppSetting.key.in_(keys)))
+    db.commit()
+
+
+def _binance_response_payload(response: httpx.Response) -> Any:
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise ValueError("幣安暫時沒有回傳可讀取的資料") from exc
+    if response.is_error:
+        detail = payload.get("msg") if isinstance(payload, dict) else None
+        code = payload.get("code") if isinstance(payload, dict) else None
+        if code == -2015:
+            raise ValueError("API Key 無效、權限不足，或限制了目前的 IP")
+        raise ValueError(f"幣安連線失敗：{detail or response.status_code}")
+    return payload
+
+
+def _fetch_binance_spot_snapshot(
+    api_key: str,
+    api_secret: str,
+) -> tuple[list[dict[str, Any]], dict[str, Decimal]]:
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": "FinanceHome/1.0",
+        "X-MBX-APIKEY": api_key,
+    }
+    with httpx.Client(timeout=20, follow_redirects=True, headers=headers) as client:
+        time_response = client.get("https://api.binance.com/api/v3/time")
+        time_payload = _binance_response_payload(time_response)
+        timestamp = int(time_payload.get("serverTime") or int(time.time() * 1000))
+        params = [
+            ("omitZeroBalances", "true"),
+            ("recvWindow", "5000"),
+            ("timestamp", str(timestamp)),
+        ]
+        signature_payload = urlencode(params)
+        signature = hmac.new(
+            api_secret.encode("utf-8"),
+            signature_payload.encode("utf-8"),
+            hashlib.sha256,
+        ).hexdigest()
+        account_response = client.get(
+            "https://api.binance.com/api/v3/account",
+            params=[*params, ("signature", signature)],
+        )
+        account_payload = _binance_response_payload(account_response)
+
+        prices_response = client.get("https://data-api.binance.vision/api/v3/ticker/price")
+        prices_payload = _binance_response_payload(prices_response)
+
+    balances = account_payload.get("balances", []) if isinstance(account_payload, dict) else []
+    prices = {
+        str(item.get("symbol")): decimal_value(item.get("price"))
+        for item in prices_payload
+        if isinstance(item, dict) and item.get("symbol") and decimal_value(item.get("price")) > 0
+    }
+    return balances, prices
+
+
+def sync_binance_account(
+    db: Session,
+    account: Account,
+    *,
+    force: bool = False,
+    api_key: str | None = None,
+    api_secret: str | None = None,
+    save_credentials: bool = False,
+) -> dict[str, Any]:
+    if account.account_type != "crypto" or account.nature != "asset":
+        raise ValueError("只能把幣安連接到加密貨幣資產帳戶")
+
+    last_sync_key = _binance_setting_key(account.id, "last_sync_at")
+    last_sync_value = _get_setting_value(db, last_sync_key)
+    if not force and not api_key and last_sync_value:
+        try:
+            last_sync_at = datetime.fromisoformat(last_sync_value)
+            if datetime.utcnow() - last_sync_at < timedelta(minutes=15):
+                return {
+                    "account_id": account.id,
+                    "account_name": account.name,
+                    "updated": False,
+                    "skipped": True,
+                    "last_sync_at": last_sync_value,
+                    "positions": account_summary(db, account)["positions_count"],
+                    "warnings": [],
+                }
+        except ValueError:
+            pass
+
+    if not api_key:
+        encrypted_key = _get_setting_value(db, _binance_setting_key(account.id, "api_key"))
+        encrypted_secret = _get_setting_value(db, _binance_setting_key(account.id, "api_secret"))
+        if not encrypted_key or not encrypted_secret:
+            raise ValueError("這個交易所帳戶尚未連接幣安")
+        api_key = decrypt_credential(encrypted_key)
+        api_secret = decrypt_credential(encrypted_secret)
+
+    try:
+        balances, prices = _fetch_binance_spot_snapshot(api_key, api_secret or "")
+    except ValueError:
+        raise
+    except httpx.HTTPError as exc:
+        raise ValueError("目前無法連上幣安，請稍後再同步") from exc
+    usd_rate, usd_estimated = latest_fx_rate(db, "USD")
+    if usd_estimated and usd_rate == ONE:
+        raise ValueError("尚未設定美元匯率，請先到設定更新匯率")
+
+    warnings: list[str] = []
+    cash_usd = ZERO
+    seen_position_ids: set[int] = set()
+    for item in balances:
+        asset = str(item.get("asset") or "").upper()
+        quantity = decimal_value(item.get("free")) + decimal_value(item.get("locked"))
+        if not asset or quantity <= 0:
+            continue
+        if asset in BINANCE_CASH_ASSETS:
+            cash_usd += quantity
+            continue
+
+        pair = f"{asset}USDT"
+        price = prices.get(pair)
+        if not price:
+            warnings.append(f"{asset} 暫時沒有 USDT 報價，未列入總值")
+            continue
+        symbol = BINANCE_ASSET_SYMBOLS.get(asset, f"binance-{asset.lower()}")
+        position = db.scalar(
+            select(Position).where(
+                Position.account_id == account.id,
+                Position.market == "CRYPTO",
+                Position.symbol == symbol,
+            )
+        )
+        if not position:
+            position = Position(
+                account_id=account.id,
+                market="CRYPTO",
+                symbol=symbol,
+                name=asset,
+                quantity=quantity,
+                average_cost=price,
+                currency="USD",
+            )
+            db.add(position)
+        else:
+            position.quantity = quantity
+            position.name = position.name or asset
+            position.currency = "USD"
+            position.manual_price = None
+            position.archived = False
+            if decimal_value(position.average_cost) <= 0:
+                position.average_cost = price
+        db.flush()
+        seen_position_ids.add(position.id)
+        _upsert_price(db, "CRYPTO", symbol, date.today(), price, "USD", "Binance")
+
+    previous_ids_value = _get_setting_value(
+        db, _binance_setting_key(account.id, "position_ids")
+    )
+    try:
+        previous_ids = {int(item) for item in json.loads(previous_ids_value or "[]")}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        previous_ids = set()
+    for position_id in previous_ids - seen_position_ids:
+        position = db.get(Position, position_id)
+        if position and position.account_id == account.id:
+            position.archived = True
+
+    if save_credentials:
+        _set_setting_value(
+            db, _binance_setting_key(account.id, "api_key"), encrypt_credential(api_key)
+        )
+        _set_setting_value(
+            db,
+            _binance_setting_key(account.id, "api_secret"),
+            encrypt_credential(api_secret or ""),
+        )
+
+    cash_twd = cash_usd * usd_rate
+    account_rate, _ = latest_fx_rate(db, account.currency)
+    account.auto_balance_base_twd = cash_twd
+    account.balance_includes_positions = False
+    create_balance_snapshot(
+        db,
+        account,
+        cash_twd / account_rate,
+        date.today(),
+        account_rate,
+        source="binance_sync",
+    )
+    synced_at = datetime.utcnow().isoformat(timespec="seconds")
+    _set_setting_value(db, last_sync_key, synced_at)
+    _set_setting_value(
+        db,
+        _binance_setting_key(account.id, "position_ids"),
+        json.dumps(sorted(seen_position_ids)),
+    )
+    db.flush()
+    record_valuation(db)
+    db.commit()
+    return {
+        "account_id": account.id,
+        "account_name": account.name,
+        "updated": True,
+        "skipped": False,
+        "last_sync_at": synced_at,
+        "positions": len(seen_position_ids),
+        "warnings": warnings,
+    }
+
+
 def _refresh_crypto_from_binance(
     client: httpx.Client,
     db: Session,
     position: Position,
 ) -> bool:
-    pair = BINANCE_SPOT_SYMBOLS.get(position.symbol.lower())
+    normalized_symbol = position.symbol.lower()
+    pair = (
+        f"{normalized_symbol.removeprefix('binance-').upper()}USDT"
+        if normalized_symbol.startswith("binance-")
+        else BINANCE_SPOT_SYMBOLS.get(normalized_symbol)
+    )
     if not pair or position.currency.upper() != "USD":
         return False
     try:
