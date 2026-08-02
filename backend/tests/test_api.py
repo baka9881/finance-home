@@ -158,6 +158,22 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
     assert account["total_twd"] == 4000
 
 
+def test_binance_credentials_remove_pasted_whitespace_and_invisible_characters():
+    assert services_module._clean_binance_credential("  abc\n123\u200b  ") == "abc123"
+
+
+def test_binance_signature_error_has_actionable_message():
+    request = services_module.httpx.Request("GET", "https://api.binance.com/api/v3/account")
+    response = services_module.httpx.Response(
+        400,
+        request=request,
+        json={"code": -1022, "msg": "Signature for this request is not valid."},
+    )
+
+    with pytest.raises(ValueError, match="API Key 與 Secret Key 是同一次建立"):
+        services_module._binance_response_payload(response)
+
+
 def test_transfer_does_not_pollute_cashflow(client: TestClient):
     source = create_account(client, "來源帳戶")
     target = create_account(client, "目標帳戶")

@@ -1027,16 +1027,37 @@ def _binance_response_payload(response: httpx.Response) -> Any:
     if response.is_error:
         detail = payload.get("msg") if isinstance(payload, dict) else None
         code = payload.get("code") if isinstance(payload, dict) else None
+        if code == -1022:
+            raise ValueError(
+                "Binance 簽章驗證失敗。請確認 API Key 與 Secret Key 是同一次建立的一組；"
+                "如果 Secret Key 已離開建立頁面，請刪除舊金鑰並重新建立 HMAC 金鑰。"
+            )
+        if code == -1021:
+            raise ValueError("Binance 時間驗證失敗，請稍後再試；系統會重新取得 Binance 伺服器時間。")
         if code == -2015:
             raise ValueError("API Key 無效、權限不足，或限制了目前的 IP")
         raise ValueError(f"幣安連線失敗：{detail or response.status_code}")
     return payload
 
 
+def _clean_binance_credential(value: str) -> str:
+    """Remove whitespace and invisible formatting copied with Binance credentials."""
+    normalized = unicodedata.normalize("NFKC", value or "")
+    return "".join(
+        char
+        for char in normalized
+        if not char.isspace() and unicodedata.category(char) != "Cf"
+    )
+
+
 def _fetch_binance_spot_snapshot(
     api_key: str,
     api_secret: str,
 ) -> tuple[list[dict[str, Any]], dict[str, Decimal]]:
+    api_key = _clean_binance_credential(api_key)
+    api_secret = _clean_binance_credential(api_secret)
+    if not api_key or not api_secret:
+        raise ValueError("請同時填入 Binance API Key 與 Secret Key。")
     headers = {
         "Accept": "application/json",
         "User-Agent": "FinanceHome/1.0",
@@ -1057,9 +1078,9 @@ def _fetch_binance_spot_snapshot(
             signature_payload.encode("utf-8"),
             hashlib.sha256,
         ).hexdigest()
+        signed_query = f"{signature_payload}&signature={signature}"
         account_response = client.get(
-            "https://api.binance.com/api/v3/account",
-            params=[*params, ("signature", signature)],
+            f"https://api.binance.com/api/v3/account?{signed_query}",
         )
         account_payload = _binance_response_payload(account_response)
 
