@@ -104,6 +104,7 @@ export default function TransactionsPage() {
   const [ownerFilter] = useOwnerFilter();
   const [accountFilter, setAccountFilter] = useState("");
   const [search, setSearch] = useState("");
+  const [onlyUnclassified, setOnlyUnclassified] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
   const [manualScenario, setManualScenario] = useState<ManualScenario | null>(null);
   const [manualKind, setManualKind] = useState("expense");
@@ -173,18 +174,24 @@ export default function TransactionsPage() {
 
   const filteredTransactions = useMemo(() => {
     const query = search.trim().toLowerCase();
-    if (!query) return transactions.data || [];
-    return (transactions.data || []).filter(
-      (item) =>
-        item.description.toLowerCase().includes(query) ||
-        item.category_name.toLowerCase().includes(query) ||
-        item.account_name.toLowerCase().includes(query),
-    );
-  }, [transactions.data, search]);
+    let rows = transactions.data || [];
+    if (query) {
+      rows = rows.filter(
+        (item) =>
+          item.description.toLowerCase().includes(query) ||
+          item.category_name.toLowerCase().includes(query) ||
+          item.account_name.toLowerCase().includes(query),
+      );
+    }
+    if (onlyUnclassified) {
+      rows = rows.filter((transaction) => transaction.category_name === "未分類");
+    }
+    return rows;
+  }, [transactions.data, search, onlyUnclassified]);
   const importMappingReady = Boolean(
     mapping.date && mapping.description && (mapping.amount || mapping.debit || mapping.credit),
   );
-  const unclassifiedCount = filteredTransactions.filter(
+  const unclassifiedCount = (transactions.data || []).filter(
     (transaction) => transaction.category_name === "未分類",
   ).length;
 
@@ -218,10 +225,14 @@ export default function TransactionsPage() {
         { method: "POST" },
       ),
     onSuccess: (result) => {
+      const needsManualClassification = !result.updated && unclassifiedCount > 0;
+      if (needsManualClassification) setOnlyUnclassified(true);
       setClassificationMessage(
         result.updated
           ? `已自動分類 ${result.updated} 筆交易。`
-          : "目前沒有能自動辨識的未分類交易。",
+          : needsManualClassification
+            ? "這筆交易無法自動判斷，已替你顯示出來，請手動選擇分類。"
+            : "目前沒有能自動辨識的未分類交易。",
       );
       client.invalidateQueries({ queryKey: ["transactions"] });
       client.invalidateQueries({ queryKey: ["dashboard"] });
@@ -475,6 +486,14 @@ export default function TransactionsPage() {
         <div className="flex flex-wrap gap-2">
           {unclassifiedCount > 0 && (
             <Button
+              variant="ghost"
+              onClick={() => setOnlyUnclassified((current) => !current)}
+            >
+              {onlyUnclassified ? "顯示全部交易" : `只看未分類（${unclassifiedCount}）`}
+            </Button>
+          )}
+          {unclassifiedCount > 0 && (
+            <Button
               variant="secondary"
               onClick={() => {
                 setClassificationMessage("");
@@ -510,9 +529,17 @@ export default function TransactionsPage() {
         {!filteredTransactions.length ? (
           <EmptyState
             icon={<ArrowRightLeft size={25} />}
-            title="這個月份沒有交易"
-            description="你可以手動新增交易，或匯入銀行與信用卡提供的 CSV 明細。"
-            action={<Button onClick={() => setImportOpen(true)}>匯入交易</Button>}
+            title={onlyUnclassified ? "這個月份沒有未分類交易" : "這個月份沒有交易"}
+            description={
+              onlyUnclassified
+                ? "目前顯示範圍內的交易都已完成分類。"
+                : "你可以手動新增交易，或匯入銀行與信用卡提供的 CSV 明細。"
+            }
+            action={
+              onlyUnclassified
+                ? <Button onClick={() => setOnlyUnclassified(false)}>顯示全部交易</Button>
+                : <Button onClick={() => setImportOpen(true)}>匯入交易</Button>
+            }
           />
         ) : (
           <>
