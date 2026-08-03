@@ -1263,10 +1263,18 @@ def sync_binance_account(
     wallet_total_twd = wallet_total_usdt * usd_rate if wallet_total_usdt is not None else None
     snapshot_twd = wallet_total_twd if wallet_total_twd is not None else cash_twd
     account_rate, _ = latest_fx_rate(db, account.currency)
-    account.auto_balance_base_twd = (
-        wallet_total_twd - positions_twd if wallet_total_twd is not None else cash_twd
-    )
-    account.balance_includes_positions = wallet_total_twd is not None
+    if wallet_total_twd is not None:
+        # Binance's all-wallet total already includes Spot, Funding, Futures and
+        # every position in those wallets. Keep imported positions as a
+        # breakdown only; adding them to an auto base would double-count any
+        # pre-existing/manual holding attached to the same account.
+        account.auto_balance_base_twd = None
+        account.balance_includes_positions = True
+    else:
+        # If the all-wallet endpoint is temporarily unavailable, fall back to
+        # the old estimate: liquid Spot assets plus the visible positions.
+        account.auto_balance_base_twd = cash_twd
+        account.balance_includes_positions = False
     create_balance_snapshot(
         db,
         account,

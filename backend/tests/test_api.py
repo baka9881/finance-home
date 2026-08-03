@@ -116,6 +116,21 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
     assert account_response.status_code == 201, account_response.text
     account_id = account_response.json()["id"]
 
+    manual_position = client.post(
+        "/api/positions",
+        json={
+            "account_id": account_id,
+            "market": "US",
+            "symbol": "MSTR",
+            "name": "MicroStrategy",
+            "quantity": 1,
+            "average_cost": 100,
+            "currency": "USD",
+            "manual_price": 100,
+        },
+    )
+    assert manual_position.status_code == 201, manual_position.text
+
     balances = [
         {"asset": "BTC", "free": "0.5", "locked": "0"},
         {"asset": "USDT", "free": "100", "locked": "0"},
@@ -143,16 +158,16 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
 
     account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
     assert account["balance_twd"] == 976000
-    assert account["investments_twd"] == 960000
+    assert account["investments_twd"] == 963200
     assert account["total_twd"] == 976000
-    assert account["auto_balance_base_twd"] == 16000
+    assert account["auto_balance_base_twd"] is None
     assert account["balance_includes_positions"] is True
-    assert account["valuation_mode"] == "auto_estimate"
+    assert account["valuation_mode"] == "manual_total"
     positions = client.get("/api/positions").json()
-    assert len(positions) == 1
-    assert positions[0]["symbol"] == "bitcoin"
-    assert positions[0]["quantity"] == 0.5
-    assert positions[0]["price"] == 60000
+    assert len(positions) == 2
+    bitcoin = next(item for item in positions if item["symbol"] == "bitcoin")
+    assert bitcoin["quantity"] == 0.5
+    assert bitcoin["price"] == 60000
 
     status = client.get("/api/exchanges/binance").json()
     assert status[0]["connected"] is True
@@ -166,9 +181,14 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
     refreshed = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
     assert refreshed.status_code == 200, refreshed.text
     assert refreshed.json()["updated"] == 1
-    assert client.get("/api/positions").json() == []
+    positions = client.get("/api/positions").json()
+    assert len(positions) == 1
+    assert positions[0]["symbol"] == "MSTR"
     account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
     assert account["total_twd"] == 4000
+    assert account["investments_twd"] == 3200
+    assert account["auto_balance_base_twd"] is None
+    assert account["valuation_mode"] == "manual_total"
 
 
 def test_binance_credentials_remove_pasted_whitespace_and_invisible_characters():
