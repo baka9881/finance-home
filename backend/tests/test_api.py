@@ -119,11 +119,18 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
     balances = [
         {"asset": "BTC", "free": "0.5", "locked": "0"},
         {"asset": "USDT", "free": "100", "locked": "0"},
+        {"asset": "DUST", "free": "1", "locked": "0"},
     ]
     monkeypatch.setattr(
         services_module,
         "_fetch_binance_spot_snapshot",
-        lambda _key, _secret: (balances, {"BTCUSDT": services_module.Decimal("60000")}),
+        lambda _key, _secret: (
+            balances,
+            {
+                "BTCUSDT": services_module.Decimal("60000"),
+                "DUSTUSDT": services_module.Decimal("0.01"),
+            },
+        ),
     )
     connected = client.post(
         "/api/exchanges/binance/connect",

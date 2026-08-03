@@ -140,6 +140,7 @@ BINANCE_ASSET_SYMBOLS = {
     "LTC": "litecoin",
 }
 BINANCE_CASH_ASSETS = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD"}
+BINANCE_MIN_POSITION_VALUE_TWD = Decimal("10")
 
 
 def decimal_value(value: Any, default: Decimal = ZERO) -> Decimal:
@@ -1160,6 +1161,8 @@ def sync_binance_account(
         price = prices.get(pair)
         if not price:
             warnings.append(f"{asset} 暫時沒有 USDT 報價，未列入總值")
+            continue
+        if quantity * price * usd_rate < BINANCE_MIN_POSITION_VALUE_TWD:
             continue
         symbol = BINANCE_ASSET_SYMBOLS.get(asset, f"binance-{asset.lower()}")
         position = db.scalar(
