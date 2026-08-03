@@ -1051,10 +1051,36 @@ def _clean_binance_credential(value: str) -> str:
     )
 
 
+def _binance_signed_query(
+    api_secret: str,
+    timestamp: int,
+    *params: tuple[str, str],
+) -> str:
+    query_params = [*params, ("recvWindow", "5000"), ("timestamp", str(timestamp))]
+    signature_payload = urlencode(query_params)
+    signature = hmac.new(
+        api_secret.encode("utf-8"),
+        signature_payload.encode("utf-8"),
+        hashlib.sha256,
+    ).hexdigest()
+    return f"{signature_payload}&signature={signature}"
+
+
+def _binance_wallet_total(payload: Any) -> Decimal | None:
+    if not isinstance(payload, list):
+        return None
+    active_wallets = [
+        decimal_value(item.get("balance"))
+        for item in payload
+        if isinstance(item, dict) and item.get("activate") is not False
+    ]
+    return sum(active_wallets, ZERO) if active_wallets else ZERO
+
+
 def _fetch_binance_spot_snapshot(
     api_key: str,
     api_secret: str,
-) -> tuple[list[dict[str, Any]], dict[str, Decimal]]:
+) -> tuple[list[dict[str, Any]], dict[str, Decimal], Decimal | None, list[str]]:
     api_key = _clean_binance_credential(api_key)
     api_secret = _clean_binance_credential(api_secret)
     if not api_key or not api_secret:
@@ -1068,22 +1094,33 @@ def _fetch_binance_spot_snapshot(
         time_response = client.get("https://api.binance.com/api/v3/time")
         time_payload = _binance_response_payload(time_response)
         timestamp = int(time_payload.get("serverTime") or int(time.time() * 1000))
-        params = [
+        signed_query = _binance_signed_query(
+            api_secret,
+            timestamp,
             ("omitZeroBalances", "true"),
-            ("recvWindow", "5000"),
-            ("timestamp", str(timestamp)),
-        ]
-        signature_payload = urlencode(params)
-        signature = hmac.new(
-            api_secret.encode("utf-8"),
-            signature_payload.encode("utf-8"),
-            hashlib.sha256,
-        ).hexdigest()
-        signed_query = f"{signature_payload}&signature={signature}"
+        )
         account_response = client.get(
             f"https://api.binance.com/api/v3/account?{signed_query}",
         )
         account_payload = _binance_response_payload(account_response)
+
+        wallet_total_usdt: Decimal | None = None
+        wallet_warnings: list[str] = []
+        try:
+            wallet_query = _binance_signed_query(
+                api_secret,
+                timestamp,
+                ("quoteAsset", "USDT"),
+            )
+            wallet_response = client.get(
+                f"https://api.binance.com/sapi/v1/asset/wallet/balance?{wallet_query}",
+            )
+            wallet_payload = _binance_response_payload(wallet_response)
+            wallet_total_usdt = _binance_wallet_total(wallet_payload)
+        except (ValueError, httpx.HTTPError):
+            wallet_warnings.append(
+                "暫時無法讀取資金與合約等錢包總額，本次先以現貨資產估算"
+            )
 
         prices_response = client.get("https://data-api.binance.vision/api/v3/ticker/price")
         prices_payload = _binance_response_payload(prices_response)
@@ -1094,7 +1131,7 @@ def _fetch_binance_spot_snapshot(
         for item in prices_payload
         if isinstance(item, dict) and item.get("symbol") and decimal_value(item.get("price")) > 0
     }
-    return balances, prices
+    return balances, prices, wallet_total_usdt, wallet_warnings
 
 
 def sync_binance_account(
@@ -1136,7 +1173,9 @@ def sync_binance_account(
         api_secret = decrypt_credential(encrypted_secret)
 
     try:
-        balances, prices = _fetch_binance_spot_snapshot(api_key, api_secret or "")
+        balances, prices, wallet_total_usdt, wallet_warnings = _fetch_binance_spot_snapshot(
+            api_key, api_secret or ""
+        )
     except ValueError:
         raise
     except httpx.HTTPError as exc:
@@ -1145,8 +1184,9 @@ def sync_binance_account(
     if usd_estimated and usd_rate == ONE:
         raise ValueError("尚未設定美元匯率，請先到設定更新匯率")
 
-    warnings: list[str] = []
+    warnings: list[str] = list(wallet_warnings)
     cash_usd = ZERO
+    positions_twd = ZERO
     seen_position_ids: set[int] = set()
     for item in balances:
         asset = str(item.get("asset") or "").upper()
@@ -1162,8 +1202,10 @@ def sync_binance_account(
         if not price:
             warnings.append(f"{asset} 暫時沒有 USDT 報價，未列入總值")
             continue
-        if quantity * price * usd_rate < BINANCE_MIN_POSITION_VALUE_TWD:
+        position_value_twd = quantity * price * usd_rate
+        if position_value_twd < BINANCE_MIN_POSITION_VALUE_TWD:
             continue
+        positions_twd += position_value_twd
         symbol = BINANCE_ASSET_SYMBOLS.get(asset, f"binance-{asset.lower()}")
         position = db.scalar(
             select(Position).where(
@@ -1218,13 +1260,17 @@ def sync_binance_account(
         )
 
     cash_twd = cash_usd * usd_rate
+    wallet_total_twd = wallet_total_usdt * usd_rate if wallet_total_usdt is not None else None
+    snapshot_twd = wallet_total_twd if wallet_total_twd is not None else cash_twd
     account_rate, _ = latest_fx_rate(db, account.currency)
-    account.auto_balance_base_twd = cash_twd
-    account.balance_includes_positions = False
+    account.auto_balance_base_twd = (
+        wallet_total_twd - positions_twd if wallet_total_twd is not None else cash_twd
+    )
+    account.balance_includes_positions = wallet_total_twd is not None
     create_balance_snapshot(
         db,
         account,
-        cash_twd / account_rate,
+        snapshot_twd / account_rate,
         date.today(),
         account_rate,
         source="binance_sync",

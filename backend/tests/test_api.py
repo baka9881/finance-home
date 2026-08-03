@@ -121,6 +121,7 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
         {"asset": "USDT", "free": "100", "locked": "0"},
         {"asset": "DUST", "free": "1", "locked": "0"},
     ]
+    wallet = {"total_usdt": services_module.Decimal("30500")}
     monkeypatch.setattr(
         services_module,
         "_fetch_binance_spot_snapshot",
@@ -130,6 +131,8 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
                 "BTCUSDT": services_module.Decimal("60000"),
                 "DUSTUSDT": services_module.Decimal("0.01"),
             },
+            wallet["total_usdt"],
+            [],
         ),
     )
     connected = client.post(
@@ -139,9 +142,11 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
     assert connected.status_code == 200, connected.text
 
     account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
-    assert account["balance_twd"] == 3200
+    assert account["balance_twd"] == 976000
     assert account["investments_twd"] == 960000
-    assert account["total_twd"] == 963200
+    assert account["total_twd"] == 976000
+    assert account["auto_balance_base_twd"] == 16000
+    assert account["balance_includes_positions"] is True
     assert account["valuation_mode"] == "auto_estimate"
     positions = client.get("/api/positions").json()
     assert len(positions) == 1
@@ -157,6 +162,7 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
 
     balances.clear()
     balances.append({"asset": "USDT", "free": "125", "locked": "0"})
+    wallet["total_usdt"] = services_module.Decimal("125")
     refreshed = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
     assert refreshed.status_code == 200, refreshed.text
     assert refreshed.json()["updated"] == 1
@@ -167,6 +173,17 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
 
 def test_binance_credentials_remove_pasted_whitespace_and_invisible_characters():
     assert services_module._clean_binance_credential("  abc\n123\u200b  ") == "abc123"
+
+
+def test_binance_wallet_total_includes_each_active_wallet():
+    payload = [
+        {"walletName": "Spot", "balance": "1096.65", "activate": True},
+        {"walletName": "Funding", "balance": "413.53", "activate": True},
+        {"walletName": "Futures", "balance": "148.86", "activate": True},
+        {"walletName": "Inactive", "balance": "999", "activate": False},
+    ]
+
+    assert services_module._binance_wallet_total(payload) == services_module.Decimal("1659.04")
 
 
 def test_binance_signature_error_has_actionable_message():

@@ -404,7 +404,7 @@ export default function SettingsPage() {
                 </Badge>
               </div>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-500">
-                開啟財務居後會自動同步幣安現貨餘額與持倉，持續使用時每十五分鐘更新一次。帳戶總值會自動避免與持倉重複加總。
+                開啟財務居後會自動同步幣安現貨、資金與合約等錢包總額，現貨幣種會另外顯示為持倉明細；持續使用時每十五分鐘更新一次，且不會重複加總。
               </p>
               <p className="mt-2 text-xs leading-5 text-amber-700">
                 請建立只有讀取權限的 API Key，務必關閉現貨交易、合約交易與提領權限。
