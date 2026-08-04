@@ -1080,7 +1080,13 @@ def _binance_wallet_total(payload: Any) -> Decimal | None:
 def _fetch_binance_spot_snapshot(
     api_key: str,
     api_secret: str,
-) -> tuple[list[dict[str, Any]], dict[str, Decimal], Decimal | None, list[str]]:
+) -> tuple[
+    list[dict[str, Any]],
+    dict[str, Decimal],
+    Decimal | None,
+    list[dict[str, Any]],
+    list[str],
+]:
     api_key = _clean_binance_credential(api_key)
     api_secret = _clean_binance_credential(api_secret)
     if not api_key or not api_secret:
@@ -1093,7 +1099,9 @@ def _fetch_binance_spot_snapshot(
     with httpx.Client(timeout=20, follow_redirects=True, headers=headers) as client:
         time_response = client.get("https://api.binance.com/api/v3/time")
         time_payload = _binance_response_payload(time_response)
-        timestamp = int(time_payload.get("serverTime") or int(time.time() * 1000))
+        local_time = int(time.time() * 1000)
+        timestamp = int(time_payload.get("serverTime") or local_time)
+        server_time_offset = timestamp - local_time
         signed_query = _binance_signed_query(
             api_secret,
             timestamp,
@@ -1122,6 +1130,42 @@ def _fetch_binance_spot_snapshot(
                 "暫時無法讀取資金與合約等錢包總額，本次先以現貨資產估算"
             )
 
+        um_positions: list[dict[str, Any]] = []
+        try:
+            portfolio_timestamp = int(time.time() * 1000) + server_time_offset
+            portfolio_query = _binance_signed_query(api_secret, portfolio_timestamp)
+            portfolio_response = client.get(
+                f"https://papi.binance.com/papi/v1/um/positionRisk?{portfolio_query}",
+            )
+            portfolio_payload = _binance_response_payload(portfolio_response)
+            if isinstance(portfolio_payload, list):
+                um_positions = [
+                    item
+                    for item in portfolio_payload
+                    if isinstance(item, dict)
+                    and decimal_value(item.get("positionAmt")) != ZERO
+                ]
+
+                if um_positions:
+                    exchange_response = client.get(
+                        "https://fapi.binance.com/fapi/v1/exchangeInfo"
+                    )
+                    exchange_payload = _binance_response_payload(exchange_response)
+                    contract_info = {
+                        str(item.get("symbol")): item
+                        for item in exchange_payload.get("symbols", [])
+                        if isinstance(item, dict) and item.get("symbol")
+                    }
+                    for item in um_positions:
+                        info = contract_info.get(str(item.get("symbol")), {})
+                        item["baseAsset"] = info.get("baseAsset")
+                        item["contractType"] = info.get("contractType")
+                        item["underlyingType"] = info.get("underlyingType")
+        except (ValueError, httpx.HTTPError):
+            wallet_warnings.append(
+                "暫時無法讀取 Portfolio Margin 合約持倉，現貨與帳戶總值仍會正常同步"
+            )
+
         prices_response = client.get("https://data-api.binance.vision/api/v3/ticker/price")
         prices_payload = _binance_response_payload(prices_response)
 
@@ -1131,7 +1175,7 @@ def _fetch_binance_spot_snapshot(
         for item in prices_payload
         if isinstance(item, dict) and item.get("symbol") and decimal_value(item.get("price")) > 0
     }
-    return balances, prices, wallet_total_usdt, wallet_warnings
+    return balances, prices, wallet_total_usdt, um_positions, wallet_warnings
 
 
 def sync_binance_account(
@@ -1173,9 +1217,13 @@ def sync_binance_account(
         api_secret = decrypt_credential(encrypted_secret)
 
     try:
-        balances, prices, wallet_total_usdt, wallet_warnings = _fetch_binance_spot_snapshot(
-            api_key, api_secret or ""
-        )
+        (
+            balances,
+            prices,
+            wallet_total_usdt,
+            um_positions,
+            wallet_warnings,
+        ) = _fetch_binance_spot_snapshot(api_key, api_secret or "")
     except ValueError:
         raise
     except httpx.HTTPError as exc:
@@ -1236,6 +1284,61 @@ def sync_binance_account(
         db.flush()
         seen_position_ids.add(position.id)
         _upsert_price(db, "CRYPTO", symbol, date.today(), price, "USD", "Binance")
+
+    for item in um_positions:
+        raw_symbol = str(item.get("symbol") or "").upper()
+        base_asset = str(item.get("baseAsset") or "").upper()
+        contract_type = str(item.get("contractType") or "").upper()
+        underlying_type = str(item.get("underlyingType") or "").upper()
+        if not base_asset and raw_symbol.endswith("USDT"):
+            base_asset = raw_symbol.removesuffix("USDT")
+        if not base_asset or (
+            underlying_type != "EQUITY"
+            and contract_type != "TRADIFI_PERPETUAL"
+        ):
+            continue
+
+        quantity = abs(decimal_value(item.get("positionAmt")))
+        entry_price = decimal_value(item.get("entryPrice"))
+        mark_price = decimal_value(item.get("markPrice"))
+        if quantity <= 0 or mark_price <= 0:
+            continue
+
+        position = db.scalar(
+            select(Position).where(
+                Position.account_id == account.id,
+                Position.market == "US",
+                Position.symbol == base_asset,
+            )
+        )
+        if not position:
+            position = Position(
+                account_id=account.id,
+                market="US",
+                symbol=base_asset,
+                name=f"{base_asset}（Binance 合約）",
+                quantity=quantity,
+                average_cost=entry_price or mark_price,
+                currency="USD",
+            )
+            db.add(position)
+        else:
+            position.quantity = quantity
+            position.average_cost = entry_price or position.average_cost
+            position.currency = "USD"
+            position.manual_price = None
+            position.archived = False
+        db.flush()
+        seen_position_ids.add(position.id)
+        _upsert_price(
+            db,
+            "US",
+            base_asset,
+            date.today(),
+            mark_price,
+            "USD",
+            "Binance Futures",
+        )
 
     previous_ids_value = _get_setting_value(
         db, _binance_setting_key(account.id, "position_ids")

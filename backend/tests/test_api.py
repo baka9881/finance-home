@@ -148,6 +148,7 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
             },
             wallet["total_usdt"],
             [],
+            [],
         ),
     )
     connected = client.post(
@@ -189,6 +190,88 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
     assert account["investments_twd"] == 3200
     assert account["auto_balance_base_twd"] is None
     assert account["valuation_mode"] == "manual_total"
+
+
+def test_binance_portfolio_margin_updates_tradfi_position(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
+    client.post(
+        "/api/fx/manual",
+        json={
+            "currency": "USD",
+            "rate_date": date.today().isoformat(),
+            "rate_to_twd": 32,
+        },
+    )
+    account_response = client.post(
+        "/api/accounts",
+        json={
+            "name": "幣安交易所",
+            "institution": "Binance",
+            "account_type": "crypto",
+            "nature": "asset",
+            "currency": "TWD",
+            "is_liquid": True,
+            "opening_balance": 0,
+            "opening_date": date.today().isoformat(),
+        },
+    )
+    account_id = account_response.json()["id"]
+    client.post(
+        "/api/positions",
+        json={
+            "account_id": account_id,
+            "market": "US",
+            "symbol": "MSTR",
+            "name": "微策略",
+            "quantity": 3.2758,
+            "average_cost": 92.39,
+            "currency": "USD",
+        },
+    )
+
+    monkeypatch.setattr(
+        services_module,
+        "_fetch_binance_spot_snapshot",
+        lambda _key, _secret: (
+            [{"asset": "USDT", "free": "100", "locked": "0"}],
+            {},
+            services_module.Decimal("500"),
+            [
+                {
+                    "symbol": "MSTRUSDT",
+                    "baseAsset": "MSTR",
+                    "contractType": "TRADIFI_PERPETUAL",
+                    "underlyingType": "EQUITY",
+                    "positionAmt": "4.3",
+                    "entryPrice": "91.25",
+                    "markPrice": "94.86",
+                    "positionSide": "BOTH",
+                }
+            ],
+            [],
+        ),
+    )
+
+    connected = client.post(
+        "/api/exchanges/binance/connect",
+        json={
+            "account_id": account_id,
+            "api_key": "read-only-key",
+            "api_secret": "read-only-secret",
+        },
+    )
+    assert connected.status_code == 200, connected.text
+
+    positions = client.get("/api/positions").json()
+    assert len(positions) == 1
+    assert positions[0]["symbol"] == "MSTR"
+    assert positions[0]["quantity"] == 4.3
+    assert positions[0]["average_cost"] == 91.25
+    assert positions[0]["price"] == 94.86
+    assert positions[0]["price_source"] == "Binance Futures"
 
 
 def test_binance_credentials_remove_pasted_whitespace_and_invisible_characters():
