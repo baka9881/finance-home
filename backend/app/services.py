@@ -1085,6 +1085,7 @@ def _fetch_binance_spot_snapshot(
     dict[str, Decimal],
     Decimal | None,
     list[dict[str, Any]],
+    dict[str, str],
     list[dict[str, Any]],
     list[str],
 ]:
@@ -1156,6 +1157,60 @@ def _fetch_binance_spot_snapshot(
                 "暫時無法讀取資金帳戶持倉明細，現貨與帳戶總值仍會正常同步"
             )
 
+        equity_asset_map: dict[str, str] = {}
+        if funding_balances:
+            try:
+                exchange_response = client.get(
+                    "https://api.binance.com/sapi/v1/equity/market/exchangeInfo"
+                )
+                exchange_payload = _binance_response_payload(exchange_response)
+                tokenized_response = client.get(
+                    "https://api.binance.com/sapi/v1/equity/market/tokenized-assets"
+                )
+                tokenized_payload = _binance_response_payload(tokenized_response)
+
+                def equity_rows(payload: Any) -> list[dict[str, Any]]:
+                    if isinstance(payload, list):
+                        return [item for item in payload if isinstance(item, dict)]
+                    if not isinstance(payload, dict):
+                        return []
+                    for key in ("symbols", "assets", "data", "rows"):
+                        rows = payload.get(key)
+                        if isinstance(rows, list):
+                            return [item for item in rows if isinstance(item, dict)]
+                    return []
+
+                for item in equity_rows(exchange_payload):
+                    symbol = str(
+                        item.get("symbol")
+                        or item.get("ticker")
+                        or item.get("underlyingAsset")
+                        or ""
+                    ).upper()
+                    if symbol:
+                        equity_asset_map[symbol] = symbol
+                for item in equity_rows(tokenized_payload):
+                    underlying = str(
+                        item.get("underlyingAsset")
+                        or item.get("underlyingSymbol")
+                        or item.get("symbol")
+                        or ""
+                    ).upper()
+                    tokenized = str(
+                        item.get("tokenizedAsset")
+                        or item.get("asset")
+                        or item.get("token")
+                        or ""
+                    ).upper()
+                    if underlying:
+                        equity_asset_map[underlying] = underlying
+                    if tokenized and underlying:
+                        equity_asset_map[tokenized] = underlying
+            except (ValueError, httpx.HTTPError):
+                wallet_warnings.append(
+                    "暫時無法取得 Binance 股票代號對照，既有同代號持倉仍會正常同步"
+                )
+
         um_positions: list[dict[str, Any]] = []
         try:
             portfolio_timestamp = int(time.time() * 1000) + server_time_offset
@@ -1206,6 +1261,7 @@ def _fetch_binance_spot_snapshot(
         prices,
         wallet_total_usdt,
         funding_balances,
+        equity_asset_map,
         um_positions,
         wallet_warnings,
     )
@@ -1255,6 +1311,7 @@ def sync_binance_account(
             prices,
             wallet_total_usdt,
             funding_balances,
+            equity_asset_map,
             um_positions,
             wallet_warnings,
         ) = _fetch_binance_spot_snapshot(api_key, api_secret or "")
@@ -1333,14 +1390,18 @@ def sync_binance_account(
         # user already tracks that US-equity symbol, the Funding Wallet is the
         # authoritative source for its current quantity; cost and price stay
         # on the existing position because this endpoint does not return them.
+        stock_symbol = equity_asset_map.get(asset, asset)
         position = db.scalar(
             select(Position).where(
                 Position.account_id == account.id,
                 Position.market == "US",
-                Position.symbol == asset,
+                Position.symbol == stock_symbol,
             )
         )
         if not position:
+            warnings.append(
+                f"資金帳戶資產 {asset} 已讀取，但尚未找到對應的投資持倉"
+            )
             continue
         position.quantity = quantity
         position.archived = False

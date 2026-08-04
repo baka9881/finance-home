@@ -66,6 +66,7 @@ interface ExchangeSyncResult {
   connected: number;
   updated: number;
   skipped: number;
+  results: Array<{ account_name: string; warnings?: string[] }>;
   errors: string[];
 }
 
@@ -133,10 +134,13 @@ export default function SettingsPage() {
       client.invalidateQueries({ queryKey: ["accounts"] });
       client.invalidateQueries({ queryKey: ["positions"] });
       client.invalidateQueries({ queryKey: ["dashboard"] });
+      const warnings = result.results.flatMap((item) => item.warnings || []);
       setMessage(
         result.errors.length
           ? `同步未完成：${result.errors.join("、")}`
-          : `交易所同步完成，更新 ${result.updated} 個帳戶。`,
+          : warnings.length
+            ? `交易所已同步；${warnings.join("、")}`
+            : `交易所同步完成，更新 ${result.updated} 個帳戶。`,
       );
     },
   });

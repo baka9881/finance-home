@@ -148,6 +148,7 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
             },
             wallet["total_usdt"],
             [],
+            {},
             [],
             [],
         ),
@@ -241,6 +242,7 @@ def test_binance_portfolio_margin_updates_tradfi_position(
             {},
             services_module.Decimal("500"),
             [],
+            {},
             [
                 {
                     "symbol": "MSTRUSDT",
@@ -333,6 +335,7 @@ def test_binance_funding_wallet_updates_existing_stock_position(
                     "withdrawing": "0",
                 }
             ],
+            {"MSTR": "MSTR"},
             [],
             [],
         ),
