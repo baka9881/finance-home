@@ -362,7 +362,7 @@ def test_binance_funding_wallet_updates_existing_stock_position(
     assert positions[0]["price"] == 94.64
 
 
-def test_binance_stock_trades_rebuild_current_share_quantity(
+def test_binance_stock_trades_apply_only_new_fills_after_baseline(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -403,6 +403,16 @@ def test_binance_stock_trades_rebuild_current_share_quantity(
         },
     )
 
+    stock_trades = [
+        {
+            "executionId": "old-buy",
+            "symbol": "MSTR",
+            "side": "BUY",
+            "qty": "3.2758",
+            "price": "92.39",
+            "executionAt": 1,
+        }
+    ]
     monkeypatch.setattr(
         services_module,
         "_fetch_binance_spot_snapshot",
@@ -412,11 +422,7 @@ def test_binance_stock_trades_rebuild_current_share_quantity(
             services_module.Decimal("1661.16"),
             [],
             {},
-            [
-                {"symbol": "MSTR", "side": "BUY", "qty": "3.2758", "price": "92.39"},
-                {"symbol": "MSTR", "side": "BUY", "qty": "1.2242", "price": "95.00"},
-                {"symbol": "MSTR", "side": "SELL", "qty": "0.2", "price": "96.00"},
-            ],
+            stock_trades,
             [],
             [],
         ),
@@ -435,8 +441,29 @@ def test_binance_stock_trades_rebuild_current_share_quantity(
     positions = client.get("/api/positions").json()
     assert len(positions) == 1
     assert positions[0]["symbol"] == "MSTR"
+    assert positions[0]["quantity"] == 3.2758
+
+    stock_trades.append(
+        {
+            "executionId": "new-buy",
+            "symbol": "MSTR",
+            "side": "BUY",
+            "qty": "1.0242",
+            "price": "95.00",
+            "executionAt": 2,
+        }
+    )
+    refreshed = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert refreshed.status_code == 200, refreshed.text
+    positions = client.get("/api/positions").json()
     assert positions[0]["quantity"] == 4.3
-    assert positions[0]["average_cost"] == 92.39
+    assert positions[0]["average_cost"] == 93.011666
+
+    unchanged = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert unchanged.status_code == 200, unchanged.text
+    positions = client.get("/api/positions").json()
+    assert len(positions) == 1
+    assert positions[0]["quantity"] == 4.3
     assert positions[0]["price"] == 94.64
 
 

@@ -1454,25 +1454,66 @@ def sync_binance_account(
         db.flush()
         seen_position_ids.add(position.id)
 
-    stock_quantities: defaultdict[str, Decimal] = defaultdict(lambda: ZERO)
-    stock_buy_quantities: defaultdict[str, Decimal] = defaultdict(lambda: ZERO)
-    stock_buy_costs: defaultdict[str, Decimal] = defaultdict(lambda: ZERO)
+    stock_trade_ids_key = _binance_setting_key(account.id, "stock_trade_ids")
+    processed_trade_ids_row = db.get(AppSetting, stock_trade_ids_key)
+    processed_trade_ids_value = (
+        processed_trade_ids_row.value if processed_trade_ids_row else None
+    )
+    try:
+        processed_trade_ids = {
+            str(item) for item in json.loads(processed_trade_ids_value or "[]")
+        }
+    except (TypeError, ValueError, json.JSONDecodeError):
+        processed_trade_ids = set()
+
+    current_trade_ids: set[str] = set()
+    new_stock_trades: list[dict[str, Any]] = []
     for item in equity_trades:
+        trade_id = str(
+            item.get("executionId")
+            or "|".join(
+                str(item.get(key) or "")
+                for key in ("orderId", "symbol", "side", "qty", "price", "executionAt")
+            )
+        )
+        current_trade_ids.add(trade_id)
+        if processed_trade_ids_value is not None and trade_id not in processed_trade_ids:
+            new_stock_trades.append(item)
+
+    # A stock can have no new fills during this sync and still be an active
+    # holding. Keep every existing US position referenced by the trade history
+    # in the Binance-managed set so the general stale-position cleanup below
+    # does not archive it.
+    stock_history_symbols = {
+        str(item.get("symbol") or "").upper()
+        for item in equity_trades
+        if str(item.get("symbol") or "").strip()
+    }
+    if stock_history_symbols:
+        existing_stock_positions = db.scalars(
+            select(Position).where(
+                Position.account_id == account.id,
+                Position.market == "US",
+                Position.symbol.in_(stock_history_symbols),
+                Position.archived.is_(False),
+            )
+        ).all()
+        seen_position_ids.update(
+            position.id
+            for position in existing_stock_positions
+            if decimal_value(position.quantity) > 0
+        )
+
+    # The Stocks API only exposes fills since the product launched; it does
+    # not expose a complete positions endpoint. On the first sync, preserve
+    # the user's reconciled quantity and checkpoint all existing fills. Every
+    # later sync applies only newly seen BUY/SELL executions.
+    for item in sorted(new_stock_trades, key=lambda row: int(row.get("executionAt") or 0)):
         symbol = str(item.get("symbol") or "").upper()
         side = str(item.get("side") or "").upper()
         quantity = decimal_value(item.get("qty"))
         price = decimal_value(item.get("price"))
         if not symbol or quantity <= 0 or side not in {"BUY", "SELL"}:
-            continue
-        if side == "BUY":
-            stock_quantities[symbol] += quantity
-            stock_buy_quantities[symbol] += quantity
-            stock_buy_costs[symbol] += quantity * price
-        else:
-            stock_quantities[symbol] -= quantity
-
-    for symbol, quantity in stock_quantities.items():
-        if quantity <= 0:
             continue
         position = db.scalar(
             select(Position).where(
@@ -1481,30 +1522,45 @@ def sync_binance_account(
                 Position.symbol == symbol,
             )
         )
-        average_buy_price = (
-            stock_buy_costs[symbol] / stock_buy_quantities[symbol]
-            if stock_buy_quantities[symbol] > 0
-            else ZERO
-        )
         if not position:
+            if side == "SELL":
+                warnings.append(f"讀到 {symbol} 賣出成交，但目前沒有可扣除的持倉")
+                continue
             position = Position(
                 account_id=account.id,
                 market="US",
                 symbol=symbol,
                 name=symbol,
                 quantity=quantity,
-                average_cost=average_buy_price,
+                average_cost=price,
                 currency="USD",
             )
             db.add(position)
+        elif side == "BUY":
+            old_quantity = decimal_value(position.quantity)
+            new_quantity = old_quantity + quantity
+            if new_quantity > 0 and price > 0:
+                position.average_cost = (
+                    old_quantity * decimal_value(position.average_cost)
+                    + quantity * price
+                ) / new_quantity
+            position.quantity = new_quantity
         else:
-            position.quantity = quantity
-            position.currency = "USD"
+            position.quantity = max(ZERO, decimal_value(position.quantity) - quantity)
+            position.archived = position.quantity <= 0
+        position.currency = "USD"
+        if position.quantity > 0:
             position.archived = False
-            if decimal_value(position.average_cost) <= 0 and average_buy_price > 0:
-                position.average_cost = average_buy_price
         db.flush()
-        seen_position_ids.add(position.id)
+        if not position.archived:
+            seen_position_ids.add(position.id)
+
+    processed_trade_ids.update(current_trade_ids)
+    _set_setting_value(
+        db,
+        stock_trade_ids_key,
+        json.dumps(sorted(processed_trade_ids)),
+    )
 
     for item in um_positions:
         raw_symbol = str(item.get("symbol") or "").upper()

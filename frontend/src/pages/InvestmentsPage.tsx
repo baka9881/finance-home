@@ -5,6 +5,7 @@ import {
   ChevronDown,
   Clock3,
   LineChart,
+  Pencil,
   Plus,
   RefreshCw,
   Trash2,
@@ -125,6 +126,8 @@ export default function InvestmentsPage() {
   const [tradeTotalAmount, setTradeTotalAmount] = useState("");
   const [refreshMessage, setRefreshMessage] = useState("");
   const [tradeStep, setTradeStep] = useState(1);
+  const [adjustingPosition, setAdjustingPosition] = useState<Position | null>(null);
+  const [adjustQuantity, setAdjustQuantity] = useState("");
   const tradeFormRef = useRef<HTMLFormElement>(null);
 
   const positions = useQuery({
@@ -156,6 +159,33 @@ export default function InvestmentsPage() {
       client.invalidateQueries({ queryKey: ["dashboard"] });
     },
   });
+
+  const updatePosition = useMutation({
+    mutationFn: ({ id, quantity }: { id: number; quantity: number }) =>
+      api(`/positions/${id}`, {
+        method: "PATCH",
+        body: JSON.stringify({ quantity }),
+      }),
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ["positions"] });
+      client.invalidateQueries({ queryKey: ["accounts"] });
+      client.invalidateQueries({ queryKey: ["dashboard"] });
+      setAdjustingPosition(null);
+      setAdjustQuantity("");
+    },
+  });
+
+  function openQuantityAdjustment(position: Position) {
+    setAdjustingPosition(position);
+    setAdjustQuantity(String(position.quantity));
+  }
+
+  function submitQuantityAdjustment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    const quantity = Number(adjustQuantity);
+    if (!adjustingPosition || !Number.isFinite(quantity) || quantity < 0) return;
+    updatePosition.mutate({ id: adjustingPosition.id, quantity });
+  }
 
   const refresh = useMutation({
     mutationFn: () => api<{ updated: number; skipped: number; warnings?: string[]; errors: string[] }>("/market/refresh", { method: "POST" }),
@@ -472,7 +502,14 @@ export default function InvestmentsPage() {
                     <div className="mt-1"><Badge tone={position.stale ? "amber" : "green"}>{position.price_source}</Badge></div>
                     <p className="mt-1 text-xs text-slate-400">{position.price_date || "尚無行情"}</p>
                   </div>
-                  <div className="col-span-2 flex justify-end">
+                  <div className="col-span-2 flex justify-end gap-2">
+                    <Button
+                      variant="secondary"
+                      className="h-11"
+                      onClick={() => openQuantityAdjustment(position)}
+                    >
+                      <Pencil size={15} /> 調整數量
+                    </Button>
                     <Button
                       variant="danger"
                       className="h-11"
@@ -549,6 +586,15 @@ export default function InvestmentsPage() {
                     <td className="px-3 py-4 text-right">
                       <Button
                         variant="ghost"
+                        className="size-9 px-0 text-slate-500 hover:text-forest"
+                        title="調整持倉數量"
+                        aria-label={`調整 ${position.symbol} 數量`}
+                        onClick={() => openQuantityAdjustment(position)}
+                      >
+                        <Pencil size={15} />
+                      </Button>
+                      <Button
+                        variant="ghost"
                         className="size-9 px-0 text-red-500 hover:bg-red-50 hover:text-red-700"
                         title="刪除持倉"
                         aria-label={`刪除 ${position.symbol}`}
@@ -570,6 +616,62 @@ export default function InvestmentsPage() {
           </>
         )}
       </Card>
+
+      <Dialog
+        open={Boolean(adjustingPosition)}
+        onClose={() => {
+          setAdjustingPosition(null);
+          setAdjustQuantity("");
+        }}
+        title="調整持倉數量"
+        description="用來校正交易所實際持有數量，不會新增收支，也不會改動帳戶總額。"
+      >
+        <form className="space-y-5" onSubmit={submitQuantityAdjustment}>
+          <div className="rounded-2xl bg-slate-50 p-4">
+            <p className="text-xs text-slate-400">目前調整</p>
+            <p className="mt-1 font-semibold text-slate-800">
+              {adjustingPosition?.symbol} · {adjustingPosition?.account_name}
+            </p>
+          </div>
+          <Field label="實際持有數量">
+            <Input
+              type="number"
+              min="0"
+              step="any"
+              inputMode="decimal"
+              value={adjustQuantity}
+              onChange={(event) => setAdjustQuantity(event.target.value)}
+              autoFocus
+              required
+            />
+          </Field>
+          {updatePosition.isError && (
+            <p className="text-sm text-red-600">{(updatePosition.error as Error).message}</p>
+          )}
+          <div className="flex justify-end gap-3">
+            <Button
+              type="button"
+              variant="secondary"
+              onClick={() => {
+                setAdjustingPosition(null);
+                setAdjustQuantity("");
+              }}
+            >
+              取消
+            </Button>
+            <Button
+              type="submit"
+              disabled={
+                updatePosition.isPending ||
+                !adjustQuantity ||
+                Number(adjustQuantity) < 0
+              }
+            >
+              儲存數量
+            </Button>
+          </div>
+        </form>
+      </Dialog>
 
       <Dialog
         open={createOpen}
