@@ -11,7 +11,7 @@ import secrets
 import time
 import unicodedata
 from collections import defaultdict
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal, InvalidOperation
 from typing import Any
 from urllib.parse import urlencode
@@ -1087,6 +1087,7 @@ def _fetch_binance_spot_snapshot(
     list[dict[str, Any]],
     dict[str, str],
     list[dict[str, Any]],
+    list[dict[str, Any]],
     list[str],
 ]:
     api_key = _clean_binance_credential(api_key)
@@ -1211,6 +1212,49 @@ def _fetch_binance_spot_snapshot(
                     "暫時無法取得 Binance 股票代號對照，既有同代號持倉仍會正常同步"
                 )
 
+        equity_trades: list[dict[str, Any]] = []
+        try:
+            # Binance Stocks Trading launched on 2026-07-20. Reading from its
+            # first day lets us rebuild current share quantities from every
+            # BUY and SELL fill because the API has no direct positions route.
+            stock_history_start = int(
+                datetime(2026, 7, 20, tzinfo=timezone.utc).timestamp() * 1000
+            )
+            stock_history_end = int(time.time() * 1000) + server_time_offset
+            page = 1
+            while page <= 20:
+                trade_timestamp = int(time.time() * 1000) + server_time_offset
+                trade_query = _binance_signed_query(
+                    api_secret,
+                    trade_timestamp,
+                    ("startTime", str(stock_history_start)),
+                    ("endTime", str(stock_history_end)),
+                    ("current", str(page)),
+                    ("size", "100"),
+                )
+                trade_response = client.get(
+                    f"https://api.binance.com/sapi/v1/equity/trade/history?{trade_query}"
+                )
+                trade_payload = _binance_response_payload(trade_response)
+                rows = (
+                    trade_payload.get("rows", [])
+                    if isinstance(trade_payload, dict)
+                    else []
+                )
+                if not isinstance(rows, list):
+                    break
+                equity_trades.extend(
+                    item for item in rows if isinstance(item, dict)
+                )
+                total = int(trade_payload.get("total") or len(equity_trades))
+                if page * 100 >= total or not rows:
+                    break
+                page += 1
+        except (ValueError, httpx.HTTPError):
+            wallet_warnings.append(
+                "暫時無法讀取 Binance 股票成交紀錄，既有股票持倉會先保留"
+            )
+
         um_positions: list[dict[str, Any]] = []
         try:
             portfolio_timestamp = int(time.time() * 1000) + server_time_offset
@@ -1262,6 +1306,7 @@ def _fetch_binance_spot_snapshot(
         wallet_total_usdt,
         funding_balances,
         equity_asset_map,
+        equity_trades,
         um_positions,
         wallet_warnings,
     )
@@ -1312,6 +1357,7 @@ def sync_binance_account(
             wallet_total_usdt,
             funding_balances,
             equity_asset_map,
+            equity_trades,
             um_positions,
             wallet_warnings,
         ) = _fetch_binance_spot_snapshot(api_key, api_secret or "")
@@ -1405,6 +1451,58 @@ def sync_binance_account(
             continue
         position.quantity = quantity
         position.archived = False
+        db.flush()
+        seen_position_ids.add(position.id)
+
+    stock_quantities: defaultdict[str, Decimal] = defaultdict(lambda: ZERO)
+    stock_buy_quantities: defaultdict[str, Decimal] = defaultdict(lambda: ZERO)
+    stock_buy_costs: defaultdict[str, Decimal] = defaultdict(lambda: ZERO)
+    for item in equity_trades:
+        symbol = str(item.get("symbol") or "").upper()
+        side = str(item.get("side") or "").upper()
+        quantity = decimal_value(item.get("qty"))
+        price = decimal_value(item.get("price"))
+        if not symbol or quantity <= 0 or side not in {"BUY", "SELL"}:
+            continue
+        if side == "BUY":
+            stock_quantities[symbol] += quantity
+            stock_buy_quantities[symbol] += quantity
+            stock_buy_costs[symbol] += quantity * price
+        else:
+            stock_quantities[symbol] -= quantity
+
+    for symbol, quantity in stock_quantities.items():
+        if quantity <= 0:
+            continue
+        position = db.scalar(
+            select(Position).where(
+                Position.account_id == account.id,
+                Position.market == "US",
+                Position.symbol == symbol,
+            )
+        )
+        average_buy_price = (
+            stock_buy_costs[symbol] / stock_buy_quantities[symbol]
+            if stock_buy_quantities[symbol] > 0
+            else ZERO
+        )
+        if not position:
+            position = Position(
+                account_id=account.id,
+                market="US",
+                symbol=symbol,
+                name=symbol,
+                quantity=quantity,
+                average_cost=average_buy_price,
+                currency="USD",
+            )
+            db.add(position)
+        else:
+            position.quantity = quantity
+            position.currency = "USD"
+            position.archived = False
+            if decimal_value(position.average_cost) <= 0 and average_buy_price > 0:
+                position.average_cost = average_buy_price
         db.flush()
         seen_position_ids.add(position.id)
 

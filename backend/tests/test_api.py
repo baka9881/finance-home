@@ -151,6 +151,7 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
             {},
             [],
             [],
+            [],
         ),
     )
     connected = client.post(
@@ -243,6 +244,7 @@ def test_binance_portfolio_margin_updates_tradfi_position(
             services_module.Decimal("500"),
             [],
             {},
+            [],
             [
                 {
                     "symbol": "MSTRUSDT",
@@ -336,6 +338,85 @@ def test_binance_funding_wallet_updates_existing_stock_position(
                 }
             ],
             {"MSTR": "MSTR"},
+            [],
+            [],
+            [],
+        ),
+    )
+
+    connected = client.post(
+        "/api/exchanges/binance/connect",
+        json={
+            "account_id": account_id,
+            "api_key": "read-only-key",
+            "api_secret": "read-only-secret",
+        },
+    )
+    assert connected.status_code == 200, connected.text
+
+    positions = client.get("/api/positions").json()
+    assert len(positions) == 1
+    assert positions[0]["symbol"] == "MSTR"
+    assert positions[0]["quantity"] == 4.3
+    assert positions[0]["average_cost"] == 92.39
+    assert positions[0]["price"] == 94.64
+
+
+def test_binance_stock_trades_rebuild_current_share_quantity(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
+    client.post(
+        "/api/fx/manual",
+        json={
+            "currency": "USD",
+            "rate_date": date.today().isoformat(),
+            "rate_to_twd": 32,
+        },
+    )
+    account_response = client.post(
+        "/api/accounts",
+        json={
+            "name": "幣安交易所",
+            "institution": "Binance",
+            "account_type": "crypto",
+            "nature": "asset",
+            "currency": "TWD",
+            "is_liquid": True,
+            "opening_balance": 0,
+            "opening_date": date.today().isoformat(),
+        },
+    )
+    account_id = account_response.json()["id"]
+    client.post(
+        "/api/positions",
+        json={
+            "account_id": account_id,
+            "market": "US",
+            "symbol": "MSTR",
+            "name": "微策略",
+            "quantity": 3.2758,
+            "average_cost": 92.39,
+            "currency": "USD",
+            "manual_price": 94.64,
+        },
+    )
+
+    monkeypatch.setattr(
+        services_module,
+        "_fetch_binance_spot_snapshot",
+        lambda _key, _secret: (
+            [{"asset": "USDT", "free": "100", "locked": "0"}],
+            {},
+            services_module.Decimal("1661.16"),
+            [],
+            {},
+            [
+                {"symbol": "MSTR", "side": "BUY", "qty": "3.2758", "price": "92.39"},
+                {"symbol": "MSTR", "side": "BUY", "qty": "1.2242", "price": "95.00"},
+                {"symbol": "MSTR", "side": "SELL", "qty": "0.2", "price": "96.00"},
+            ],
             [],
             [],
         ),
