@@ -1085,6 +1085,7 @@ def _fetch_binance_spot_snapshot(
     dict[str, Decimal],
     Decimal | None,
     list[dict[str, Any]],
+    list[dict[str, Any]],
     list[str],
 ]:
     api_key = _clean_binance_credential(api_key)
@@ -1128,6 +1129,31 @@ def _fetch_binance_spot_snapshot(
         except (ValueError, httpx.HTTPError):
             wallet_warnings.append(
                 "暫時無法讀取資金與合約等錢包總額，本次先以現貨資產估算"
+            )
+
+        funding_balances: list[dict[str, Any]] = []
+        try:
+            funding_timestamp = int(time.time() * 1000) + server_time_offset
+            funding_query = _binance_signed_query(api_secret, funding_timestamp)
+            funding_response = client.post(
+                f"https://api.binance.com/sapi/v1/asset/get-funding-asset?{funding_query}",
+            )
+            funding_payload = _binance_response_payload(funding_response)
+            if isinstance(funding_payload, list):
+                funding_balances = [
+                    item
+                    for item in funding_payload
+                    if isinstance(item, dict)
+                    and (
+                        decimal_value(item.get("free"))
+                        + decimal_value(item.get("locked"))
+                        + decimal_value(item.get("freeze"))
+                    )
+                    > ZERO
+                ]
+        except (ValueError, httpx.HTTPError):
+            wallet_warnings.append(
+                "暫時無法讀取資金帳戶持倉明細，現貨與帳戶總值仍會正常同步"
             )
 
         um_positions: list[dict[str, Any]] = []
@@ -1175,7 +1201,14 @@ def _fetch_binance_spot_snapshot(
         for item in prices_payload
         if isinstance(item, dict) and item.get("symbol") and decimal_value(item.get("price")) > 0
     }
-    return balances, prices, wallet_total_usdt, um_positions, wallet_warnings
+    return (
+        balances,
+        prices,
+        wallet_total_usdt,
+        funding_balances,
+        um_positions,
+        wallet_warnings,
+    )
 
 
 def sync_binance_account(
@@ -1221,6 +1254,7 @@ def sync_binance_account(
             balances,
             prices,
             wallet_total_usdt,
+            funding_balances,
             um_positions,
             wallet_warnings,
         ) = _fetch_binance_spot_snapshot(api_key, api_secret or "")
@@ -1284,6 +1318,34 @@ def sync_binance_account(
         db.flush()
         seen_position_ids.add(position.id)
         _upsert_price(db, "CRYPTO", symbol, date.today(), price, "USD", "Binance")
+
+    for item in funding_balances:
+        asset = str(item.get("asset") or "").upper()
+        quantity = (
+            decimal_value(item.get("free"))
+            + decimal_value(item.get("locked"))
+            + decimal_value(item.get("freeze"))
+        )
+        if not asset or quantity <= 0 or asset in BINANCE_CASH_ASSETS:
+            continue
+
+        # Binance Stocks holdings are kept in the Funding Wallet. When the
+        # user already tracks that US-equity symbol, the Funding Wallet is the
+        # authoritative source for its current quantity; cost and price stay
+        # on the existing position because this endpoint does not return them.
+        position = db.scalar(
+            select(Position).where(
+                Position.account_id == account.id,
+                Position.market == "US",
+                Position.symbol == asset,
+            )
+        )
+        if not position:
+            continue
+        position.quantity = quantity
+        position.archived = False
+        db.flush()
+        seen_position_ids.add(position.id)
 
     for item in um_positions:
         raw_symbol = str(item.get("symbol") or "").upper()
