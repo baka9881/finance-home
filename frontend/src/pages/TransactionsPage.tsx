@@ -284,6 +284,7 @@ export default function TransactionsPage() {
       body.append("account_id", String(mapping.account_id));
       body.append("mapping_json", JSON.stringify(mapping));
       body.append("commit", "true");
+      body.append("adjust_balance", "true");
       return api<Record<string, unknown>>("/transactions/import", { method: "POST", body });
     },
     onSuccess: (result) => {
@@ -1103,6 +1104,11 @@ export default function TransactionsPage() {
             <p className="mt-2 text-sm text-slate-500">
               新增 {String(importResult.imported)} 筆，略過 {String(importResult.duplicates)} 筆重複資料。
             </p>
+            {Number(importResult.balance_applied_transactions || 0) > 0 && (
+              <p className="mt-2 text-sm font-medium text-emerald-700">
+                已將 {String(importResult.balance_applied_transactions)} 筆尚未套用的明細同步至帳戶餘額。
+              </p>
+            )}
             <Button
               className="mt-6"
               onClick={() => {
@@ -1158,6 +1164,13 @@ export default function TransactionsPage() {
                 ))}
               </Select>
             </Field>
+
+            <div className="rounded-2xl border border-blue-100 bg-blue-50/70 px-4 py-3">
+              <p className="text-sm font-semibold text-blue-900">帳戶餘額會一起更新</p>
+              <p className="mt-1 text-sm leading-6 text-blue-700">
+                系統只套用尚未反映過的明細；同一份檔案再次匯入不會重複扣款。若 CSV 有餘額欄位，會以檔案餘額為準。
+              </p>
+            </div>
 
             <div>
               <p className="mb-2 text-sm font-semibold text-slate-700">內容預覽</p>

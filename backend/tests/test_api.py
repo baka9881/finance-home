@@ -558,6 +558,81 @@ def test_csv_import_big5_and_duplicate_detection(client: TestClient):
     assert sorted(item["base_amount"] for item in rows) == [-80, 30000]
 
 
+def test_csv_import_adjusts_balance_once_and_can_reconcile_existing_rows(client: TestClient):
+    account_id = create_account(client, "生活費帳戶")
+    content = (
+        "date,description,amount,currency\n"
+        "2026-07-01,早餐,-100,TWD\n"
+        "2026-07-02,交通,-50,TWD\n"
+    ).encode("utf-8")
+    mapping = {
+        "date": "date",
+        "description": "description",
+        "amount": "amount",
+        "currency": "currency",
+    }
+    data = {
+        "account_id": str(account_id),
+        "mapping_json": __import__("json").dumps(mapping),
+        "commit": "true",
+        "adjust_balance": "false",
+    }
+
+    first = client.post(
+        "/api/transactions/import",
+        files={"file": ("transactions.csv", io.BytesIO(content), "text/csv")},
+        data=data,
+    )
+    assert first.status_code == 200, first.text
+    assert first.json()["imported"] == 2
+    assert first.json()["balance_applied_transactions"] == 0
+    account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
+    assert account["balance"] == 100000
+
+    data["adjust_balance"] = "true"
+    reconciled = client.post(
+        "/api/transactions/import",
+        files={"file": ("transactions.csv", io.BytesIO(content), "text/csv")},
+        data=data,
+    )
+    assert reconciled.status_code == 200, reconciled.text
+    assert reconciled.json()["imported"] == 0
+    assert reconciled.json()["duplicates"] == 2
+    assert reconciled.json()["balance_applied_transactions"] == 2
+    assert reconciled.json()["balance_change"] == -150
+    account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
+    assert account["balance"] == 99850
+
+    repeated = client.post(
+        "/api/transactions/import",
+        files={"file": ("transactions.csv", io.BytesIO(content), "text/csv")},
+        data=data,
+    )
+    assert repeated.status_code == 200, repeated.text
+    assert repeated.json()["balance_applied_transactions"] == 0
+    account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
+    assert account["balance"] == 99850
+
+
+def test_csv_credit_card_expenses_increase_liability_balance(client: TestClient):
+    account_id = create_account(client, "信用卡", "liability")
+    content = "date,description,amount\n2026-07-01,餐費,-200\n".encode("utf-8")
+    mapping = {"date": "date", "description": "description", "amount": "amount"}
+    response = client.post(
+        "/api/transactions/import",
+        files={"file": ("credit-card.csv", io.BytesIO(content), "text/csv")},
+        data={
+            "account_id": str(account_id),
+            "mapping_json": __import__("json").dumps(mapping),
+            "commit": "true",
+            "adjust_balance": "true",
+        },
+    )
+    assert response.status_code == 200, response.text
+    account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
+    assert account["balance"] == 12200
+
+
 def test_reclassify_existing_uncategorized_transactions(client: TestClient):
     account_id = create_account(client, "信用卡", "liability")
     categories = client.get("/api/categories").json()

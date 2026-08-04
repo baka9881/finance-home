@@ -783,12 +783,39 @@ def parse_transaction_date(value: Any) -> date:
     return parsed.date()
 
 
+def _csv_balance_applied_key(account_id: int) -> str:
+    return f"csv_balance_applied:{account_id}"
+
+
+def _csv_balance_applied_ids(db: Session, account_id: int) -> set[int]:
+    setting = db.get(AppSetting, _csv_balance_applied_key(account_id))
+    if not setting or not setting.value:
+        return set()
+    try:
+        values = json.loads(setting.value)
+        return {int(value) for value in values}
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return set()
+
+
+def _store_csv_balance_applied_ids(
+    db: Session, account_id: int, transaction_ids: set[int]
+) -> None:
+    key = _csv_balance_applied_key(account_id)
+    setting = db.get(AppSetting, key)
+    if not setting:
+        setting = AppSetting(key=key, value="[]")
+        db.add(setting)
+    setting.value = json.dumps(sorted(transaction_ids), separators=(",", ":"))
+
+
 def import_csv(
     db: Session,
     content: bytes,
     account: Account,
     mapping: dict[str, str | None],
     commit: bool = True,
+    adjust_balance: bool = True,
 ) -> dict[str, Any]:
     inspected = inspect_csv(content)
     frame = pd.read_csv(
@@ -809,7 +836,11 @@ def import_csv(
     failed: list[dict[str, Any]] = []
     preview: list[dict[str, Any]] = []
     latest_balance: tuple[date, Decimal] | None = None
-    existing = set(db.scalars(select(Transaction.fingerprint)).all())
+    existing_by_fingerprint = {
+        transaction.fingerprint: transaction
+        for transaction in db.scalars(select(Transaction)).all()
+    }
+    balance_candidates: dict[str, Transaction] = {}
 
     for index, row in frame.iterrows():
         try:
@@ -829,7 +860,8 @@ def import_csv(
             rate, estimated = latest_fx_rate(db, currency, tx_date)
             category_id, kind = classify_transaction(db, description, amount)
             fingerprint = transaction_fingerprint(account.id, tx_date, amount, description)
-            is_duplicate = fingerprint in existing
+            existing_transaction = existing_by_fingerprint.get(fingerprint)
+            is_duplicate = existing_transaction is not None
             if is_duplicate:
                 duplicates += 1
             record = {
@@ -844,24 +876,25 @@ def import_csv(
             if len(preview) < 50:
                 preview.append(record)
             if commit and not is_duplicate:
-                db.add(
-                    Transaction(
-                        account_id=account.id,
-                        transaction_date=tx_date,
-                        description=description,
-                        amount=amount,
-                        currency=currency,
-                        fx_rate=rate,
-                        base_amount=amount * rate,
-                        fx_estimated=estimated,
-                        transaction_kind=kind,
-                        category_id=category_id,
-                        fingerprint=fingerprint,
-                        source="csv",
-                    )
+                existing_transaction = Transaction(
+                    account_id=account.id,
+                    transaction_date=tx_date,
+                    description=description,
+                    amount=amount,
+                    currency=currency,
+                    fx_rate=rate,
+                    base_amount=amount * rate,
+                    fx_estimated=estimated,
+                    transaction_kind=kind,
+                    category_id=category_id,
+                    fingerprint=fingerprint,
+                    source="csv",
                 )
-                existing.add(fingerprint)
+                db.add(existing_transaction)
+                existing_by_fingerprint[fingerprint] = existing_transaction
                 imported += 1
+            if commit and existing_transaction and existing_transaction.source == "csv":
+                balance_candidates[fingerprint] = existing_transaction
             if mapping.get("balance") and str(row[mapping["balance"]]).strip():
                 balance = parse_number(row[mapping["balance"]])
                 if latest_balance is None or tx_date >= latest_balance[0]:
@@ -869,11 +902,68 @@ def import_csv(
         except Exception as exc:
             failed.append({"row": int(index) + 2, "error": str(exc)})
 
+    balance_adjusted = False
+    balance_applied_transactions = 0
+    balance_change = ZERO
+    balance_after: Decimal | None = None
     if commit and latest_balance:
         create_balance_snapshot(
             db, account, latest_balance[1], latest_balance[0], source="csv"
         )
+        balance_after = latest_balance[1]
     if commit:
+        db.flush()
+        applied_ids = _csv_balance_applied_ids(db, account.id)
+        candidate_transactions = [
+            transaction
+            for transaction in balance_candidates.values()
+            if transaction.id is not None and transaction.id not in applied_ids
+        ]
+        if latest_balance:
+            applied_ids.update(transaction.id for transaction in candidate_transactions)
+        elif adjust_balance and candidate_transactions:
+            latest = get_latest_balance(db, account.id)
+            current_amount = decimal_value(latest.amount) if latest else ZERO
+            balance_delta = ZERO
+            for transaction in candidate_transactions:
+                if transaction.currency == account.currency:
+                    transaction_delta = decimal_value(transaction.amount)
+                else:
+                    account_rate, _ = latest_fx_rate(
+                        db, account.currency, transaction.transaction_date
+                    )
+                    transaction_delta = decimal_value(transaction.base_amount) / account_rate
+                balance_delta += transaction_delta
+
+            balance_after = (
+                current_amount - balance_delta
+                if account.nature == "liability"
+                else current_amount + balance_delta
+            )
+            snapshot_date = max(
+                [transaction.transaction_date for transaction in candidate_transactions]
+                + ([latest.snapshot_date] if latest else [])
+            )
+            create_balance_snapshot(
+                db,
+                account,
+                balance_after,
+                snapshot_date,
+                source="csv_transactions",
+            )
+            if account.auto_balance_base_twd is not None:
+                summary = account_summary(db, account)
+                account.auto_balance_base_twd = Decimal(str(summary["balance_twd"])) - Decimal(
+                    str(summary["investments_twd"])
+                )
+            balance_change = balance_after - current_amount
+            balance_adjusted = balance_change != ZERO
+            balance_applied_transactions = len(candidate_transactions)
+            applied_ids.update(transaction.id for transaction in candidate_transactions)
+
+        if candidate_transactions:
+            _store_csv_balance_applied_ids(db, account.id, applied_ids)
+        record_valuation(db)
         db.commit()
     else:
         db.rollback()
@@ -884,6 +974,10 @@ def import_csv(
         "failed": failed[:50],
         "preview": preview,
         "encoding": inspected["encoding"],
+        "balance_adjusted": balance_adjusted,
+        "balance_applied_transactions": balance_applied_transactions,
+        "balance_change": float(balance_change),
+        "balance_after": float(balance_after) if balance_after is not None else None,
     }
 
 

@@ -684,12 +684,20 @@ async def import_transactions(
     account_id: int = Form(...),
     mapping_json: str = Form(...),
     commit: bool = Form(True),
+    adjust_balance: bool = Form(True),
 ):
     account = require_account(db, account_id)
     content = await file.read()
     try:
         mapping = json.loads(mapping_json)
-        return import_csv(db, content, account, mapping, commit=commit)
+        return import_csv(
+            db,
+            content,
+            account,
+            mapping,
+            commit=commit,
+            adjust_balance=adjust_balance,
+        )
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(422, str(exc)) from exc
 
