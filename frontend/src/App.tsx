@@ -38,7 +38,7 @@ const navigation = [
   { to: "/settings", label: "設定", icon: Settings },
 ];
 
-const globalOwnerPaths = new Set(["/", "/accounts", "/transactions", "/investments", "/plans"]);
+const globalOwnerPaths = new Set(["/", "/accounts", "/transactions", "/investments", "/plans", "/analysis"]);
 
 function useShowGlobalOwnerFilter() {
   const location = useLocation();
@@ -73,7 +73,7 @@ function GlobalOwnerBar() {
   return (
     <div className="sticky top-0 z-20 hidden h-14 items-center justify-between border-b border-slate-200/80 bg-canvas/90 px-10 backdrop-blur lg:flex">
       <GlobalOwnerSelect />
-      <p className="text-xs text-slate-400">會套用到總覽、帳戶、交易、投資持倉與財務目標。</p>
+      <p className="text-xs text-slate-400">會套用到總覽、帳戶、交易、投資持倉、財務目標與財務分析。</p>
     </div>
   );
 }
@@ -301,7 +301,7 @@ function FinanceApp() {
       void prefetchPrimaryData(queryClient, ownerFilter);
     }, 250);
     const secondaryTimer = window.setTimeout(() => {
-      void prefetchSecondaryData(queryClient);
+      void prefetchSecondaryData(queryClient, ownerFilter);
     }, 1_500);
 
     return () => {

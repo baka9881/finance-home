@@ -618,12 +618,15 @@ def record_valuation(db: Session) -> ValuationSnapshot:
     return snapshots["all"]
 
 
-def calculate_health_score(db: Session) -> dict[str, Any]:
+def calculate_health_score(db: Session, owner: str = "all") -> dict[str, Any]:
     end = date.today()
     start = end - timedelta(days=90)
-    transactions = db.scalars(
-        select(Transaction).where(Transaction.transaction_date >= start)
-    ).all()
+    transaction_query = select(Transaction).join(Account).where(
+        Transaction.transaction_date >= start
+    )
+    if owner != "all":
+        transaction_query = transaction_query.where(Account.owner == owner)
+    transactions = db.scalars(transaction_query).all()
     income = sum(
         (decimal_value(tx.base_amount) for tx in transactions if tx.transaction_kind == "income"),
         ZERO,
@@ -655,25 +658,33 @@ def calculate_health_score(db: Session) -> dict[str, Any]:
         ZERO,
     ) / Decimal("3")
     liquid = ZERO
-    for account in db.scalars(
-        select(Account).where(
-            Account.archived.is_(False),
-            Account.nature == "asset",
-            Account.is_liquid.is_(True),
-        )
-    ).all():
+    liquid_query = select(Account).where(
+        Account.archived.is_(False),
+        Account.nature == "asset",
+        Account.is_liquid.is_(True),
+    )
+    if owner != "all":
+        liquid_query = liquid_query.where(Account.owner == owner)
+    for account in db.scalars(liquid_query).all():
         liquid += Decimal(str(account_summary(db, account)["total_twd"]))
 
     current_month = end.strftime("%Y-%m")
-    budget_total = db.scalar(
-        select(func.sum(Budget.amount)).where(Budget.month == current_month)
+    budget_total = (
+        db.scalar(select(func.sum(Budget.amount)).where(Budget.month == current_month))
+        if owner == "all"
+        else None
     )
     current_start = end.replace(day=1)
+    current_transaction_query = select(Transaction).join(Account).where(
+        Transaction.transaction_date >= current_start
+    )
+    if owner != "all":
+        current_transaction_query = current_transaction_query.where(Account.owner == owner)
     current_spend = sum(
         (
             abs(decimal_value(tx.base_amount))
             for tx in db.scalars(
-                select(Transaction).where(Transaction.transaction_date >= current_start)
+                current_transaction_query
             ).all()
             if tx.transaction_kind in {"expense", "interest"}
         ),
@@ -728,7 +739,8 @@ def calculate_health_score(db: Session) -> dict[str, Any]:
             budget_score = Decimal("20")
         add_component("budget", "預算遵守度", ratio, budget_score, "支出不超過預算為滿分")
     else:
-        add_component("budget", "預算遵守度", None, None, "尚未設定本月預算")
+        budget_detail = "個人範圍尚未支援獨立預算" if owner != "all" else "尚未設定本月預算"
+        add_component("budget", "預算遵守度", None, None, budget_detail)
 
     available = [item for item in components if item["score"] is not None]
     overall = (

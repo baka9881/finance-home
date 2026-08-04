@@ -51,15 +51,15 @@ export function prefetchPrimaryData(client: QueryClient, owner: string) {
   ]);
 }
 
-export function prefetchSecondaryData(client: QueryClient) {
+export function prefetchSecondaryData(client: QueryClient, owner: string) {
   return Promise.allSettled([
     client.prefetchQuery({
-      queryKey: ["health"],
-      queryFn: () => api<HealthScore>("/analysis/health"),
+      queryKey: ["health", owner],
+      queryFn: () => api<HealthScore>(`/analysis/health?owner=${owner}`),
     }),
     client.prefetchQuery({
-      queryKey: ["dashboard", "all"],
-      queryFn: () => api<Dashboard>("/dashboard?owner=all"),
+      queryKey: ["dashboard", owner],
+      queryFn: () => api<Dashboard>(`/dashboard?owner=${owner}`),
     }),
     client.prefetchQuery({
       queryKey: ["settings"],

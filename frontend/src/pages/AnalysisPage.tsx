@@ -5,19 +5,25 @@ import {
   CircleHelp,
   Gauge,
   Lightbulb,
+  PieChart as PieChartIcon,
   ShieldCheck,
+  ShoppingBag,
   TrendingUp,
 } from "lucide-react";
 import {
   Bar,
   BarChart,
+  Cell,
   CartesianGrid,
+  Pie,
+  PieChart,
   ResponsiveContainer,
   Tooltip,
   XAxis,
   YAxis,
 } from "recharts";
 import { api } from "../api";
+import { ownerFilterLabels, useOwnerFilter } from "../ownerFilter";
 import type { Dashboard, HealthScore } from "../types";
 import { Badge, Card, EmptyState, PageHeader, Progress, money, number } from "../ui";
 
@@ -36,15 +42,35 @@ function componentValue(key: string, value: number | null) {
 }
 
 export default function AnalysisPage() {
-  const health = useQuery({ queryKey: ["health"], queryFn: () => api<HealthScore>("/analysis/health") });
+  const [ownerFilter] = useOwnerFilter();
+  const health = useQuery({
+    queryKey: ["health", ownerFilter],
+    queryFn: () => api<HealthScore>(`/analysis/health?owner=${ownerFilter}`),
+  });
   const dashboard = useQuery({
-    queryKey: ["dashboard", "all"],
-    queryFn: () => api<Dashboard>("/dashboard?owner=all"),
+    queryKey: ["dashboard", ownerFilter],
+    queryFn: () => api<Dashboard>(`/dashboard?owner=${ownerFilter}`),
   });
 
   const data = health.data;
   const tone = scoreTone(data?.score ?? null);
   const recommendations = makeRecommendations(data, dashboard.data);
+  const totalExpense = dashboard.data?.month_expense || 0;
+  const categorizedExpense = (dashboard.data?.category_expenses || []).reduce(
+    (total, item) => total + item.value,
+    0,
+  );
+  const uncategorizedExpense = Math.max(0, totalExpense - categorizedExpense);
+  const categoryExpenses = [
+    ...(dashboard.data?.category_expenses || []),
+    ...(uncategorizedExpense >= 0.5
+      ? [{ name: "未分類", color: "#94a3b8", value: uncategorizedExpense }]
+      : []),
+  ].sort((left, right) => right.value - left.value);
+  const monthLabel = new Intl.DateTimeFormat("zh-TW", {
+    year: "numeric",
+    month: "long",
+  }).format(new Date());
 
   return (
     <>
@@ -115,6 +141,82 @@ export default function AnalysisPage() {
               </div>
             </Card>
           </div>
+
+          <Card className="mt-6 p-5 sm:p-6">
+            <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
+              <div className="flex items-center gap-3">
+                <div className="rounded-xl bg-purple-50 p-2.5 text-purple-700"><PieChartIcon size={18} /></div>
+                <div>
+                  <h2 className="font-bold text-ink">本月消費分布</h2>
+                  <p className="mt-1 text-xs text-slate-400">{monthLabel} · {ownerFilterLabels[ownerFilter]} · 依支出分類統計</p>
+                </div>
+              </div>
+              <div className="rounded-xl bg-slate-50 px-4 py-3 sm:text-right">
+                <p className="text-xs text-slate-400">本月總支出</p>
+                <p className="mt-0.5 text-xl font-bold text-slate-800">{money(totalExpense)}</p>
+              </div>
+            </div>
+
+            {categoryExpenses.length ? (
+              <div className="mt-6 grid gap-7 lg:grid-cols-[320px_1fr] lg:items-center">
+                <div className="relative mx-auto h-[250px] w-full max-w-[320px] [&_*]:outline-none">
+                  <ResponsiveContainer width="100%" height="100%">
+                    <PieChart accessibilityLayer={false}>
+                      <Pie
+                        data={categoryExpenses}
+                        dataKey="value"
+                        nameKey="name"
+                        cx="50%"
+                        cy="50%"
+                        innerRadius={70}
+                        outerRadius={105}
+                        paddingAngle={2}
+                        stroke="transparent"
+                      >
+                        {categoryExpenses.map((item) => (
+                          <Cell key={item.name} fill={item.color} />
+                        ))}
+                      </Pie>
+                      <Tooltip formatter={(value) => money(Number(value))} />
+                    </PieChart>
+                  </ResponsiveContainer>
+                  <div className="pointer-events-none absolute inset-0 grid place-content-center text-center">
+                    <p className="text-xs text-slate-400">總消費</p>
+                    <p className="mt-1 text-xl font-bold text-slate-800">{money(totalExpense)}</p>
+                  </div>
+                </div>
+
+                <div className="space-y-4">
+                  {categoryExpenses.map((item, index) => {
+                    const percentage = totalExpense ? (item.value / totalExpense) * 100 : 0;
+                    return (
+                      <div key={item.name}>
+                        <div className="mb-2 flex items-center gap-3">
+                          <span className="w-5 text-xs font-semibold text-slate-400">{index + 1}</span>
+                          <span className="size-2.5 shrink-0 rounded-full" style={{ backgroundColor: item.color }} />
+                          <span className="min-w-0 flex-1 truncate text-sm font-semibold text-slate-700">{item.name}</span>
+                          <span className="text-sm font-bold text-slate-800">{money(item.value)}</span>
+                          <span className="w-14 text-right text-xs font-semibold text-slate-400">{number(percentage, 1)}%</span>
+                        </div>
+                        <div className="ml-8 h-2 overflow-hidden rounded-full bg-slate-100">
+                          <div
+                            className="h-full rounded-full transition-[width]"
+                            style={{ width: `${Math.min(100, percentage)}%`, backgroundColor: item.color }}
+                          />
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            ) : (
+              <EmptyState
+                icon={<ShoppingBag size={24} />}
+                title="本月還沒有消費"
+                description="新增或匯入支出後，這裡會自動統計餐飲、購物、交通等分類。"
+              />
+            )}
+          </Card>
 
           <div className="mt-6 grid gap-6 xl:grid-cols-[1.25fr_.75fr]">
             <Card className="p-6">

@@ -1572,8 +1572,9 @@ def dashboard(db: DB, owner: str = "all"):
 
 
 @app.get("/api/analysis/health")
-def financial_health(db: DB):
-    return calculate_health_score(db)
+def financial_health(db: DB, owner: str = "all"):
+    owner = validate_owner_filter(owner)
+    return calculate_health_score(db, owner=owner)
 
 
 @app.get("/api/exchanges/binance")

@@ -728,3 +728,11 @@ def test_budget_goal_and_health_score(client: TestClient):
     payload = health.json()
     assert payload["completeness"] >= 3
     assert payload["score"] is not None
+
+    filtered_health = client.get("/api/analysis/health?owner=me")
+    assert filtered_health.status_code == 200
+    assert filtered_health.json()["score"] is not None
+
+    partner_health = client.get("/api/analysis/health?owner=partner")
+    assert partner_health.status_code == 200
+    assert partner_health.json()["score"] is None
