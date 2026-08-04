@@ -41,6 +41,16 @@ interface TransferSuggestion {
   to: { id: number; account: string; date: string; description: string; amount: number };
 }
 
+interface PendingCsvBalance {
+  account_id: number;
+  account_name: string;
+  currency: string;
+  count: number;
+  balance_change: number;
+  current_balance: number;
+  balance_after: number;
+}
+
 const currentMonth = new Date().toISOString().slice(0, 7);
 const kindLabels: Record<string, string> = {
   income: "收入",
@@ -136,6 +146,11 @@ export default function TransactionsPage() {
       api<Transaction[]>(
         `/transactions?month=${month}&owner=${ownerFilter}${accountFilter ? `&account_id=${accountFilter}` : ""}`,
       ),
+  });
+  const pendingCsvBalances = useQuery({
+    queryKey: ["pending-csv-balances", ownerFilter],
+    queryFn: () =>
+      api<PendingCsvBalance[]>(`/transactions/import-balance/pending?owner=${ownerFilter}`),
   });
   const suggestions = useQuery({
     queryKey: ["transfer-suggestions"],
@@ -295,6 +310,18 @@ export default function TransactionsPage() {
     },
   });
 
+  const applyPendingCsvBalance = useMutation({
+    mutationFn: (accountId: number) =>
+      api<PendingCsvBalance>(`/transactions/import-balance/apply/${accountId}`, {
+        method: "POST",
+      }),
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ["pending-csv-balances"] });
+      client.invalidateQueries({ queryKey: ["accounts"] });
+      client.invalidateQueries({ queryKey: ["dashboard"] });
+    },
+  });
+
   const confirmTransfer = useMutation({
     mutationFn: (suggestion: TransferSuggestion) =>
       api("/transfers", {
@@ -451,6 +478,34 @@ export default function TransactionsPage() {
           </div>
         }
       />
+
+      {pendingCsvBalances.data?.map((pending) => (
+        <div
+          key={pending.account_id}
+          className="mb-5 flex flex-col gap-3 rounded-2xl border border-amber-200 bg-amber-50 px-4 py-4 text-amber-900 sm:flex-row sm:items-center sm:justify-between"
+        >
+          <div>
+            <p className="font-semibold">{pending.account_name}有 {pending.count} 筆匯入明細尚未反映在餘額</p>
+            <p className="mt-1 text-sm text-amber-700">
+              同步後餘額會由 {money(pending.current_balance)} 變為 {money(pending.balance_after)}，且不會重複套用。
+            </p>
+          </div>
+          <Button
+            variant="secondary"
+            className="shrink-0"
+            onClick={() => applyPendingCsvBalance.mutate(pending.account_id)}
+            disabled={applyPendingCsvBalance.isPending}
+          >
+            {applyPendingCsvBalance.isPending ? "同步中…" : "同步帳戶餘額"}
+          </Button>
+        </div>
+      ))}
+
+      {applyPendingCsvBalance.isError && (
+        <p className="mb-5 rounded-xl bg-red-50 px-4 py-3 text-sm text-red-700">
+          {(applyPendingCsvBalance.error as Error).message}
+        </p>
+      )}
 
       <Card className="mb-5 p-4">
         <div className="grid min-w-0 gap-3 sm:grid-cols-3">

@@ -809,6 +809,92 @@ def _store_csv_balance_applied_ids(
     setting.value = json.dumps(sorted(transaction_ids), separators=(",", ":"))
 
 
+def _pending_csv_balance_transactions(db: Session, account: Account) -> list[Transaction]:
+    setting = db.get(AppSetting, _csv_balance_applied_key(account.id))
+    if setting is None:
+        legacy_balance_snapshot = db.scalar(
+            select(BalanceSnapshot.id).where(
+                BalanceSnapshot.account_id == account.id,
+                BalanceSnapshot.source == "csv",
+            )
+        )
+        if legacy_balance_snapshot is not None:
+            return []
+    applied_ids = _csv_balance_applied_ids(db, account.id)
+    return [
+        transaction
+        for transaction in db.scalars(
+            select(Transaction).where(
+                Transaction.account_id == account.id,
+                Transaction.source == "csv",
+            )
+        ).all()
+        if transaction.id not in applied_ids
+    ]
+
+
+def _csv_transactions_balance_delta(
+    db: Session, account: Account, transactions: list[Transaction]
+) -> Decimal:
+    balance_delta = ZERO
+    for transaction in transactions:
+        if transaction.currency == account.currency:
+            transaction_delta = decimal_value(transaction.amount)
+        else:
+            account_rate, _ = latest_fx_rate(db, account.currency, transaction.transaction_date)
+            transaction_delta = decimal_value(transaction.base_amount) / account_rate
+        balance_delta += transaction_delta
+    return balance_delta
+
+
+def pending_csv_balance_status(db: Session, account: Account) -> dict[str, Any]:
+    transactions = _pending_csv_balance_transactions(db, account)
+    latest = get_latest_balance(db, account.id)
+    current_amount = decimal_value(latest.amount) if latest else ZERO
+    transaction_delta = _csv_transactions_balance_delta(db, account, transactions)
+    balance_change = -transaction_delta if account.nature == "liability" else transaction_delta
+    return {
+        "account_id": account.id,
+        "account_name": account.name,
+        "currency": account.currency,
+        "count": len(transactions),
+        "balance_change": float(balance_change),
+        "current_balance": float(current_amount),
+        "balance_after": float(current_amount + balance_change),
+    }
+
+
+def apply_pending_csv_balance(db: Session, account: Account) -> dict[str, Any]:
+    transactions = _pending_csv_balance_transactions(db, account)
+    status = pending_csv_balance_status(db, account)
+    if not transactions:
+        return status
+
+    latest = get_latest_balance(db, account.id)
+    snapshot_date = max(
+        [transaction.transaction_date for transaction in transactions]
+        + ([latest.snapshot_date] if latest else [])
+    )
+    create_balance_snapshot(
+        db,
+        account,
+        Decimal(str(status["balance_after"])),
+        snapshot_date,
+        source="csv_transactions",
+    )
+    applied_ids = _csv_balance_applied_ids(db, account.id)
+    applied_ids.update(transaction.id for transaction in transactions)
+    _store_csv_balance_applied_ids(db, account.id, applied_ids)
+    if account.auto_balance_base_twd is not None:
+        summary = account_summary(db, account)
+        account.auto_balance_base_twd = Decimal(str(summary["balance_twd"])) - Decimal(
+            str(summary["investments_twd"])
+        )
+    record_valuation(db)
+    db.commit()
+    return status
+
+
 def import_csv(
     db: Session,
     content: bytes,
@@ -924,16 +1010,9 @@ def import_csv(
         elif adjust_balance and candidate_transactions:
             latest = get_latest_balance(db, account.id)
             current_amount = decimal_value(latest.amount) if latest else ZERO
-            balance_delta = ZERO
-            for transaction in candidate_transactions:
-                if transaction.currency == account.currency:
-                    transaction_delta = decimal_value(transaction.amount)
-                else:
-                    account_rate, _ = latest_fx_rate(
-                        db, account.currency, transaction.transaction_date
-                    )
-                    transaction_delta = decimal_value(transaction.base_amount) / account_rate
-                balance_delta += transaction_delta
+            balance_delta = _csv_transactions_balance_delta(
+                db, account, candidate_transactions
+            )
 
             balance_after = (
                 current_amount - balance_delta

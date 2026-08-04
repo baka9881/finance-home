@@ -589,20 +589,26 @@ def test_csv_import_adjusts_balance_once_and_can_reconcile_existing_rows(client:
     account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
     assert account["balance"] == 100000
 
-    data["adjust_balance"] = "true"
-    reconciled = client.post(
-        "/api/transactions/import",
-        files={"file": ("transactions.csv", io.BytesIO(content), "text/csv")},
-        data=data,
-    )
+    pending = client.get("/api/transactions/import-balance/pending").json()
+    assert pending == [
+        {
+            "account_id": account_id,
+            "account_name": "生活費帳戶",
+            "currency": "TWD",
+            "count": 2,
+            "balance_change": -150,
+            "current_balance": 100000,
+            "balance_after": 99850,
+        }
+    ]
+
+    reconciled = client.post(f"/api/transactions/import-balance/apply/{account_id}")
     assert reconciled.status_code == 200, reconciled.text
-    assert reconciled.json()["imported"] == 0
-    assert reconciled.json()["duplicates"] == 2
-    assert reconciled.json()["balance_applied_transactions"] == 2
     assert reconciled.json()["balance_change"] == -150
     account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
     assert account["balance"] == 99850
 
+    data["adjust_balance"] = "true"
     repeated = client.post(
         "/api/transactions/import",
         files={"file": ("transactions.csv", io.BytesIO(content), "text/csv")},

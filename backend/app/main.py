@@ -70,6 +70,7 @@ from .schemas import (
     TransferCreate,
 )
 from .services import (
+    apply_pending_csv_balance,
     account_summary,
     binance_connection_statuses,
     calculate_dashboard,
@@ -83,6 +84,7 @@ from .services import (
     import_csv,
     inspect_csv,
     latest_fx_rate,
+    pending_csv_balance_status,
     position_summary,
     reclassify_uncategorized_transactions,
     record_valuation,
@@ -700,6 +702,22 @@ async def import_transactions(
         )
     except (ValueError, json.JSONDecodeError) as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/transactions/import-balance/pending")
+def pending_imported_transaction_balances(db: DB, owner: str = "all"):
+    owner = validate_owner_filter(owner)
+    query = select(Account).where(Account.archived.is_(False)).order_by(Account.id)
+    if owner != "all":
+        query = query.where(Account.owner == owner)
+    statuses = [pending_csv_balance_status(db, account) for account in db.scalars(query).all()]
+    return [status for status in statuses if status["count"] > 0]
+
+
+@app.post("/api/transactions/import-balance/apply/{account_id}")
+def apply_imported_transaction_balance(account_id: int, db: DB):
+    account = require_account(db, account_id)
+    return apply_pending_csv_balance(db, account)
 
 
 @app.get("/api/transfers/suggestions")
