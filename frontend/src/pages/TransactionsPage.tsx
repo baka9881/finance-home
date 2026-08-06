@@ -27,6 +27,7 @@ import {
   FormContext,
   FormStep,
   Input,
+  MonthInput,
   MobileWizardActions,
   MobileWizardProgress,
   MobileWizardStep,
@@ -518,9 +519,7 @@ export default function TransactionsPage() {
               onChange={(event) => setSearch(event.target.value)}
             />
           </div>
-          <Input
-            className="min-w-0 max-w-full"
-            type="month"
+          <MonthInput
             value={month}
             onChange={(event) => setMonth(event.target.value)}
           />

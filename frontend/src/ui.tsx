@@ -4,7 +4,7 @@ import {
   type ReactNode,
   type SelectHTMLAttributes,
 } from "react";
-import { ChevronLeft, ChevronRight, X } from "lucide-react";
+import { CalendarDays, ChevronLeft, ChevronRight, X } from "lucide-react";
 import { twMerge } from "tailwind-merge";
 
 export const cn = (...values: (string | false | null | undefined)[]) =>
@@ -65,6 +65,40 @@ export function Input({
       inputMode={inputMode ?? (type === "number" ? "decimal" : undefined)}
       {...props}
     />
+  );
+}
+
+export function MonthInput({
+  className,
+  value,
+  disabled,
+  ...props
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "type">) {
+  const rawValue = typeof value === "string" ? value : "";
+  const [year, month] = rawValue.split("-");
+  const displayValue = year && month
+    ? `${year}年${Number(month)}月`
+    : "選擇月份";
+
+  return (
+    <label
+      className={cn(
+        "relative flex h-11 min-w-0 w-full max-w-full cursor-pointer items-center overflow-hidden rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none transition focus-within:border-emerald-500 focus-within:ring-4 focus-within:ring-emerald-500/10",
+        disabled && "cursor-not-allowed opacity-50",
+        className,
+      )}
+    >
+      <span className="min-w-0 flex-1 truncate">{displayValue}</span>
+      <CalendarDays className="ml-3 shrink-0 text-slate-500" size={16} aria-hidden="true" />
+      <input
+        className="absolute inset-0 h-full min-h-0 w-full min-w-0 max-w-full cursor-pointer opacity-0 disabled:cursor-not-allowed"
+        type="month"
+        value={value}
+        disabled={disabled}
+        aria-label={props["aria-label"] || "選擇月份"}
+        {...props}
+      />
+    </label>
   );
 }
 

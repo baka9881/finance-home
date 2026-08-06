@@ -107,7 +107,7 @@ function Sidebar({
       >
         <div className="flex h-24 items-center gap-3 px-6">
           <img
-            src="/finance-home-cover.png?v=2"
+            src="/finance-home-icon-192.png"
             alt="財務居"
             className="size-12 shrink-0 rounded-2xl border-2 border-white/20 object-cover shadow-lg shadow-black/15"
           />
@@ -223,7 +223,7 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
       <div className="absolute inset-0 bg-[url('/finance-home-cover.png?v=2')] bg-cover bg-center opacity-25" />
       <div className="absolute inset-0 bg-gradient-to-b from-white/25 via-white/55 to-canvas" />
       <div className="relative w-full max-w-md rounded-3xl border border-white/70 bg-white/90 p-7 shadow-2xl backdrop-blur sm:p-9">
-        <img src="/finance-home-cover.png?v=2" alt="財務居" className="mx-auto size-24 rounded-3xl object-cover shadow-lg" />
+        <img src="/finance-home-icon-192.png" alt="財務居" className="mx-auto size-24 rounded-3xl object-cover shadow-lg" />
         <div className="mt-5 text-center">
           <h1 className="text-2xl font-bold text-ink">登入財務居</h1>
           <p className="mt-2 text-sm text-slate-500">輸入你的專屬密碼，才能查看雲端財務資料。</p>
@@ -347,7 +347,7 @@ function FinanceApp() {
             <Menu size={20} />
           </button>
           <div className="flex items-center gap-2 font-bold text-forest">
-            <img src="/finance-home-cover.png?v=2" alt="" className="size-8 rounded-xl object-cover" />
+            <img src="/finance-home-icon-192.png" alt="" className="size-8 rounded-xl object-cover" />
             財務居
           </div>
           {showGlobalOwnerFilter ? <GlobalOwnerSelect compact /> : <div className="size-10" />}

@@ -7,6 +7,7 @@ import hmac
 import io
 import json
 import os
+import re
 import secrets
 import time
 import unicodedata
@@ -593,6 +594,132 @@ def calculate_dashboard(db: Session, owner: str = "all") -> dict[str, Any]:
             for item in snapshots
         ],
         "updated_at": datetime.now().isoformat(),
+    }
+
+
+def _shift_month_start(value: date, offset: int) -> date:
+    month_index = value.year * 12 + value.month - 1 + offset
+    return date(month_index // 12, month_index % 12 + 1, 1)
+
+
+def _recurring_display_name(description: str) -> str:
+    normalized = unicodedata.normalize("NFKC", description or "").strip()
+    normalized = re.sub(r"\s*[（(](?:本金|利息|沖抵本金)[）)]\s*$", "", normalized)
+    return re.sub(r"\s+", " ", normalized).strip()
+
+
+def calculate_spending_analysis(
+    db: Session, month: str, owner: str = "all"
+) -> dict[str, Any]:
+    try:
+        year, month_number = map(int, month.split("-"))
+        month_start = date(year, month_number, 1)
+    except (TypeError, ValueError) as exc:
+        raise ValueError("月份格式必須是 YYYY-MM") from exc
+    month_end = _shift_month_start(month_start, 1)
+
+    month_query = select(Transaction).join(Account).where(
+        Transaction.transaction_date >= month_start,
+        Transaction.transaction_date < month_end,
+        Transaction.base_amount < 0,
+        Transaction.transaction_kind.in_(["expense", "interest"]),
+    )
+    if owner != "all":
+        month_query = month_query.where(Account.owner == owner)
+    month_rows = db.scalars(month_query).all()
+
+    category_totals: dict[tuple[str, str], Decimal] = defaultdict(lambda: ZERO)
+    month_expense = ZERO
+    for row in month_rows:
+        amount = abs(decimal_value(row.base_amount))
+        month_expense += amount
+        category_name = row.category.name if row.category else "未分類"
+        category_color = row.category.color if row.category else "#94a3b8"
+        category_totals[(category_name, category_color)] += amount
+
+    history_start = _shift_month_start(month_start, -5)
+    recurring_query = select(Transaction).join(Account).where(
+        Transaction.transaction_date >= history_start,
+        Transaction.transaction_date < month_end,
+        Transaction.base_amount < 0,
+        Transaction.transaction_kind.in_(["expense", "interest", "debt_principal"]),
+    )
+    if owner != "all":
+        recurring_query = recurring_query.where(Account.owner == owner)
+    recurring_rows = db.scalars(recurring_query).all()
+
+    groups: dict[tuple[int, str], dict[str, Any]] = {}
+    for row in recurring_rows:
+        display_name = _recurring_display_name(row.description)
+        if not display_name:
+            continue
+        key = (row.account_id, display_name.casefold())
+        group = groups.setdefault(
+            key,
+            {
+                "name": display_name,
+                "account_name": row.account.name,
+                "months": defaultdict(lambda: {"amount": ZERO, "count": 0}),
+                "categories": defaultdict(int),
+                "has_loan_principal": False,
+                "latest_date": row.transaction_date,
+            },
+        )
+        row_month = row.transaction_date.strftime("%Y-%m")
+        group["months"][row_month]["amount"] += abs(decimal_value(row.base_amount))
+        group["months"][row_month]["count"] += 1
+        category_name = row.category.name if row.category else "未分類"
+        group["categories"][category_name] += 1
+        group["has_loan_principal"] = group["has_loan_principal"] or row.transaction_kind == "debt_principal"
+        group["latest_date"] = max(group["latest_date"], row.transaction_date)
+
+    previous_month = _shift_month_start(month_start, -1).strftime("%Y-%m")
+    recurring_expenses: list[dict[str, Any]] = []
+    for group in groups.values():
+        monthly = group["months"]
+        if len(monthly) < 2 or max(item["count"] for item in monthly.values()) > 2:
+            continue
+        if month not in monthly and previous_month not in monthly:
+            continue
+        amounts = [item["amount"] for item in monthly.values()]
+        average = sum(amounts, ZERO) / Decimal(len(amounts))
+        if average <= 0:
+            continue
+        if any(abs(amount - average) / average > Decimal("0.20") for amount in amounts):
+            continue
+        if group["has_loan_principal"]:
+            category_name = "貸款"
+        else:
+            category_name = max(group["categories"], key=group["categories"].get)
+        current_amount = monthly.get(month, {}).get("amount", ZERO)
+        recurring_expenses.append(
+            {
+                "name": group["name"],
+                "account_name": group["account_name"],
+                "category_name": category_name,
+                "average_amount": float(average),
+                "current_month_amount": float(current_amount),
+                "months_detected": len(monthly),
+                "latest_date": group["latest_date"].isoformat(),
+                "status": "recorded" if current_amount > 0 else "expected",
+            }
+        )
+
+    recurring_expenses.sort(key=lambda item: item["average_amount"], reverse=True)
+    return {
+        "month": month,
+        "owner": owner,
+        "month_expense": float(month_expense),
+        "category_expenses": [
+            {"name": name, "color": color, "value": float(value)}
+            for (name, color), value in sorted(
+                category_totals.items(), key=lambda item: item[1], reverse=True
+            )
+        ],
+        "recurring_expenses": recurring_expenses,
+        "estimated_recurring_total": float(
+            sum((Decimal(str(item["average_amount"])) for item in recurring_expenses), ZERO)
+        ),
     }
 
 

@@ -132,6 +132,24 @@ export interface HealthScore {
   }[];
 }
 
+export interface SpendingAnalysis {
+  month: string;
+  owner: "all" | "me" | "partner" | "shared";
+  month_expense: number;
+  category_expenses: { name: string; color: string; value: number }[];
+  recurring_expenses: {
+    name: string;
+    account_name: string;
+    category_name: string;
+    average_amount: number;
+    current_month_amount: number;
+    months_detected: number;
+    latest_date: string;
+    status: "recorded" | "expected";
+  }[];
+  estimated_recurring_total: number;
+}
+
 export interface CsvInspection {
   encoding: string;
   columns: string[];

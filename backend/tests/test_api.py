@@ -736,3 +736,55 @@ def test_budget_goal_and_health_score(client: TestClient):
     partner_health = client.get("/api/analysis/health?owner=partner")
     assert partner_health.status_code == 200
     assert partner_health.json()["score"] is None
+
+
+def test_spending_analysis_supports_months_and_recurring_expenses(client: TestClient):
+    account = create_account(client, "生活帳戶")
+    categories = client.get("/api/categories").json()
+    subscription = next(item for item in categories if item["name"] == "訂閱")
+    food = next(item for item in categories if item["name"] == "餐飲")
+    fees = next(item for item in categories if item["name"] == "利息與費用")
+    today = date.today()
+    previous_date = today.replace(day=1) - timedelta(days=1)
+
+    transactions = [
+        (previous_date, "健身房月費", -999, "expense", subscription["id"]),
+        (today, "健身房月費", -999, "expense", subscription["id"]),
+        (previous_date, "貸款還款（本金）", -5000, "debt_principal", None),
+        (previous_date, "貸款還款（利息）", -500, "interest", fees["id"]),
+        (today, "貸款還款（本金）", -5000, "debt_principal", None),
+        (today, "貸款還款（利息）", -500, "interest", fees["id"]),
+        (previous_date, "家樂福", -100, "expense", food["id"]),
+        (today, "家樂福", -800, "expense", food["id"]),
+    ]
+    for transaction_date, description, amount, kind, category_id in transactions:
+        response = client.post(
+            "/api/transactions",
+            json={
+                "account_id": account,
+                "transaction_date": transaction_date.isoformat(),
+                "description": description,
+                "amount": amount,
+                "transaction_kind": kind,
+                "category_id": category_id,
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    month = today.strftime("%Y-%m")
+    response = client.get(f"/api/analysis/spending?month={month}&owner=me")
+    assert response.status_code == 200
+    payload = response.json()
+    assert payload["month"] == month
+    assert payload["month_expense"] == 2299
+    assert any(
+        item["name"] == "訂閱" and item["value"] == 999
+        for item in payload["category_expenses"]
+    )
+    recurring = {item["name"]: item for item in payload["recurring_expenses"]}
+    assert recurring["健身房月費"]["average_amount"] == 999
+    assert recurring["貸款還款"]["average_amount"] == 5500
+    assert recurring["貸款還款"]["category_name"] == "貸款"
+    assert "家樂福" not in recurring
+
+    assert client.get("/api/analysis/spending?month=not-a-month").status_code == 422

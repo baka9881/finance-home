@@ -2,7 +2,7 @@
   "id": "/",
   "name": "財務居",
   "short_name": "財務居",
-  "description": "個人與共同財務管理工具",
+  "description": "整合帳戶、交易、投資與財務目標的個人財務工具",
   "lang": "zh-Hant",
   "start_url": "/",
   "scope": "/",
@@ -12,16 +12,16 @@
   "theme_color": "#153b32",
   "icons": [
     {
-      "src": "/app-icon-192.png",
+      "src": "/finance-home-icon-192.png",
       "sizes": "192x192",
       "type": "image/png",
-      "purpose": "any"
+      "purpose": "any maskable"
     },
     {
-      "src": "/app-icon-512.png",
+      "src": "/finance-home-icon-512.png",
       "sizes": "512x512",
       "type": "image/png",
-      "purpose": "any"
+      "purpose": "any maskable"
     }
   ]
 }

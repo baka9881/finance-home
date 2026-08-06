@@ -75,6 +75,7 @@ from .services import (
     binance_connection_statuses,
     calculate_dashboard,
     calculate_health_score,
+    calculate_spending_analysis,
     classify_transaction,
     create_balance_snapshot,
     decimal_value,
@@ -1575,6 +1576,16 @@ def dashboard(db: DB, owner: str = "all"):
 def financial_health(db: DB, owner: str = "all"):
     owner = validate_owner_filter(owner)
     return calculate_health_score(db, owner=owner)
+
+
+@app.get("/api/analysis/spending")
+def spending_analysis(db: DB, month: str | None = None, owner: str = "all"):
+    owner = validate_owner_filter(owner)
+    selected_month = month or date.today().strftime("%Y-%m")
+    try:
+        return calculate_spending_analysis(db, selected_month, owner=owner)
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/exchanges/binance")
