@@ -505,7 +505,7 @@ export default function SettingsPage() {
               <p className="text-sm text-amber-700">請先到帳戶頁新增「加密貨幣交易所」帳戶。</p>
             )}
             <p className="text-xs leading-5 text-slate-400">
-              幣安不會提供歷史平均成本；原本已填的成本會保留，新同步進來的幣種會先以第一次同步價格作為成本基準。
+              系統會比對 Binance 可讀取的 USDT 現貨成交紀錄與目前餘額，自動計算能確認的平均成本；如果有外部轉入、理財收益或歷史缺漏，就會保留原值並標示「成本待確認」。
             </p>
           </form>
         )}

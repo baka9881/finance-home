@@ -88,6 +88,8 @@ export interface Position {
   market_value: number;
   market_value_twd: number;
   cost_twd: number;
+  cost_status: "automatic" | "calculated" | "confirmed" | "estimated" | "missing";
+  cost_note: string;
   profit_twd: number;
   profit_pct?: number;
 }

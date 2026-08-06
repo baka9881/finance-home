@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import io
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta, timezone
 
 import pytest
 from fastapi.testclient import TestClient
@@ -172,6 +172,7 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
     bitcoin = next(item for item in positions if item["symbol"] == "bitcoin")
     assert bitcoin["quantity"] == 0.5
     assert bitcoin["price"] == 60000
+    assert bitcoin["cost_status"] == "estimated"
 
     status = client.get("/api/exchanges/binance").json()
     assert status[0]["connected"] is True
@@ -278,6 +279,35 @@ def test_binance_portfolio_margin_updates_tradfi_position(
     assert positions[0]["average_cost"] == 91.25
     assert positions[0]["price"] == 94.86
     assert positions[0]["price_source"] == "Binance Futures"
+    assert positions[0]["cost_status"] == "automatic"
+
+
+def test_position_cost_can_be_confirmed_with_average_cost_patch(client: TestClient):
+    account_id = create_account(client, "投資帳戶")
+    created = client.post(
+        "/api/positions",
+        json={
+            "account_id": account_id,
+            "market": "US",
+            "symbol": "MSTR",
+            "name": "Strategy",
+            "quantity": 2,
+            "average_cost": 90,
+            "currency": "USD",
+            "manual_price": 100,
+        },
+    )
+    assert created.status_code == 201, created.text
+    assert created.json()["cost_status"] == "confirmed"
+
+    updated = client.patch(
+        f"/api/positions/{created.json()['id']}",
+        json={"quantity": 2.5, "average_cost": 80},
+    )
+    assert updated.status_code == 200, updated.text
+    assert updated.json()["quantity"] == 2.5
+    assert updated.json()["average_cost"] == 80
+    assert updated.json()["cost_status"] == "confirmed"
 
 
 def test_binance_funding_wallet_updates_existing_stock_position(
@@ -482,6 +512,72 @@ def test_binance_wallet_total_includes_each_active_wallet():
     assert services_module._binance_wallet_total(payload) == services_module.Decimal("1659.04")
 
 
+def test_binance_spot_average_cost_uses_matching_trade_history():
+    trades = [
+        {
+            "id": 1,
+            "time": 1,
+            "price": "50000",
+            "qty": "0.01",
+            "quoteQty": "500",
+            "commission": "0",
+            "commissionAsset": "BNB",
+            "isBuyer": True,
+        },
+        {
+            "id": 2,
+            "time": 2,
+            "price": "60000",
+            "qty": "0.01",
+            "quoteQty": "600",
+            "commission": "0",
+            "commissionAsset": "BNB",
+            "isBuyer": True,
+        },
+        {
+            "id": 3,
+            "time": 3,
+            "price": "65000",
+            "qty": "0.005",
+            "quoteQty": "325",
+            "commission": "0",
+            "commissionAsset": "BNB",
+            "isBuyer": False,
+        },
+    ]
+
+    average_cost = services_module._binance_spot_average_cost(
+        trades,
+        "BTC",
+        services_module.Decimal("0.015"),
+    )
+    assert average_cost == services_module.Decimal("55000")
+
+
+def test_binance_spot_average_cost_rejects_incomplete_history():
+    trades = [
+        {
+            "id": 1,
+            "time": 1,
+            "price": "50000",
+            "qty": "0.01",
+            "quoteQty": "500",
+            "commission": "0",
+            "commissionAsset": "BNB",
+            "isBuyer": True,
+        }
+    ]
+
+    assert (
+        services_module._binance_spot_average_cost(
+            trades,
+            "BTC",
+            services_module.Decimal("0.02"),
+        )
+        is None
+    )
+
+
 def test_binance_signature_error_has_actionable_message():
     request = services_module.httpx.Request("GET", "https://api.binance.com/api/v3/account")
     response = services_module.httpx.Response(
@@ -492,6 +588,116 @@ def test_binance_signature_error_has_actionable_message():
 
     with pytest.raises(ValueError, match="API Key 與 Secret Key 是同一次建立"):
         services_module._binance_response_payload(response)
+
+
+def test_us_market_falls_back_to_yahoo_and_uses_daily_cache(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    account_id = create_account(client, "美股投資帳戶")
+    position = client.post(
+        "/api/positions",
+        json={
+            "account_id": account_id,
+            "market": "US",
+            "symbol": "MSTR",
+            "name": "Strategy",
+            "quantity": 1,
+            "average_cost": 90,
+            "currency": "USD",
+        },
+    )
+    assert position.status_code == 201, position.text
+    monkeypatch.setenv("ALPHA_VANTAGE_API_KEY", "test-key")
+
+    calls: list[str] = []
+
+    class FakeResponse:
+        def __init__(self, payload: dict):
+            self.payload = payload
+
+        def raise_for_status(self):
+            return None
+
+        def json(self):
+            return self.payload
+
+    class FakeMarketClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, traceback):
+            return False
+
+        def get(self, url: str, **kwargs):
+            calls.append(url)
+            if "alphavantage.co" in url:
+                return FakeResponse(
+                    {
+                        "Information": (
+                            "Our standard API rate limit is 25 requests per day."
+                        )
+                    }
+                )
+            return FakeResponse(
+                {
+                    "chart": {
+                        "result": [
+                            {
+                                "meta": {"currency": "USD"},
+                                "timestamp": [
+                                    int(
+                                        datetime(
+                                            2026, 8, 6, tzinfo=timezone.utc
+                                        ).timestamp()
+                                    )
+                                ],
+                                "indicators": {
+                                    "quote": [{"close": [97.15]}]
+                                },
+                            }
+                        ],
+                        "error": None,
+                    }
+                }
+            )
+
+    monkeypatch.setattr(services_module.httpx, "Client", FakeMarketClient)
+
+    refreshed = client.post("/api/market/refresh")
+    assert refreshed.status_code == 200, refreshed.text
+    payload = refreshed.json()
+    assert payload["updated"] == 1
+    assert any("Yahoo Finance" in warning for warning in payload["warnings"])
+    assert len(calls) == 2
+
+    positions = client.get("/api/positions").json()
+    assert positions[0]["price"] == 97.15
+    assert positions[0]["price_source"] == "Yahoo Finance"
+    assert positions[0]["price_date"] == "2026-08-06"
+
+    cached = client.post("/api/market/refresh")
+    assert cached.status_code == 200, cached.text
+    assert cached.json()["skipped"] == 1
+    assert len(calls) == 2
+
+
+def test_alpha_vantage_failure_reason_is_not_always_reported_as_quota():
+    assert (
+        services_module._alpha_vantage_failure_reason(
+            {"Error Message": "Invalid API call. Please retry."}
+        )
+        == "Alpha Vantage 暫時未提供行情"
+    )
+    assert (
+        services_module._alpha_vantage_failure_reason(
+            {"Information": "Our standard API rate limit is 25 requests per day."}
+        )
+        == "Alpha Vantage 今日免費額度已用完"
+    )
 
 
 def test_transfer_does_not_pollute_cashflow(client: TestClient):

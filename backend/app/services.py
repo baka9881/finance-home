@@ -349,6 +349,47 @@ def get_latest_price(db: Session, market: str, symbol: str) -> PriceSnapshot | N
     )
 
 
+def _position_cost_setting_key(position_id: int) -> str:
+    return f"position:{position_id}:cost_status"
+
+
+def set_position_cost_status(db: Session, position: Position, status: str) -> None:
+    if status not in {"automatic", "calculated", "confirmed", "estimated", "missing"}:
+        raise ValueError("不支援的成本狀態")
+    _set_setting_value(db, _position_cost_setting_key(position.id), status)
+
+
+def position_cost_status(
+    db: Session,
+    position: Position,
+    price_source: str,
+) -> tuple[str, str]:
+    average_cost = decimal_value(position.average_cost)
+    stored = _get_setting_value(db, _position_cost_setting_key(position.id))
+    if average_cost <= 0:
+        return "missing", "尚未填入成本，損益暫時無法正確計算。"
+    if stored == "automatic":
+        return "automatic", "已由交易所可讀取的成交或合約資料自動計算。"
+    if stored == "calculated":
+        return "calculated", "已依財務居內的買入紀錄自動計算。"
+    if stored == "confirmed":
+        return "confirmed", "這筆成本已由你確認。"
+    if stored == "estimated":
+        return "estimated", "交易所只提供餘額或持倉，無法完整還原歷史成本，請確認一次。"
+
+    institution = str(getattr(position.account, "institution", "") or "").casefold()
+    is_binance_position = (
+        "binance" in institution
+        or "幣安" in institution
+        or price_source.startswith("Binance")
+    )
+    if price_source == "Binance Futures":
+        return "automatic", "已使用 Binance 合約回傳的進場成本。"
+    if is_binance_position:
+        return "estimated", "交易所只提供餘額或持倉，無法完整還原歷史成本，請確認一次。"
+    return "confirmed", "這筆成本已有完整資料。"
+
+
 def position_summary(db: Session, position: Position) -> dict[str, Any]:
     latest = get_latest_price(db, position.market, position.symbol)
     if position.manual_price is not None:
@@ -372,6 +413,7 @@ def position_summary(db: Session, position: Position) -> dict[str, Any]:
     value_original = quantity * price
     value_twd = value_original * rate
     cost_twd = quantity * decimal_value(position.average_cost) * rate
+    cost_status, cost_note = position_cost_status(db, position, source)
     return {
         "id": position.id,
         "account_id": position.account_id,
@@ -393,6 +435,8 @@ def position_summary(db: Session, position: Position) -> dict[str, Any]:
         "market_value": float(value_original),
         "market_value_twd": float(value_twd),
         "cost_twd": float(cost_twd),
+        "cost_status": cost_status,
+        "cost_note": cost_note,
         "profit_twd": float(value_twd - cost_twd),
         "profit_pct": float((value_twd / cost_twd - 1) * 100) if cost_twd else None,
     }
@@ -1389,6 +1433,53 @@ def _binance_wallet_total(payload: Any) -> Decimal | None:
     return sum(active_wallets, ZERO) if active_wallets else ZERO
 
 
+def _binance_spot_average_cost(
+    trades: Any,
+    asset: str,
+    current_quantity: Decimal,
+) -> Decimal | None:
+    if not isinstance(trades, list) or not trades or current_quantity <= 0:
+        return None
+
+    running_quantity = ZERO
+    running_cost = ZERO
+    for item in sorted(
+        (row for row in trades if isinstance(row, dict)),
+        key=lambda row: (int(row.get("time") or 0), int(row.get("id") or 0)),
+    ):
+        quantity = decimal_value(item.get("qty"))
+        quote_quantity = decimal_value(item.get("quoteQty"))
+        if quantity <= 0:
+            continue
+        if quote_quantity <= 0:
+            quote_quantity = quantity * decimal_value(item.get("price"))
+        commission = decimal_value(item.get("commission"))
+        commission_asset = str(item.get("commissionAsset") or "").upper()
+        is_buyer = item.get("isBuyer") is True or str(item.get("isBuyer")).lower() == "true"
+
+        if is_buyer:
+            acquired_quantity = quantity - (commission if commission_asset == asset else ZERO)
+            if acquired_quantity <= 0:
+                continue
+            running_quantity += acquired_quantity
+            running_cost += quote_quantity
+            if commission_asset == "USDT":
+                running_cost += commission
+            continue
+
+        removed_quantity = quantity + (commission if commission_asset == asset else ZERO)
+        if running_quantity <= 0 or removed_quantity > running_quantity:
+            return None
+        average_cost = running_cost / running_quantity
+        running_quantity -= removed_quantity
+        running_cost = max(ZERO, running_cost - average_cost * removed_quantity)
+
+    tolerance = max(Decimal("0.00000001"), current_quantity * Decimal("0.0001"))
+    if running_quantity <= 0 or abs(running_quantity - current_quantity) > tolerance:
+        return None
+    return running_cost / running_quantity if running_cost > 0 else None
+
+
 def _fetch_binance_spot_snapshot(
     api_key: str,
     api_secret: str,
@@ -1606,6 +1697,57 @@ def _fetch_binance_spot_snapshot(
         prices_response = client.get("https://data-api.binance.vision/api/v3/ticker/price")
         prices_payload = _binance_response_payload(prices_response)
 
+        prices_for_cost = {
+            str(item.get("symbol")): decimal_value(item.get("price"))
+            for item in prices_payload
+            if isinstance(item, dict)
+            and item.get("symbol")
+            and decimal_value(item.get("price")) > 0
+        }
+        for item in account_payload.get("balances", []):
+            if not isinstance(item, dict):
+                continue
+            asset = str(item.get("asset") or "").upper()
+            quantity = decimal_value(item.get("free")) + decimal_value(item.get("locked"))
+            pair = f"{asset}USDT"
+            price = prices_for_cost.get(pair)
+            if (
+                not asset
+                or asset in BINANCE_CASH_ASSETS
+                or quantity <= 0
+                or not price
+                or quantity * price < Decimal("0.30")
+            ):
+                continue
+            try:
+                trade_timestamp = int(time.time() * 1000) + server_time_offset
+                trades_query = _binance_signed_query(
+                    api_secret,
+                    trade_timestamp,
+                    ("symbol", pair),
+                    ("limit", "1000"),
+                )
+                trades_response = client.get(
+                    f"https://api.binance.com/api/v3/myTrades?{trades_query}"
+                )
+                trades_payload = _binance_response_payload(trades_response)
+                average_cost = _binance_spot_average_cost(
+                    trades_payload,
+                    asset,
+                    quantity,
+                )
+                if average_cost is not None:
+                    item["_average_cost"] = str(average_cost)
+                    item["_cost_status"] = "automatic"
+                elif trades_payload:
+                    wallet_warnings.append(
+                        f"{asset} 的成交數量與目前餘額不同，成本需確認一次"
+                    )
+            except (ValueError, httpx.HTTPError):
+                wallet_warnings.append(
+                    f"暫時無法讀取 {asset} 的現貨成交紀錄，成本維持原值"
+                )
+
     balances = account_payload.get("balances", []) if isinstance(account_payload, dict) else []
     prices = {
         str(item.get("symbol")): decimal_value(item.get("price"))
@@ -1703,6 +1845,8 @@ def sync_binance_account(
         if position_value_twd < BINANCE_MIN_POSITION_VALUE_TWD:
             continue
         positions_twd += position_value_twd
+        synced_average_cost = decimal_value(item.get("_average_cost"))
+        synced_cost_status = str(item.get("_cost_status") or "estimated")
         symbol = BINANCE_ASSET_SYMBOLS.get(asset, f"binance-{asset.lower()}")
         position = db.scalar(
             select(Position).where(
@@ -1718,17 +1862,22 @@ def sync_binance_account(
                 symbol=symbol,
                 name=asset,
                 quantity=quantity,
-                average_cost=price,
+                average_cost=synced_average_cost or price,
                 currency="USD",
             )
             db.add(position)
+            db.flush()
+            set_position_cost_status(db, position, synced_cost_status)
         else:
             position.quantity = quantity
             position.name = position.name or asset
             position.currency = "USD"
             position.manual_price = None
             position.archived = False
-            if decimal_value(position.average_cost) <= 0:
+            if synced_average_cost > 0:
+                position.average_cost = synced_average_cost
+                set_position_cost_status(db, position, "automatic")
+            elif decimal_value(position.average_cost) <= 0:
                 position.average_cost = price
         db.flush()
         seen_position_ids.add(position.id)
@@ -1848,6 +1997,8 @@ def sync_binance_account(
                 currency="USD",
             )
             db.add(position)
+            db.flush()
+            set_position_cost_status(db, position, "automatic")
         elif side == "BUY":
             old_quantity = decimal_value(position.quantity)
             new_quantity = old_quantity + quantity
@@ -1918,6 +2069,7 @@ def sync_binance_account(
             position.manual_price = None
             position.archived = False
         db.flush()
+        set_position_cost_status(db, position, "automatic")
         seen_position_ids.add(position.id)
         _upsert_price(
             db,
@@ -2033,6 +2185,61 @@ def _refresh_crypto_from_binance(
         return False
 
 
+def _alpha_vantage_failure_reason(payload: Any) -> str:
+    if not isinstance(payload, dict):
+        return "Alpha Vantage 回傳格式異常"
+    message = str(
+        payload.get("Note")
+        or payload.get("Information")
+        or payload.get("Error Message")
+        or ""
+    ).strip()
+    normalized = message.casefold()
+    if "api key" in normalized and any(
+        keyword in normalized
+        for keyword in ("invalid", "not authorized", "not valid", "premium")
+    ):
+        return "Alpha Vantage API 金鑰無效或沒有此功能的權限"
+    if "rate limit" in normalized or "requests per day" in normalized:
+        return "Alpha Vantage 今日免費額度已用完"
+    if message:
+        return "Alpha Vantage 暫時未提供行情"
+    return "Alpha Vantage 找不到這個美股代號"
+
+
+def _fetch_yahoo_daily_quote(
+    client: httpx.Client,
+    symbol: str,
+) -> tuple[date, Decimal, str]:
+    yahoo_symbol = symbol.strip().upper().replace(".", "-")
+    if not yahoo_symbol:
+        raise ValueError("缺少美股代號")
+    response = client.get(
+        f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}",
+        params={"interval": "1d", "range": "5d", "events": "history"},
+    )
+    response.raise_for_status()
+    payload = response.json()
+    chart = payload.get("chart", {}) if isinstance(payload, dict) else {}
+    if chart.get("error"):
+        raise ValueError("Yahoo Finance 回傳行情錯誤")
+    results = chart.get("result") or []
+    if not results:
+        raise ValueError("Yahoo Finance 找不到這個美股代號")
+    result = results[0]
+    timestamps = result.get("timestamp") or []
+    indicators = result.get("indicators") or {}
+    quotes = indicators.get("quote") or []
+    closes = quotes[0].get("close", []) if quotes else []
+    for timestamp, close in reversed(list(zip(timestamps, closes))):
+        price = decimal_value(close)
+        if price > 0:
+            price_date = datetime.fromtimestamp(int(timestamp), timezone.utc).date()
+            currency = str(result.get("meta", {}).get("currency") or "USD").upper()
+            return price_date, price, currency
+    raise ValueError("Yahoo Finance 沒有可用的每日收盤價")
+
+
 def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
     positions = db.scalars(select(Position).where(Position.archived.is_(False))).all()
     result = {"updated": 0, "skipped": 0, "warnings": [], "errors": []}
@@ -2110,62 +2317,75 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
         if by_market.get("US"):
             setting = db.get(AppSetting, "alpha_vantage_api_key")
             api_key = os.getenv("ALPHA_VANTAGE_API_KEY") or (setting.value if setting else "")
-            if not api_key:
-                for position in by_market["US"]:
-                    _reuse_cached_market_price(
-                        db,
-                        result,
-                        position,
-                        f"美股 {position.symbol}",
-                        "尚未設定 Alpha Vantage API 金鑰",
-                    )
-            else:
-                for position in by_market["US"]:
+            for position in by_market["US"]:
+                alpha_failure = "尚未設定 Alpha Vantage API 金鑰"
+                if api_key:
                     try:
-                        payload = client.get(
+                        response = client.get(
                             "https://www.alphavantage.co/query",
                             params={
                                 "function": "GLOBAL_QUOTE",
                                 "symbol": position.symbol,
                                 "apikey": api_key,
                             },
-                        ).json()
+                        )
+                        response.raise_for_status()
+                        payload = response.json()
                         quote = payload.get("Global Quote", {})
-                        if not quote.get("05. price"):
-                            provider_message = str(
-                                payload.get("Note") or payload.get("Information") or ""
-                            ).lower()
-                            reason = (
-                                "今日免費更新額度已用完"
-                                if "rate limit" in provider_message
-                                or "requests per day" in provider_message
-                                else "暫時無法取得新報價"
+                        alpha_price = decimal_value(quote.get("05. price"))
+                        if alpha_price > 0:
+                            price_date = date.fromisoformat(
+                                quote.get(
+                                    "07. latest trading day", date.today().isoformat()
+                                )
                             )
-                            _reuse_cached_market_price(
-                                db, result, position, f"美股 {position.symbol}", reason
+                            _upsert_price(
+                                db,
+                                "US",
+                                position.symbol,
+                                price_date,
+                                alpha_price,
+                                "USD",
+                                "Alpha Vantage",
                             )
+                            result["updated"] += 1
                             continue
-                        price_date = date.fromisoformat(
-                            quote.get("07. latest trading day", date.today().isoformat())
+                        alpha_failure = _alpha_vantage_failure_reason(payload)
+                    except httpx.HTTPStatusError as exc:
+                        alpha_failure = (
+                            f"Alpha Vantage 連線失敗（HTTP {exc.response.status_code}）"
                         )
-                        _upsert_price(
-                            db,
-                            "US",
-                            position.symbol,
-                            price_date,
-                            decimal_value(quote["05. price"]),
-                            "USD",
-                            "Alpha Vantage",
-                        )
-                        result["updated"] += 1
-                    except Exception:
-                        _reuse_cached_market_price(
-                            db,
-                            result,
-                            position,
-                            f"美股 {position.symbol}",
-                            "行情服務暫時無法連線",
-                        )
+                    except (ValueError, TypeError):
+                        alpha_failure = "Alpha Vantage 回傳的行情格式無法辨識"
+                    except httpx.HTTPError:
+                        alpha_failure = "Alpha Vantage 連線失敗"
+
+                try:
+                    price_date, price, currency = _fetch_yahoo_daily_quote(
+                        client, position.symbol
+                    )
+                    _upsert_price(
+                        db,
+                        "US",
+                        position.symbol,
+                        price_date,
+                        price,
+                        currency,
+                        "Yahoo Finance",
+                    )
+                    result["updated"] += 1
+                    result["warnings"].append(
+                        f"美股 {position.symbol}：{alpha_failure}，已改用 Yahoo Finance "
+                        f"{price_date.isoformat()} 的每日收盤價"
+                    )
+                except (ValueError, TypeError, httpx.HTTPError):
+                    _reuse_cached_market_price(
+                        db,
+                        result,
+                        position,
+                        f"美股 {position.symbol}",
+                        f"{alpha_failure}；Yahoo Finance 備援也暫時無法使用",
+                    )
 
         if by_market.get("CRYPTO"):
             try:

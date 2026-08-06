@@ -94,6 +94,7 @@ from .services import (
     restore_backup,
     seed_defaults,
     seed_demo,
+    set_position_cost_status,
     sync_binance_account,
     transaction_fingerprint,
     OWNER_LABELS,
@@ -1115,6 +1116,7 @@ def create_investment_trade(payload: InvestmentTradeCreate, db: DB):
     )
 
     if side == "buy":
+        created_position = position is None
         if position:
             old_quantity = decimal_value(position.quantity)
             new_quantity = old_quantity + quantity
@@ -1186,6 +1188,8 @@ def create_investment_trade(payload: InvestmentTradeCreate, db: DB):
 
     try:
         db.flush()
+        if side == "buy" and created_position:
+            set_position_cost_status(db, position, "calculated")
         apply_investment_cash_change(
             db,
             cash_account,
@@ -1252,6 +1256,7 @@ def create_position(payload: PositionCreate, db: DB):
         if payload.manual_price is not None:
             existing.manual_price = payload.manual_price
         db.flush()
+        set_position_cost_status(db, existing, "confirmed")
         recalibrate_auto_base_if_needed(db, account)
         record_valuation(db)
         db.commit()
@@ -1269,6 +1274,7 @@ def create_position(payload: PositionCreate, db: DB):
     )
     db.add(row)
     db.flush()
+    set_position_cost_status(db, row, "confirmed")
     recalibrate_auto_base_if_needed(db, account)
     record_valuation(db)
     db.commit()
@@ -1280,9 +1286,12 @@ def update_position(position_id: int, payload: PositionUpdate, db: DB):
     row = db.get(Position, position_id)
     if not row:
         raise HTTPException(404, "找不到持倉")
-    for key, value in payload.model_dump(exclude_unset=True).items():
+    changes = payload.model_dump(exclude_unset=True)
+    for key, value in changes.items():
         setattr(row, key, value)
     db.flush()
+    if "average_cost" in changes:
+        set_position_cost_status(db, row, "confirmed")
     recalibrate_auto_base_if_needed(db, row.account)
     record_valuation(db)
     db.commit()

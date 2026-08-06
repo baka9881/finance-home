@@ -128,6 +128,9 @@ export default function InvestmentsPage() {
   const [tradeStep, setTradeStep] = useState(1);
   const [adjustingPosition, setAdjustingPosition] = useState<Position | null>(null);
   const [adjustQuantity, setAdjustQuantity] = useState("");
+  const [adjustAverageCost, setAdjustAverageCost] = useState("");
+  const [adjustTotalCost, setAdjustTotalCost] = useState("");
+  const [adjustCostInput, setAdjustCostInput] = useState<"unit" | "total">("total");
   const tradeFormRef = useRef<HTMLFormElement>(null);
 
   const positions = useQuery({
@@ -161,10 +164,10 @@ export default function InvestmentsPage() {
   });
 
   const updatePosition = useMutation({
-    mutationFn: ({ id, quantity }: { id: number; quantity: number }) =>
+    mutationFn: ({ id, quantity, averageCost }: { id: number; quantity: number; averageCost: number }) =>
       api(`/positions/${id}`, {
         method: "PATCH",
-        body: JSON.stringify({ quantity }),
+        body: JSON.stringify({ quantity, average_cost: averageCost }),
       }),
     onSuccess: () => {
       client.invalidateQueries({ queryKey: ["positions"] });
@@ -172,19 +175,73 @@ export default function InvestmentsPage() {
       client.invalidateQueries({ queryKey: ["dashboard"] });
       setAdjustingPosition(null);
       setAdjustQuantity("");
+      setAdjustAverageCost("");
+      setAdjustTotalCost("");
     },
   });
+
+  function editableNumber(value: number) {
+    if (!Number.isFinite(value)) return "";
+    return String(Number(value.toFixed(8)));
+  }
 
   function openQuantityAdjustment(position: Position) {
     setAdjustingPosition(position);
     setAdjustQuantity(String(position.quantity));
+    setAdjustAverageCost(String(position.average_cost));
+    setAdjustTotalCost(editableNumber(position.quantity * position.average_cost));
+    setAdjustCostInput("total");
+  }
+
+  function changeAdjustQuantity(value: string) {
+    setAdjustQuantity(value);
+    const quantity = Number(value);
+    if (!Number.isFinite(quantity) || quantity < 0) return;
+    if (adjustCostInput === "total") {
+      const total = Number(adjustTotalCost);
+      setAdjustAverageCost(quantity > 0 && Number.isFinite(total) ? editableNumber(total / quantity) : "0");
+    } else {
+      const averageCost = Number(adjustAverageCost);
+      setAdjustTotalCost(Number.isFinite(averageCost) ? editableNumber(quantity * averageCost) : "");
+    }
+  }
+
+  function changeAdjustAverageCost(value: string) {
+    setAdjustAverageCost(value);
+    setAdjustCostInput("unit");
+    const quantity = Number(adjustQuantity);
+    const averageCost = Number(value);
+    setAdjustTotalCost(
+      Number.isFinite(quantity) && Number.isFinite(averageCost)
+        ? editableNumber(quantity * averageCost)
+        : "",
+    );
+  }
+
+  function changeAdjustTotalCost(value: string) {
+    setAdjustTotalCost(value);
+    setAdjustCostInput("total");
+    const quantity = Number(adjustQuantity);
+    const totalCost = Number(value);
+    setAdjustAverageCost(
+      quantity > 0 && Number.isFinite(totalCost)
+        ? editableNumber(totalCost / quantity)
+        : "0",
+    );
   }
 
   function submitQuantityAdjustment(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const quantity = Number(adjustQuantity);
-    if (!adjustingPosition || !Number.isFinite(quantity) || quantity < 0) return;
-    updatePosition.mutate({ id: adjustingPosition.id, quantity });
+    const averageCost = Number(adjustAverageCost);
+    if (
+      !adjustingPosition ||
+      !Number.isFinite(quantity) ||
+      !Number.isFinite(averageCost) ||
+      quantity < 0 ||
+      averageCost < 0
+    ) return;
+    updatePosition.mutate({ id: adjustingPosition.id, quantity, averageCost });
   }
 
   const refresh = useMutation({
@@ -492,6 +549,17 @@ export default function InvestmentsPage() {
                   <div className="rounded-xl bg-slate-50 p-3">
                     <p className="text-xs text-slate-400">平均成本</p>
                     <p className="mt-1 font-semibold text-slate-800">{money(position.average_cost, position.currency)}</p>
+                    <div className="mt-2">
+                      <Badge tone={position.cost_status === "estimated" ? "amber" : position.cost_status === "missing" ? "red" : "green"}>
+                        {position.cost_status === "estimated"
+                          ? "成本待確認"
+                          : position.cost_status === "missing"
+                            ? "尚未填成本"
+                            : position.cost_status === "confirmed"
+                              ? "成本已確認"
+                              : "自動計算"}
+                      </Badge>
+                    </div>
                   </div>
                   <div className="rounded-xl bg-slate-50 p-3">
                     <p className="text-xs text-slate-400">持倉帳戶</p>
@@ -508,7 +576,7 @@ export default function InvestmentsPage() {
                       className="h-11"
                       onClick={() => openQuantityAdjustment(position)}
                     >
-                      <Pencil size={15} /> 調整數量
+                      <Pencil size={15} /> 調整持倉與成本
                     </Button>
                     <Button
                       variant="danger"
@@ -558,6 +626,9 @@ export default function InvestmentsPage() {
                     <td className="px-4 py-4 text-right">
                       <p className="text-sm font-semibold text-slate-800">{money(position.price, position.currency)}</p>
                       <p className="mt-1 text-xs text-slate-400">每單位成本 {money(position.average_cost, position.currency)}</p>
+                      {(position.cost_status === "estimated" || position.cost_status === "missing") && (
+                        <p className="mt-1 text-xs font-medium text-amber-600">成本待確認</p>
+                      )}
                     </td>
                     <td className="px-4 py-4 text-right">
                       <p className="text-sm font-bold text-slate-800">{money(position.market_value_twd)}</p>
@@ -587,8 +658,8 @@ export default function InvestmentsPage() {
                       <Button
                         variant="ghost"
                         className="size-9 px-0 text-slate-500 hover:text-forest"
-                        title="調整持倉數量"
-                        aria-label={`調整 ${position.symbol} 數量`}
+                        title="調整持倉與成本"
+                        aria-label={`調整 ${position.symbol} 持倉與成本`}
                         onClick={() => openQuantityAdjustment(position)}
                       >
                         <Pencil size={15} />
@@ -622,9 +693,11 @@ export default function InvestmentsPage() {
         onClose={() => {
           setAdjustingPosition(null);
           setAdjustQuantity("");
+          setAdjustAverageCost("");
+          setAdjustTotalCost("");
         }}
-        title="調整持倉數量"
-        description="用來校正交易所實際持有數量，不會新增收支，也不會改動帳戶總額。"
+        title="調整持倉與成本"
+        description="可用每單位成本或總投入金額校正；兩者會自動換算，不會新增收支或改動帳戶總額。"
       >
         <form className="space-y-5" onSubmit={submitQuantityAdjustment}>
           <div className="rounded-2xl bg-slate-50 p-4">
@@ -640,11 +713,60 @@ export default function InvestmentsPage() {
               step="any"
               inputMode="decimal"
               value={adjustQuantity}
-              onChange={(event) => setAdjustQuantity(event.target.value)}
+              onChange={(event) => changeAdjustQuantity(event.target.value)}
               autoFocus
               required
             />
           </Field>
+          {adjustingPosition && (
+            <div className={`rounded-2xl px-4 py-3 text-sm ${
+              adjustingPosition.cost_status === "estimated" || adjustingPosition.cost_status === "missing"
+                ? "bg-amber-50 text-amber-800"
+                : "bg-emerald-50 text-emerald-800"
+            }`}>
+              <p className="font-semibold">
+                {adjustingPosition.cost_status === "estimated"
+                  ? "這筆成本需要你確認一次"
+                  : adjustingPosition.cost_status === "missing"
+                    ? "這筆持倉還沒有成本"
+                    : "目前成本已有資料"}
+              </p>
+              <p className="mt-1 text-xs leading-5 opacity-80">{adjustingPosition.cost_note}</p>
+            </div>
+          )}
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field
+              label={`每單位平均成本（${adjustingPosition?.currency || "TWD"}）`}
+              hint="知道買入均價時填這裡"
+            >
+              <Input
+                type="number"
+                min="0"
+                step="any"
+                inputMode="decimal"
+                value={adjustAverageCost}
+                onChange={(event) => changeAdjustAverageCost(event.target.value)}
+                required
+              />
+            </Field>
+            <Field
+              label={`總投入金額（${adjustingPosition?.currency || "TWD"}）`}
+              hint="只知道總共投入多少時填這裡"
+            >
+              <Input
+                type="number"
+                min="0"
+                step="any"
+                inputMode="decimal"
+                value={adjustTotalCost}
+                onChange={(event) => changeAdjustTotalCost(event.target.value)}
+                required
+              />
+            </Field>
+          </div>
+          <p className="rounded-xl bg-blue-50 px-3 py-2 text-xs leading-5 text-blue-700">
+            修改其中一個成本欄位，另一個會依持有數量自動換算。儲存後會立即重新計算損益。
+          </p>
           {updatePosition.isError && (
             <p className="text-sm text-red-600">{(updatePosition.error as Error).message}</p>
           )}
@@ -655,6 +777,8 @@ export default function InvestmentsPage() {
               onClick={() => {
                 setAdjustingPosition(null);
                 setAdjustQuantity("");
+                setAdjustAverageCost("");
+                setAdjustTotalCost("");
               }}
             >
               取消
@@ -664,10 +788,12 @@ export default function InvestmentsPage() {
               disabled={
                 updatePosition.isPending ||
                 !adjustQuantity ||
-                Number(adjustQuantity) < 0
+                !adjustAverageCost ||
+                Number(adjustQuantity) < 0 ||
+                Number(adjustAverageCost) < 0
               }
             >
-              儲存數量
+              儲存持倉與成本
             </Button>
           </div>
         </form>
