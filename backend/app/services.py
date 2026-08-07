@@ -2207,6 +2207,56 @@ def _alpha_vantage_failure_reason(payload: Any) -> str:
     return "Alpha Vantage 找不到這個美股代號"
 
 
+def _fetch_nasdaq_quote(
+    client: httpx.Client,
+    symbol: str,
+) -> tuple[date, Decimal, str]:
+    nasdaq_symbol = symbol.strip().upper()
+    if not nasdaq_symbol:
+        raise ValueError("缺少美股代號")
+    response = client.get(
+        f"https://api.nasdaq.com/api/quote/{nasdaq_symbol}/info",
+        params={"assetclass": "stocks"},
+        headers={
+            "Accept": "application/json, text/plain, */*",
+            "Origin": "https://www.nasdaq.com",
+            "Referer": f"https://www.nasdaq.com/market-activity/stocks/{nasdaq_symbol.lower()}",
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/127.0 Safari/537.36"
+            ),
+        },
+    )
+    response.raise_for_status()
+    payload = response.json()
+    data = payload.get("data") if isinstance(payload, dict) else None
+    primary = data.get("primaryData") if isinstance(data, dict) else None
+    price_text = str(primary.get("lastSalePrice") or "") if isinstance(primary, dict) else ""
+    price = decimal_value(re.sub(r"[^0-9.\-]", "", price_text))
+    if price <= 0:
+        raise ValueError("Nasdaq 找不到這個美股代號")
+
+    timestamp_text = str(primary.get("lastTradeTimestamp") or "").strip()
+    quote_date = date.today()
+    if timestamp_text:
+        normalized_timestamp = re.sub(r"\s+[A-Z]{2,5}$", "", timestamp_text).strip()
+        for timestamp_format in (
+            "%b %d, %Y %I:%M %p",
+            "%B %d, %Y %I:%M %p",
+            "%m/%d/%Y %I:%M %p",
+        ):
+            try:
+                quote_date = datetime.strptime(
+                    normalized_timestamp, timestamp_format
+                ).date()
+                break
+            except ValueError:
+                continue
+    currency = str(primary.get("currency") or data.get("currency") or "USD").upper()
+    return quote_date, price, currency
+
+
 def _fetch_yahoo_daily_quote(
     client: httpx.Client,
     symbol: str,
@@ -2214,29 +2264,45 @@ def _fetch_yahoo_daily_quote(
     yahoo_symbol = symbol.strip().upper().replace(".", "-")
     if not yahoo_symbol:
         raise ValueError("缺少美股代號")
-    response = client.get(
-        f"https://query1.finance.yahoo.com/v8/finance/chart/{yahoo_symbol}",
-        params={"interval": "1d", "range": "5d", "events": "history"},
-    )
-    response.raise_for_status()
-    payload = response.json()
-    chart = payload.get("chart", {}) if isinstance(payload, dict) else {}
-    if chart.get("error"):
-        raise ValueError("Yahoo Finance 回傳行情錯誤")
-    results = chart.get("result") or []
-    if not results:
-        raise ValueError("Yahoo Finance 找不到這個美股代號")
-    result = results[0]
-    timestamps = result.get("timestamp") or []
-    indicators = result.get("indicators") or {}
-    quotes = indicators.get("quote") or []
-    closes = quotes[0].get("close", []) if quotes else []
-    for timestamp, close in reversed(list(zip(timestamps, closes))):
-        price = decimal_value(close)
-        if price > 0:
-            price_date = datetime.fromtimestamp(int(timestamp), timezone.utc).date()
-            currency = str(result.get("meta", {}).get("currency") or "USD").upper()
-            return price_date, price, currency
+    for host in ("query1.finance.yahoo.com", "query2.finance.yahoo.com"):
+        try:
+            response = client.get(
+                f"https://{host}/v8/finance/chart/{yahoo_symbol}",
+                params={"interval": "1d", "range": "5d", "events": "history"},
+                headers={
+                    "Accept": "application/json, text/plain, */*",
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/127.0 Safari/537.36"
+                    ),
+                },
+            )
+            response.raise_for_status()
+            payload = response.json()
+            chart = payload.get("chart", {}) if isinstance(payload, dict) else {}
+            if chart.get("error"):
+                continue
+            results = chart.get("result") or []
+            if not results:
+                continue
+            result = results[0]
+            timestamps = result.get("timestamp") or []
+            indicators = result.get("indicators") or {}
+            quotes = indicators.get("quote") or []
+            closes = quotes[0].get("close", []) if quotes else []
+            for timestamp, close in reversed(list(zip(timestamps, closes))):
+                price = decimal_value(close)
+                if price > 0:
+                    price_date = datetime.fromtimestamp(
+                        int(timestamp), timezone.utc
+                    ).date()
+                    currency = str(
+                        result.get("meta", {}).get("currency") or "USD"
+                    ).upper()
+                    return price_date, price, currency
+        except (ValueError, TypeError, httpx.HTTPError):
+            continue
     raise ValueError("Yahoo Finance 沒有可用的每日收盤價")
 
 
@@ -2318,6 +2384,30 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
             setting = db.get(AppSetting, "alpha_vantage_api_key")
             api_key = os.getenv("ALPHA_VANTAGE_API_KEY") or (setting.value if setting else "")
             for position in by_market["US"]:
+                try:
+                    price_date, price, currency = _fetch_nasdaq_quote(
+                        client, position.symbol
+                    )
+                    _upsert_price(
+                        db,
+                        "US",
+                        position.symbol,
+                        price_date,
+                        price,
+                        currency,
+                        "Nasdaq",
+                    )
+                    result["updated"] += 1
+                    continue
+                except httpx.HTTPStatusError as exc:
+                    nasdaq_failure = (
+                        f"Nasdaq 連線失敗（HTTP {exc.response.status_code}）"
+                    )
+                except (ValueError, TypeError):
+                    nasdaq_failure = "Nasdaq 回傳的行情格式無法辨識"
+                except httpx.HTTPError:
+                    nasdaq_failure = "Nasdaq 連線失敗"
+
                 alpha_failure = "尚未設定 Alpha Vantage API 金鑰"
                 if api_key:
                     try:
@@ -2349,6 +2439,10 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                                 "Alpha Vantage",
                             )
                             result["updated"] += 1
+                            result["warnings"].append(
+                                f"美股 {position.symbol}：{nasdaq_failure}，"
+                                f"已改用 Alpha Vantage {price_date.isoformat()} 的價格"
+                            )
                             continue
                         alpha_failure = _alpha_vantage_failure_reason(payload)
                     except httpx.HTTPStatusError as exc:
@@ -2375,8 +2469,8 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                     )
                     result["updated"] += 1
                     result["warnings"].append(
-                        f"美股 {position.symbol}：{alpha_failure}，已改用 Yahoo Finance "
-                        f"{price_date.isoformat()} 的每日收盤價"
+                        f"美股 {position.symbol}：{nasdaq_failure}；{alpha_failure}，"
+                        f"已改用 Yahoo Finance {price_date.isoformat()} 的每日收盤價"
                     )
                 except (ValueError, TypeError, httpx.HTTPError):
                     _reuse_cached_market_price(
@@ -2384,7 +2478,7 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                         result,
                         position,
                         f"美股 {position.symbol}",
-                        f"{alpha_failure}；Yahoo Finance 備援也暫時無法使用",
+                        f"{nasdaq_failure}；{alpha_failure}；Yahoo Finance 備援也暫時無法使用",
                     )
 
         if by_market.get("CRYPTO"):

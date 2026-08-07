@@ -590,7 +590,7 @@ def test_binance_signature_error_has_actionable_message():
         services_module._binance_response_payload(response)
 
 
-def test_us_market_falls_back_to_yahoo_and_uses_daily_cache(
+def test_us_market_uses_nasdaq_first_and_daily_cache(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
@@ -642,6 +642,19 @@ def test_us_market_falls_back_to_yahoo_and_uses_daily_cache(
                         )
                     }
                 )
+            if "api.nasdaq.com" in url:
+                return FakeResponse(
+                    {
+                        "data": {
+                            "currency": "USD",
+                            "primaryData": {
+                                "lastSalePrice": "$97.74",
+                                "lastTradeTimestamp": "Aug 7, 2026 1:28 PM ET",
+                            },
+                        },
+                        "status": {"rCode": 200},
+                    }
+                )
             return FakeResponse(
                 {
                     "chart": {
@@ -671,18 +684,18 @@ def test_us_market_falls_back_to_yahoo_and_uses_daily_cache(
     assert refreshed.status_code == 200, refreshed.text
     payload = refreshed.json()
     assert payload["updated"] == 1
-    assert any("Yahoo Finance" in warning for warning in payload["warnings"])
-    assert len(calls) == 2
+    assert payload["warnings"] == []
+    assert len(calls) == 1
 
     positions = client.get("/api/positions").json()
-    assert positions[0]["price"] == 97.15
-    assert positions[0]["price_source"] == "Yahoo Finance"
-    assert positions[0]["price_date"] == "2026-08-06"
+    assert positions[0]["price"] == 97.74
+    assert positions[0]["price_source"] == "Nasdaq"
+    assert positions[0]["price_date"] == "2026-08-07"
 
     cached = client.post("/api/market/refresh")
     assert cached.status_code == 200, cached.text
     assert cached.json()["skipped"] == 1
-    assert len(calls) == 2
+    assert len(calls) == 1
 
 
 def test_alpha_vantage_failure_reason_is_not_always_reported_as_quota():
