@@ -1,5 +1,6 @@
-import { FormEvent, useRef, useState } from "react";
+import { FormEvent, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import {
   Banknote,
   Bitcoin,
@@ -149,7 +150,9 @@ const labelFor = (type: string) =>
 
 export default function AccountsPage() {
   const client = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [createOpen, setCreateOpen] = useState(false);
+  const [balancePickerOpen, setBalancePickerOpen] = useState(false);
   const [balanceAccount, setBalanceAccount] = useState<Account | null>(null);
   const [detailAccount, setDetailAccount] = useState<Account | null>(null);
   const [message, setMessage] = useState("");
@@ -162,6 +165,14 @@ export default function AccountsPage() {
   const [useCustomAccountName, setUseCustomAccountName] = useState(false);
   const [accountStep, setAccountStep] = useState(1);
   const accountFormRef = useRef<HTMLFormElement>(null);
+
+  useEffect(() => {
+    if (searchParams.get("quick") !== "balance") return;
+    setBalancePickerOpen(true);
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete("quick");
+    setSearchParams(nextParams, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   const selectedInstitution =
     institutionChoice === customInstitutionValue ? customInstitution.trim() : institutionChoice;
@@ -549,6 +560,52 @@ export default function AccountsPage() {
             pending={createAccount.isPending}
           />
         </form>
+      </Dialog>
+
+      <Dialog
+        open={balancePickerOpen}
+        onClose={() => setBalancePickerOpen(false)}
+        title="更新帳戶餘額"
+        description="先選擇要更新的帳戶，再輸入現在看到的實際餘額。"
+      >
+        <div className="space-y-2">
+          {visibleAccounts.length ? (
+            visibleAccounts.map((account) => {
+              const Icon = iconFor(account.account_type);
+              return (
+                <button
+                  key={account.id}
+                  type="button"
+                  className="flex w-full items-center gap-3 rounded-2xl border border-slate-200 p-3 text-left transition hover:border-emerald-300 hover:bg-emerald-50/40"
+                  onClick={() => {
+                    setBalancePickerOpen(false);
+                    setBalanceAccount(account);
+                  }}
+                >
+                  <span className="grid size-11 shrink-0 place-items-center rounded-xl bg-emerald-50 text-emerald-700">
+                    <Icon size={19} />
+                  </span>
+                  <span className="min-w-0 flex-1">
+                    <span className="block truncate text-sm font-semibold text-slate-800">{account.name}</span>
+                    <span className="mt-0.5 block truncate text-xs text-slate-400">
+                      {account.institution || labelFor(account.account_type)} · {account.owner_label}
+                    </span>
+                  </span>
+                  <span className="shrink-0 text-sm font-semibold text-slate-700">
+                    {account.currency} {Number(account.balance || 0).toLocaleString()}
+                  </span>
+                </button>
+              );
+            })
+          ) : (
+            <EmptyState
+              icon={<Wallet size={22} />}
+              title="目前沒有可更新的帳戶"
+              description="請先建立帳戶，再新增餘額快照。"
+              action={<Button onClick={() => { setBalancePickerOpen(false); openCreateDialog(); }}>新增帳戶</Button>}
+            />
+          )}
+        </div>
       </Dialog>
 
       <Dialog

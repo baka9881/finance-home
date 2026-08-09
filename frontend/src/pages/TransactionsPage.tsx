@@ -1,5 +1,6 @@
 import { FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useSearchParams } from "react-router-dom";
 import {
   ArrowDownLeft,
   ArrowRightLeft,
@@ -111,6 +112,7 @@ function guessImportAccountId(fileName: string, accounts: Account[], selectedAcc
 
 export default function TransactionsPage() {
   const client = useQueryClient();
+  const [searchParams, setSearchParams] = useSearchParams();
   const [month, setMonth] = useState(currentMonth);
   const [ownerFilter] = useOwnerFilter();
   const [accountFilter, setAccountFilter] = useState("");
@@ -135,6 +137,28 @@ export default function TransactionsPage() {
   const [accountTransferStep, setAccountTransferStep] = useState(1);
   const manualFormRef = useRef<HTMLFormElement>(null);
   const accountTransferFormRef = useRef<HTMLFormElement>(null);
+
+  useEffect(() => {
+    const quickAction = searchParams.get("quick");
+    if (!quickAction) return;
+
+    if (quickAction === "expense" || quickAction === "income") {
+      setManualScenario(quickAction);
+      setManualKind(quickAction);
+      setLoanAccountId("");
+      setManualStep(1);
+      setManualOpen(true);
+    } else if (quickAction === "transfer") {
+      setAccountTransferStep(1);
+      setAccountTransferOpen(true);
+    } else if (quickAction === "import") {
+      setImportOpen(true);
+    }
+
+    const nextParams = new URLSearchParams(searchParams);
+    nextParams.delete("quick");
+    setSearchParams(nextParams, { replace: true });
+  }, [searchParams, setSearchParams]);
 
   const accounts = useQuery({
     queryKey: ["accounts", ownerFilter],

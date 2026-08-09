@@ -38,6 +38,10 @@ input[type="month"] {
   padding-bottom: calc(.75rem + env(safe-area-inset-bottom, 0px));
 }
 
+.mobile-quick-actions {
+  bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+}
+
 button,
 input,
 select,

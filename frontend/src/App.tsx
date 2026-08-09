@@ -1,20 +1,25 @@
 import { type FormEvent, lazy, Suspense, useEffect, useState } from "react";
 import {
+  ArrowDownLeft,
   ArrowLeftRight,
+  ArrowUpRight,
   BarChart3,
   ChevronLeft,
   Cloud,
+  FileUp,
   Goal,
   LayoutDashboard,
   LockKeyhole,
   LogOut,
   Menu,
   PieChart,
+  Plus,
+  RefreshCw,
   Settings,
   WalletCards,
   X,
 } from "lucide-react";
-import { NavLink, Navigate, Route, Routes, useLocation } from "react-router-dom";
+import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
 import { api, AUTH_REQUIRED, clearAuthToken, getAuthToken, setAuthToken } from "./api";
 import { prefetchPrimaryData, prefetchSecondaryData, preloadPageModules } from "./appQueries";
@@ -75,6 +80,112 @@ function GlobalOwnerBar() {
       <GlobalOwnerSelect />
       <p className="text-xs text-slate-400">會套用到總覽、帳戶、交易、投資持倉、財務目標與財務分析。</p>
     </div>
+  );
+}
+
+function MobileQuickActions() {
+  const [open, setOpen] = useState(false);
+  const location = useLocation();
+  const navigate = useNavigate();
+
+  useEffect(() => {
+    setOpen(false);
+  }, [location.pathname]);
+
+  const actions = [
+    {
+      label: "花錢",
+      description: "記錄日常支出",
+      icon: ArrowUpRight,
+      tone: "bg-orange-50 text-orange-700",
+      target: "/transactions?quick=expense",
+    },
+    {
+      label: "收錢",
+      description: "記錄薪水或退款",
+      icon: ArrowDownLeft,
+      tone: "bg-emerald-50 text-emerald-700",
+      target: "/transactions?quick=income",
+    },
+    {
+      label: "帳戶互轉",
+      description: "在自己的帳戶間移動",
+      icon: ArrowLeftRight,
+      tone: "bg-blue-50 text-blue-700",
+      target: "/transactions?quick=transfer",
+    },
+    {
+      label: "更新餘額",
+      description: "建立最新帳戶快照",
+      icon: RefreshCw,
+      tone: "bg-violet-50 text-violet-700",
+      target: "/accounts?quick=balance",
+    },
+    {
+      label: "匯入信用卡帳單",
+      description: "上傳銀行提供的 CSV",
+      icon: FileUp,
+      tone: "bg-slate-100 text-slate-700",
+      target: "/transactions?quick=import",
+    },
+  ];
+
+  return (
+    <>
+      {open && (
+        <button
+          type="button"
+          aria-label="關閉快速操作"
+          className="fixed inset-0 z-30 bg-slate-950/30 backdrop-blur-[2px] lg:hidden"
+          onClick={() => setOpen(false)}
+        />
+      )}
+      <div className="mobile-quick-actions fixed right-4 z-40 flex flex-col items-end gap-3 lg:hidden">
+        {open && (
+          <div
+            role="menu"
+            aria-label="快速操作"
+            className="w-[min(21rem,calc(100vw-2rem))] overflow-hidden rounded-3xl border border-slate-200 bg-white p-2 shadow-2xl"
+          >
+            <div className="px-3 pb-2 pt-2">
+              <p className="font-bold text-ink">快速新增</p>
+              <p className="mt-0.5 text-xs text-slate-400">選一件現在要做的事</p>
+            </div>
+            <div className="space-y-1">
+              {actions.map(({ label, description, icon: Icon, tone, target }) => (
+                <button
+                  key={label}
+                  type="button"
+                  role="menuitem"
+                  className="flex w-full items-center gap-3 rounded-2xl px-3 py-2.5 text-left transition hover:bg-slate-50 active:scale-[.99]"
+                  onClick={() => {
+                    setOpen(false);
+                    navigate(target);
+                  }}
+                >
+                  <span className={cn("grid size-10 shrink-0 place-items-center rounded-xl", tone)}>
+                    <Icon size={18} />
+                  </span>
+                  <span className="min-w-0">
+                    <span className="block text-sm font-semibold text-slate-800">{label}</span>
+                    <span className="block truncate text-xs text-slate-400">{description}</span>
+                  </span>
+                </button>
+              ))}
+            </div>
+          </div>
+        )}
+        <button
+          type="button"
+          aria-label={open ? "關閉快速操作" : "開啟快速操作"}
+          aria-expanded={open}
+          className="grid size-14 place-items-center rounded-2xl bg-forest text-white shadow-xl shadow-emerald-950/25 transition active:scale-95"
+          onClick={() => setOpen((value) => !value)}
+        >
+          {open ? <X size={24} /> : <Plus size={25} />}
+        </button>
+      </div>
+    </>
   );
 }
 
@@ -353,7 +464,7 @@ function FinanceApp() {
           {showGlobalOwnerFilter ? <GlobalOwnerSelect compact /> : <div className="size-10" />}
         </div>
         <GlobalOwnerBar />
-        <main className="mx-auto min-h-screen max-w-[1600px] px-4 py-7 sm:px-7 lg:px-10 lg:py-9">
+        <main className="mx-auto min-h-screen max-w-[1600px] px-4 pb-28 pt-7 sm:px-7 lg:px-10 lg:py-9">
           <Suspense
             fallback={
               <div className="space-y-5">
@@ -375,6 +486,7 @@ function FinanceApp() {
           </Suspense>
         </main>
       </div>
+      <MobileQuickActions />
     </div>
   );
 }

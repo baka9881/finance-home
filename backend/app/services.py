@@ -38,6 +38,7 @@ from .database import (
     Goal,
     Position,
     PriceSnapshot,
+    RecurringExpense,
     Transaction,
     TransferLink,
     ValuationSnapshot,
@@ -702,6 +703,7 @@ def calculate_spending_analysis(
             key,
             {
                 "name": display_name,
+                "account_id": row.account_id,
                 "account_name": row.account.name,
                 "months": defaultdict(lambda: {"amount": ZERO, "count": 0}),
                 "categories": defaultdict(int),
@@ -739,6 +741,7 @@ def calculate_spending_analysis(
         recurring_expenses.append(
             {
                 "name": group["name"],
+                "account_id": group["account_id"],
                 "account_name": group["account_name"],
                 "category_name": category_name,
                 "average_amount": float(average),
@@ -748,6 +751,69 @@ def calculate_spending_analysis(
                 "status": "recorded" if current_amount > 0 else "expected",
             }
         )
+
+    custom_query = select(RecurringExpense).where(RecurringExpense.active.is_(True))
+    if owner != "all":
+        custom_query = custom_query.where(RecurringExpense.owner == owner)
+    custom_rows = db.scalars(custom_query.order_by(RecurringExpense.id)).all()
+
+    custom_keys = {
+        (row.account_id, _recurring_display_name(row.name).casefold())
+        for row in custom_rows
+    }
+    recurring_expenses = [
+        item
+        for item in recurring_expenses
+        if (item.get("account_id"), _recurring_display_name(item["name"]).casefold())
+        not in custom_keys
+        and (None, _recurring_display_name(item["name"]).casefold())
+        not in custom_keys
+    ]
+
+    for row in custom_rows:
+        normalized_name = _recurring_display_name(row.name).casefold()
+        matching_rows = [
+            transaction
+            for transaction in month_rows
+            if (row.account_id is None or transaction.account_id == row.account_id)
+            and _recurring_display_name(transaction.description).casefold()
+            == normalized_name
+        ]
+        current_amount = sum(
+            (abs(decimal_value(transaction.base_amount)) for transaction in matching_rows),
+            ZERO,
+        )
+        recurring_expenses.append(
+            {
+                "id": row.id,
+                "name": row.name,
+                "account_id": row.account_id,
+                "account_name": row.account.name if row.account else "未指定帳戶",
+                "category_id": row.category_id,
+                "category_name": row.category.name if row.category else "自訂",
+                "owner": row.owner,
+                "average_amount": float(row.amount),
+                "current_month_amount": float(current_amount),
+                "months_detected": 0,
+                "latest_date": max(
+                    (transaction.transaction_date for transaction in matching_rows),
+                    default=None,
+                ),
+                "status": "recorded" if current_amount > 0 else "expected",
+                "source": "custom",
+                "due_day": row.due_day,
+                "note": row.note,
+            }
+        )
+
+    for item in recurring_expenses:
+        item.setdefault("id", None)
+        item.setdefault("account_id", None)
+        item.setdefault("category_id", None)
+        item.setdefault("owner", None)
+        item.setdefault("source", "detected")
+        item.setdefault("due_day", None)
+        item.setdefault("note", None)
 
     recurring_expenses.sort(key=lambda item: item["average_amount"], reverse=True)
     return {
@@ -2736,6 +2802,7 @@ BACKUP_MODELS = [
     FxRate,
     Budget,
     Goal,
+    RecurringExpense,
     ValuationSnapshot,
 ]
 

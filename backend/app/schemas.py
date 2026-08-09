@@ -128,6 +128,28 @@ class GoalUpdate(BaseModel):
     note: str | None = None
 
 
+class RecurringExpenseCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    owner: str = "me"
+    amount: Decimal = Field(gt=0)
+    due_day: int | None = Field(default=None, ge=1, le=31)
+    account_id: int | None = None
+    category_id: int | None = None
+    active: bool = True
+    note: str | None = None
+
+
+class RecurringExpenseUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    owner: str | None = None
+    amount: Decimal | None = Field(default=None, gt=0)
+    due_day: int | None = Field(default=None, ge=1, le=31)
+    account_id: int | None = None
+    category_id: int | None = None
+    active: bool | None = None
+    note: str | None = None
+
+
 class RuleCreate(BaseModel):
     keyword: str
     category_id: int

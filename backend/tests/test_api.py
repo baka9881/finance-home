@@ -1006,4 +1006,75 @@ def test_spending_analysis_supports_months_and_recurring_expenses(client: TestCl
     assert recurring["貸款還款"]["category_name"] == "貸款"
     assert "家樂福" not in recurring
 
+    custom = client.post(
+        "/api/recurring-expenses",
+        json={
+            "name": "健身房月費",
+            "owner": "me",
+            "amount": 1099,
+            "account_id": account,
+            "category_id": subscription["id"],
+        },
+    )
+    assert custom.status_code == 201
+    updated_payload = client.get(
+        f"/api/analysis/spending?month={month}&owner=me"
+    ).json()
+    matching = [
+        item
+        for item in updated_payload["recurring_expenses"]
+        if item["name"] == "健身房月費"
+    ]
+    assert len(matching) == 1
+    assert matching[0]["source"] == "custom"
+    assert matching[0]["average_amount"] == 1099
+    assert updated_payload["estimated_recurring_total"] == 6599
+
     assert client.get("/api/analysis/spending?month=not-a-month").status_code == 422
+
+
+def test_custom_recurring_expense_crud_and_analysis_override(client: TestClient):
+    account = create_account(client, "房貸扣款帳戶")
+    categories = client.get("/api/categories").json()
+    housing = next(item for item in categories if item["name"] == "居住")
+
+    created = client.post(
+        "/api/recurring-expenses",
+        json={
+            "name": "房貸",
+            "owner": "me",
+            "amount": 18000,
+            "due_day": 5,
+            "account_id": account,
+            "category_id": housing["id"],
+            "note": "每月自動扣款",
+        },
+    )
+    assert created.status_code == 201, created.text
+    expense_id = created.json()["id"]
+
+    listed = client.get("/api/recurring-expenses?owner=me")
+    assert listed.status_code == 200
+    assert listed.json()[0]["name"] == "房貸"
+    assert listed.json()[0]["due_day"] == 5
+
+    month = date.today().strftime("%Y-%m")
+    analysis = client.get(f"/api/analysis/spending?month={month}&owner=me")
+    assert analysis.status_code == 200
+    recurring = analysis.json()["recurring_expenses"]
+    assert len(recurring) == 1
+    assert recurring[0]["source"] == "custom"
+    assert recurring[0]["average_amount"] == 18000
+    assert analysis.json()["estimated_recurring_total"] == 18000
+
+    updated = client.patch(
+        f"/api/recurring-expenses/{expense_id}",
+        json={"amount": 17500, "due_day": 8},
+    )
+    assert updated.status_code == 200
+    assert updated.json()["amount"] == 17500
+    assert updated.json()["due_day"] == 8
+
+    deleted = client.delete(f"/api/recurring-expenses/{expense_id}")
+    assert deleted.status_code == 200
+    assert client.get("/api/recurring-expenses?owner=me").json() == []

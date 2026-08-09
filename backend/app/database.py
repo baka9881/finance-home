@@ -223,6 +223,23 @@ class Goal(Base, TimestampMixin):
     account: Mapped["Account | None"] = relationship()
 
 
+class RecurringExpense(Base, TimestampMixin):
+    __tablename__ = "recurring_expenses"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    owner: Mapped[str] = mapped_column(String(20), default="me", index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    due_day: Mapped[int | None] = mapped_column(Integer)
+    account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id"))
+    category_id: Mapped[int | None] = mapped_column(ForeignKey("categories.id"))
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    note: Mapped[str | None] = mapped_column(Text)
+
+    account: Mapped["Account | None"] = relationship()
+    category: Mapped["Category | None"] = relationship()
+
+
 class ValuationSnapshot(Base, TimestampMixin):
     __tablename__ = "valuation_snapshots"
 

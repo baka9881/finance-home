@@ -1,5 +1,5 @@
-import { useQuery } from "@tanstack/react-query";
-import { useState } from "react";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { type FormEvent, useState } from "react";
 import {
   AlertTriangle,
   CalendarDays,
@@ -7,10 +7,13 @@ import {
   CircleHelp,
   Gauge,
   Lightbulb,
+  Pencil,
   PieChart as PieChartIcon,
+  Plus,
   Repeat2,
   ShieldCheck,
   ShoppingBag,
+  Trash2,
   TrendingUp,
 } from "lucide-react";
 import {
@@ -27,8 +30,37 @@ import {
 } from "recharts";
 import { api } from "../api";
 import { ownerFilterLabels, useOwnerFilter } from "../ownerFilter";
-import type { Dashboard, HealthScore, SpendingAnalysis } from "../types";
-import { Badge, Card, EmptyState, MonthInput, PageHeader, money, number } from "../ui";
+import type { Account, Category, Dashboard, HealthScore, SpendingAnalysis } from "../types";
+import { Badge, Button, Card, Dialog, EmptyState, Field, FormStep, Input, MonthInput, PageHeader, Select, money, number } from "../ui";
+
+const recurringPresets = ["房貸", "車貸", "信貸", "學貸", "房租", "保險", "健身房月費", "手機費", "網路費", "訂閱服務"];
+const recurringOwnerOptions = [
+  { value: "me", label: "我" },
+  { value: "partner", label: "女友" },
+  { value: "shared", label: "共同" },
+];
+
+interface RecurringDraft {
+  name: string;
+  amount: string;
+  due_day: string;
+  account_id: string;
+  category_id: string;
+  owner: string;
+  note: string;
+}
+
+function emptyRecurringDraft(ownerFilter: string): RecurringDraft {
+  return {
+    name: "",
+    amount: "",
+    due_day: "",
+    account_id: "",
+    category_id: "",
+    owner: ownerFilter === "all" ? "me" : ownerFilter,
+    note: "",
+  };
+}
 
 function currentMonth() {
   const today = new Date();
@@ -71,8 +103,12 @@ function indicatorState(key: string, value: number | null) {
 }
 
 export default function AnalysisPage() {
+  const client = useQueryClient();
   const [ownerFilter] = useOwnerFilter();
   const [selectedMonth, setSelectedMonth] = useState(currentMonth);
+  const [recurringOpen, setRecurringOpen] = useState(false);
+  const [editingRecurringId, setEditingRecurringId] = useState<number | null>(null);
+  const [recurringDraft, setRecurringDraft] = useState<RecurringDraft>(() => emptyRecurringDraft("me"));
   const health = useQuery({
     queryKey: ["health", ownerFilter],
     queryFn: () => api<HealthScore>(`/analysis/health?owner=${ownerFilter}`),
@@ -85,6 +121,75 @@ export default function AnalysisPage() {
     queryKey: ["spending-analysis", selectedMonth, ownerFilter],
     queryFn: () => api<SpendingAnalysis>(`/analysis/spending?month=${selectedMonth}&owner=${ownerFilter}`),
   });
+  const accounts = useQuery({
+    queryKey: ["accounts", "all"],
+    queryFn: () => api<Account[]>("/accounts?owner=all"),
+  });
+  const categories = useQuery({
+    queryKey: ["categories"],
+    queryFn: () => api<Category[]>("/categories"),
+  });
+
+  const saveRecurring = useMutation({
+    mutationFn: (payload: Record<string, unknown>) =>
+      api(
+        editingRecurringId
+          ? `/recurring-expenses/${editingRecurringId}`
+          : "/recurring-expenses",
+        {
+          method: editingRecurringId ? "PATCH" : "POST",
+          body: JSON.stringify(payload),
+        },
+      ),
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ["spending-analysis"] });
+      setRecurringOpen(false);
+      setEditingRecurringId(null);
+      setRecurringDraft(emptyRecurringDraft(ownerFilter));
+    },
+  });
+
+  const deleteRecurring = useMutation({
+    mutationFn: (id: number) => api(`/recurring-expenses/${id}`, { method: "DELETE" }),
+    onSuccess: () => client.invalidateQueries({ queryKey: ["spending-analysis"] }),
+  });
+
+  function openNewRecurring() {
+    setEditingRecurringId(null);
+    setRecurringDraft(emptyRecurringDraft(ownerFilter));
+    saveRecurring.reset();
+    setRecurringOpen(true);
+  }
+
+  function openEditRecurring(item: SpendingAnalysis["recurring_expenses"][number]) {
+    if (!item.id || item.source !== "custom") return;
+    setEditingRecurringId(item.id);
+    setRecurringDraft({
+      name: item.name,
+      amount: String(item.average_amount),
+      due_day: item.due_day ? String(item.due_day) : "",
+      account_id: item.account_id ? String(item.account_id) : "",
+      category_id: item.category_id ? String(item.category_id) : "",
+      owner: item.owner || "me",
+      note: item.note || "",
+    });
+    saveRecurring.reset();
+    setRecurringOpen(true);
+  }
+
+  function submitRecurring(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    saveRecurring.mutate({
+      name: recurringDraft.name.trim(),
+      amount: Number(recurringDraft.amount),
+      due_day: recurringDraft.due_day ? Number(recurringDraft.due_day) : null,
+      account_id: recurringDraft.account_id ? Number(recurringDraft.account_id) : null,
+      category_id: recurringDraft.category_id ? Number(recurringDraft.category_id) : null,
+      owner: recurringDraft.owner,
+      note: recurringDraft.note.trim() || null,
+      active: true,
+    });
+  }
 
   const data = health.data;
   const recommendations = makeRecommendations(data, dashboard.data);
@@ -245,12 +350,17 @@ export default function AnalysisPage() {
                 <div className="rounded-xl bg-blue-50 p-2.5 text-blue-700"><Repeat2 size={18} /></div>
                 <div>
                   <h2 className="font-bold text-ink">每月固定花費</h2>
-                  <p className="mt-1 text-xs text-slate-400">根據最近六個月重複出現的交易自動辨識</p>
+                  <p className="mt-1 text-xs text-slate-400">自動辨識重複交易，也可以自行建立房貸、車貸、信貸與月費</p>
                 </div>
               </div>
-              <div className="rounded-xl bg-slate-50 px-4 py-3 sm:text-right">
-                <p className="text-xs text-slate-400">預估每月固定支出</p>
-                <p className="mt-0.5 text-xl font-bold text-slate-800">{money(spending.data?.estimated_recurring_total || 0)}</p>
+              <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <Button variant="secondary" onClick={openNewRecurring}>
+                  <Plus size={16} /> 自訂固定花費
+                </Button>
+                <div className="rounded-xl bg-slate-50 px-4 py-3 sm:text-right">
+                  <p className="text-xs text-slate-400">預估每月固定支出</p>
+                  <p className="mt-0.5 text-xl font-bold text-slate-800">{money(spending.data?.estimated_recurring_total || 0)}</p>
+                </div>
               </div>
             </div>
 
@@ -259,7 +369,7 @@ export default function AnalysisPage() {
             ) : recurringExpenses.length ? (
               <div className="mt-5 grid gap-3 lg:grid-cols-2">
                 {recurringExpenses.map((item) => (
-                  <div key={`${item.account_name}-${item.name}`} className="rounded-2xl border border-slate-200/80 p-4 sm:p-5">
+                  <div key={`${item.source}-${item.id || `${item.account_name}-${item.name}`}`} className="rounded-2xl border border-slate-200/80 p-4 sm:p-5">
                     <div className="flex items-start gap-3">
                       <div className="grid size-10 shrink-0 place-items-center rounded-xl bg-blue-50 text-blue-700">
                         <CalendarDays size={18} />
@@ -268,12 +378,20 @@ export default function AnalysisPage() {
                         <div className="flex flex-wrap items-center gap-2">
                           <p className="min-w-0 truncate font-semibold text-slate-800">{item.name}</p>
                           <Badge>{item.category_name}</Badge>
+                          <Badge tone={item.source === "custom" ? "blue" : "slate"}>
+                            {item.source === "custom" ? "自行設定" : "自動辨識"}
+                          </Badge>
                           <Badge tone={item.status === "recorded" ? "green" : "amber"}>
                             {item.status === "recorded" ? "當月已發生" : "當月尚未出現"}
                           </Badge>
                         </div>
                         <p className="mt-1 text-xs text-slate-400">
-                          {item.account_name} · 近六個月出現 {item.months_detected} 個月
+                          {item.account_name}
+                          {item.source === "custom"
+                            ? item.due_day
+                              ? ` · 每月 ${item.due_day} 日`
+                              : " · 未指定扣款日"
+                            : ` · 近六個月出現 ${item.months_detected} 個月`}
                         </p>
                       </div>
                       <div className="shrink-0 text-right">
@@ -283,6 +401,30 @@ export default function AnalysisPage() {
                         <p className="mt-1 text-xs text-slate-400">
                           {item.status === "recorded" ? "當月金額" : "過去平均"}
                         </p>
+                        {item.source === "custom" && item.id && (
+                          <div className="mt-2 flex justify-end gap-1">
+                            <button
+                              type="button"
+                              className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                              aria-label={`編輯${item.name}`}
+                              onClick={() => openEditRecurring(item)}
+                            >
+                              <Pencil size={14} />
+                            </button>
+                            <button
+                              type="button"
+                              className="rounded-lg p-2 text-slate-400 hover:bg-red-50 hover:text-red-600"
+                              aria-label={`刪除${item.name}`}
+                              onClick={() => {
+                                if (window.confirm(`確定刪除「${item.name}」固定花費？`)) {
+                                  deleteRecurring.mutate(item.id as number);
+                                }
+                              }}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        )}
                       </div>
                     </div>
                   </div>
@@ -292,13 +434,123 @@ export default function AnalysisPage() {
               <EmptyState
                 icon={<Repeat2 size={24} />}
                 title="還沒有辨識到固定花費"
-                description="同一項交易至少在兩個月重複出現、金額相近後，會自動列出貸款、月費與訂閱等項目。"
+                description="可以自行建立房貸、車貸、信貸、月費與訂閱；交易重複出現後也會自動辨識。"
+                action={<Button onClick={openNewRecurring}>建立第一筆固定花費</Button>}
               />
             )}
             <p className="mt-4 text-xs leading-5 text-slate-400">
-              辨識規則：最近六個月內至少出現兩個月，且每月金額差異不超過 20%。這是管理提示，不會自動新增未來交易。
+              自訂項目只用於每月預估與提醒，不會直接扣除帳戶餘額；實際交易匯入後會標記為「當月已發生」。自動辨識規則為最近六個月內至少出現兩個月，且每月金額差異不超過 20%。
             </p>
           </Card>
+
+          <Dialog
+            open={recurringOpen}
+            onClose={() => setRecurringOpen(false)}
+            title={editingRecurringId ? "編輯固定花費" : "新增固定花費"}
+            description="設定每月通常會發生的支出；這裡不會直接建立交易或扣款。"
+          >
+            <form className="space-y-5" onSubmit={submitRecurring}>
+              <FormStep number={1} title="這是什麼固定花費？" description="可選常見項目後再自行修改名稱。">
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="常見項目">
+                    <Select
+                      value={recurringPresets.includes(recurringDraft.name) ? recurringDraft.name : ""}
+                      onChange={(event) => setRecurringDraft((draft) => ({ ...draft, name: event.target.value }))}
+                    >
+                      <option value="">選擇或自行輸入</option>
+                      {recurringPresets.map((preset) => <option key={preset}>{preset}</option>)}
+                    </Select>
+                  </Field>
+                  <Field label="顯示名稱">
+                    <Input
+                      value={recurringDraft.name}
+                      onChange={(event) => setRecurringDraft((draft) => ({ ...draft, name: event.target.value }))}
+                      placeholder="例如：汽車貸款"
+                      required
+                    />
+                  </Field>
+                </div>
+              </FormStep>
+
+              <FormStep number={2} title="每月大約多少錢？" tone="blue">
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="每月金額（TWD）">
+                    <Input
+                      type="number"
+                      inputMode="decimal"
+                      min="1"
+                      step="any"
+                      value={recurringDraft.amount}
+                      onChange={(event) => setRecurringDraft((draft) => ({ ...draft, amount: event.target.value }))}
+                      placeholder="例如：12000"
+                      required
+                    />
+                  </Field>
+                  <Field label="每月扣款日" hint="日期不固定可以留空。">
+                    <Input
+                      type="number"
+                      inputMode="numeric"
+                      min="1"
+                      max="31"
+                      value={recurringDraft.due_day}
+                      onChange={(event) => setRecurringDraft((draft) => ({ ...draft, due_day: event.target.value }))}
+                      placeholder="例如：5"
+                    />
+                  </Field>
+                </div>
+              </FormStep>
+
+              <FormStep number={3} title="由誰支付、從哪裡扣？" tone="purple">
+                <div className="grid gap-4 sm:grid-cols-2">
+                  <Field label="所有人">
+                    <Select
+                      value={recurringDraft.owner}
+                      onChange={(event) => setRecurringDraft((draft) => ({ ...draft, owner: event.target.value }))}
+                    >
+                      {recurringOwnerOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}
+                    </Select>
+                  </Field>
+                  <Field label="付款或貸款帳戶" hint="還沒建立帳戶也可以留空。">
+                    <Select
+                      value={recurringDraft.account_id}
+                      onChange={(event) => setRecurringDraft((draft) => ({ ...draft, account_id: event.target.value }))}
+                    >
+                      <option value="">不指定帳戶</option>
+                      {accounts.data?.map((account) => (
+                        <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="支出分類">
+                    <Select
+                      value={recurringDraft.category_id}
+                      onChange={(event) => setRecurringDraft((draft) => ({ ...draft, category_id: event.target.value }))}
+                    >
+                      <option value="">不指定分類</option>
+                      {categories.data?.filter((category) => category.kind === "expense").map((category) => (
+                        <option key={category.id} value={category.id}>{category.name}</option>
+                      ))}
+                    </Select>
+                  </Field>
+                  <Field label="備註">
+                    <Input
+                      value={recurringDraft.note}
+                      onChange={(event) => setRecurringDraft((draft) => ({ ...draft, note: event.target.value }))}
+                      placeholder="例如：剩餘 24 期"
+                    />
+                  </Field>
+                </div>
+              </FormStep>
+
+              {saveRecurring.isError && <p className="text-sm text-red-600">{(saveRecurring.error as Error).message}</p>}
+              <div className="mobile-safe-actions sticky bottom-0 -mx-4 flex justify-end gap-2 border-t border-slate-100 bg-white/95 px-4 py-3 backdrop-blur sm:static sm:mx-0 sm:border-0 sm:bg-transparent sm:p-0">
+                <Button type="button" variant="ghost" onClick={() => setRecurringOpen(false)}>取消</Button>
+                <Button type="submit" disabled={saveRecurring.isPending}>
+                  {saveRecurring.isPending ? "儲存中…" : editingRecurringId ? "儲存修改" : "建立固定花費"}
+                </Button>
+              </div>
+            </form>
+          </Dialog>
 
           <div className="mt-6 grid gap-6 xl:grid-cols-[1.25fr_.75fr]">
             <Card className="p-6">

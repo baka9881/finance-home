@@ -140,16 +140,37 @@ export interface SpendingAnalysis {
   month_expense: number;
   category_expenses: { name: string; color: string; value: number }[];
   recurring_expenses: {
+    id: number | null;
     name: string;
+    account_id: number | null;
     account_name: string;
+    category_id: number | null;
     category_name: string;
+    owner: "me" | "partner" | "shared" | null;
     average_amount: number;
     current_month_amount: number;
     months_detected: number;
-    latest_date: string;
+    latest_date: string | null;
     status: "recorded" | "expected";
+    source: "detected" | "custom";
+    due_day: number | null;
+    note: string | null;
   }[];
   estimated_recurring_total: number;
+}
+
+export interface RecurringExpenseDefinition {
+  id: number;
+  name: string;
+  owner: "me" | "partner" | "shared";
+  amount: number;
+  due_day: number | null;
+  account_id: number | null;
+  account_name: string | null;
+  category_id: number | null;
+  category_name: string | null;
+  active: boolean;
+  note: string | null;
 }
 
 export interface CsvInspection {

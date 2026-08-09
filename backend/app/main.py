@@ -43,6 +43,7 @@ from .database import (
     FxRate,
     Goal,
     Position,
+    RecurringExpense,
     Transaction,
     TransferLink,
     engine,
@@ -63,6 +64,8 @@ from .schemas import (
     LoanPaymentCreate,
     PositionCreate,
     PositionUpdate,
+    RecurringExpenseCreate,
+    RecurringExpenseUpdate,
     RuleCreate,
     SettingsUpdate,
     TransactionCreate,
@@ -1595,6 +1598,95 @@ def spending_analysis(db: DB, month: str | None = None, owner: str = "all"):
         return calculate_spending_analysis(db, selected_month, owner=owner)
     except ValueError as exc:
         raise HTTPException(422, str(exc)) from exc
+
+
+def recurring_expense_payload(row: RecurringExpense) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.name,
+        "owner": row.owner,
+        "amount": float(row.amount),
+        "due_day": row.due_day,
+        "account_id": row.account_id,
+        "account_name": row.account.name if row.account else None,
+        "category_id": row.category_id,
+        "category_name": row.category.name if row.category else None,
+        "active": row.active,
+        "note": row.note,
+    }
+
+
+def validate_recurring_expense_links(
+    db: Session, account_id: int | None, category_id: int | None
+) -> None:
+    if account_id is not None and not db.get(Account, account_id):
+        raise HTTPException(404, "找不到固定花費連結帳戶")
+    if category_id is not None and not db.get(Category, category_id):
+        raise HTTPException(404, "找不到固定花費分類")
+
+
+@app.get("/api/recurring-expenses")
+def list_recurring_expenses(
+    db: DB, owner: str = "all", include_inactive: bool = False
+):
+    owner = validate_owner_filter(owner)
+    query = select(RecurringExpense).order_by(
+        RecurringExpense.active.desc(), RecurringExpense.due_day, RecurringExpense.id
+    )
+    if owner != "all":
+        query = query.where(RecurringExpense.owner == owner)
+    if not include_inactive:
+        query = query.where(RecurringExpense.active.is_(True))
+    return [recurring_expense_payload(row) for row in db.scalars(query).all()]
+
+
+@app.post("/api/recurring-expenses", status_code=201)
+def create_recurring_expense(payload: RecurringExpenseCreate, db: DB):
+    if payload.owner not in {"me", "partner", "shared"}:
+        raise HTTPException(422, "固定花費所有人必須是 me、partner 或 shared")
+    validate_recurring_expense_links(db, payload.account_id, payload.category_id)
+    row = RecurringExpense(**payload.model_dump())
+    row.name = row.name.strip()
+    db.add(row)
+    db.commit()
+    return recurring_expense_payload(row)
+
+
+@app.patch("/api/recurring-expenses/{expense_id}")
+def update_recurring_expense(
+    expense_id: int, payload: RecurringExpenseUpdate, db: DB
+):
+    row = db.get(RecurringExpense, expense_id)
+    if not row:
+        raise HTTPException(404, "找不到自訂固定花費")
+    values = payload.model_dump(exclude_unset=True)
+    if values.get("owner") is not None and values["owner"] not in {
+        "me",
+        "partner",
+        "shared",
+    }:
+        raise HTTPException(422, "固定花費所有人必須是 me、partner 或 shared")
+    validate_recurring_expense_links(
+        db,
+        values.get("account_id", row.account_id),
+        values.get("category_id", row.category_id),
+    )
+    for key, value in values.items():
+        if key == "name" and value is not None:
+            value = value.strip()
+        setattr(row, key, value)
+    db.commit()
+    return recurring_expense_payload(row)
+
+
+@app.delete("/api/recurring-expenses/{expense_id}")
+def delete_recurring_expense(expense_id: int, db: DB):
+    row = db.get(RecurringExpense, expense_id)
+    if not row:
+        raise HTTPException(404, "找不到自訂固定花費")
+    db.delete(row)
+    db.commit()
+    return {"ok": True}
 
 
 @app.get("/api/exchanges/binance")
