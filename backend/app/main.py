@@ -6,14 +6,16 @@ import hmac
 import json
 import os
 import secrets
+import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import date, timedelta
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any
 
 from fastapi import (
+    BackgroundTasks,
     Depends,
     FastAPI,
     File,
@@ -46,6 +48,7 @@ from .database import (
     RecurringExpense,
     Transaction,
     TransferLink,
+    SessionLocal,
     engine,
     get_db,
 )
@@ -160,6 +163,8 @@ async def lifespan(_: FastAPI):
 
 FINANCE_APP_PASSWORD = os.getenv("FINANCE_APP_PASSWORD", "").strip()
 FINANCE_AUTH_SECRET = os.getenv("FINANCE_AUTH_SECRET", "").strip() or FINANCE_APP_PASSWORD
+AUTOMATION_SYNC_PATH = "/api/automation/sync"
+_automation_lock = threading.Lock()
 AUTH_TOKEN_TTL_SECONDS = int(os.getenv("FINANCE_AUTH_TTL_SECONDS", str(30 * 24 * 60 * 60)))
 DEFAULT_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
 configured_origins = [
@@ -225,7 +230,12 @@ app.add_middleware(
 
 @app.middleware("http")
 async def protect_cloud_api(request: Request, call_next):
-    public_paths = {"/api/health", "/api/auth/login", "/api/auth/status"}
+    public_paths = {
+        "/api/health",
+        "/api/auth/login",
+        "/api/auth/status",
+        AUTOMATION_SYNC_PATH,
+    }
     if (
         FINANCE_APP_PASSWORD
         and request.method != "OPTIONS"
@@ -239,6 +249,158 @@ async def protect_cloud_api(request: Request, call_next):
     return await call_next(request)
 
 DB = Annotated[Session, Depends(get_db)]
+
+
+def _automation_token() -> str:
+    return os.getenv("FINANCE_AUTOMATION_TOKEN", "").strip()
+
+
+def _set_app_setting(db: Session, key: str, value: str) -> None:
+    row = db.get(AppSetting, key)
+    if not row:
+        row = AppSetting(key=key, value=value)
+        db.add(row)
+    else:
+        row.value = value
+
+
+def _app_setting_value(db: Session, key: str) -> str | None:
+    row = db.get(AppSetting, key)
+    return row.value if row else None
+
+
+def _automation_status_payload(db: Session) -> dict[str, Any]:
+    connected = sum(
+        1 for item in binance_connection_statuses(db) if item.get("connected")
+    )
+    raw_result = _app_setting_value(db, "automation:last_result")
+    try:
+        last_result = json.loads(raw_result) if raw_result else None
+    except json.JSONDecodeError:
+        last_result = None
+    return {
+        "enabled": bool(_automation_token()),
+        "schedule": "hourly",
+        "running": _automation_lock.locked(),
+        "connected_exchanges": connected,
+        "last_status": _app_setting_value(db, "automation:last_status") or "idle",
+        "last_started_at": _app_setting_value(db, "automation:last_started_at"),
+        "last_run_at": _app_setting_value(db, "automation:last_run_at"),
+        "last_error": _app_setting_value(db, "automation:last_error"),
+        "last_result": last_result,
+    }
+
+
+def _should_refresh_fx(db: Session, now: datetime) -> bool:
+    last_attempt = _app_setting_value(db, "automation:last_fx_attempt_at")
+    if not last_attempt:
+        return True
+    try:
+        return now - datetime.fromisoformat(last_attempt) >= timedelta(hours=24)
+    except ValueError:
+        return True
+
+
+def run_automatic_updates() -> None:
+    if not _automation_lock.acquire(blocking=False):
+        return
+
+    started_at = datetime.utcnow()
+    db = SessionLocal()
+    try:
+        _set_app_setting(db, "automation:last_status", "running")
+        _set_app_setting(
+            db,
+            "automation:last_started_at",
+            started_at.isoformat(timespec="seconds"),
+        )
+        _set_app_setting(db, "automation:last_error", "")
+        db.commit()
+
+        exchange_results: list[dict[str, Any]] = []
+        errors: list[str] = []
+        connections = binance_connection_statuses(db)
+        for connection in connections:
+            if not connection.get("connected"):
+                continue
+            account = db.get(Account, connection["account_id"])
+            if not account:
+                continue
+            try:
+                exchange_results.append(sync_binance_account(db, account))
+            except Exception as exc:
+                db.rollback()
+                errors.append(f"{account.name}：{exc}")
+
+        fx_result: dict[str, Any] | None = None
+        if _should_refresh_fx(db, started_at):
+            _set_app_setting(
+                db,
+                "automation:last_fx_attempt_at",
+                started_at.isoformat(timespec="seconds"),
+            )
+            db.commit()
+            try:
+                fx_result = refresh_fx_rates(db)
+            except Exception as exc:
+                db.rollback()
+                errors.append(f"匯率：{exc}")
+
+        try:
+            market_result = refresh_market_prices(db)
+        except Exception as exc:
+            db.rollback()
+            market_result = {"updated": 0, "skipped": 0, "warnings": [], "errors": []}
+            errors.append(f"行情：{exc}")
+
+        errors.extend(str(item) for item in market_result.get("errors", []))
+        record_valuation(db)
+        finished_at = datetime.utcnow().isoformat(timespec="seconds")
+        summary = {
+            "exchanges_updated": sum(
+                1 for item in exchange_results if item.get("updated")
+            ),
+            "exchanges_skipped": sum(
+                1 for item in exchange_results if item.get("skipped")
+            ),
+            "market_updated": int(market_result.get("updated", 0)),
+            "market_skipped": int(market_result.get("skipped", 0)),
+            "fx_saved": int((fx_result or {}).get("saved", 0)),
+            "warnings": [
+                *[
+                    warning
+                    for item in exchange_results
+                    for warning in item.get("warnings", [])
+                ],
+                *[str(item) for item in market_result.get("warnings", [])],
+            ],
+            "errors": errors,
+        }
+        _set_app_setting(db, "automation:last_status", "warning" if errors else "success")
+        _set_app_setting(db, "automation:last_run_at", finished_at)
+        _set_app_setting(db, "automation:last_error", "、".join(errors))
+        _set_app_setting(
+            db,
+            "automation:last_result",
+            json.dumps(summary, ensure_ascii=False, separators=(",", ":")),
+        )
+        db.commit()
+    except Exception as exc:
+        db.rollback()
+        try:
+            _set_app_setting(db, "automation:last_status", "failed")
+            _set_app_setting(
+                db,
+                "automation:last_run_at",
+                datetime.utcnow().isoformat(timespec="seconds"),
+            )
+            _set_app_setting(db, "automation:last_error", str(exc))
+            db.commit()
+        except Exception:
+            db.rollback()
+    finally:
+        db.close()
+        _automation_lock.release()
 
 
 @app.get("/api/auth/status")
@@ -258,6 +420,25 @@ def auth_login(payload: AuthLogin):
     if not secrets.compare_digest(payload.password, FINANCE_APP_PASSWORD):
         raise HTTPException(401, "密碼錯誤")
     return {"token": create_auth_token()}
+
+
+@app.get("/api/automation/status")
+def automation_status(db: DB):
+    return _automation_status_payload(db)
+
+
+@app.post(AUTOMATION_SYNC_PATH, status_code=202)
+def schedule_automatic_sync(request: Request, background_tasks: BackgroundTasks):
+    expected_token = _automation_token()
+    supplied_token = request.headers.get("X-Automation-Token", "").strip()
+    if not expected_token:
+        raise HTTPException(503, "伺服器尚未設定自動更新密鑰")
+    if not supplied_token or not secrets.compare_digest(supplied_token, expected_token):
+        raise HTTPException(401, "自動更新驗證失敗")
+    if _automation_lock.locked():
+        return {"accepted": False, "status": "already_running"}
+    background_tasks.add_task(run_automatic_updates)
+    return {"accepted": True, "status": "scheduled"}
 
 
 def require_account(db: Session, account_id: int) -> Account:

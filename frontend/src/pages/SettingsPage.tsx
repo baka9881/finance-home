@@ -70,6 +70,26 @@ interface ExchangeSyncResult {
   errors: string[];
 }
 
+interface AutomationStatus {
+  enabled: boolean;
+  schedule: "hourly";
+  running: boolean;
+  connected_exchanges: number;
+  last_status: "idle" | "running" | "success" | "warning" | "failed";
+  last_started_at?: string;
+  last_run_at?: string;
+  last_error?: string;
+  last_result?: {
+    exchanges_updated: number;
+    exchanges_skipped: number;
+    market_updated: number;
+    market_skipped: number;
+    fx_saved: number;
+    warnings: string[];
+    errors: string[];
+  };
+}
+
 export default function SettingsPage() {
   const client = useQueryClient();
   const restoreInput = useRef<HTMLInputElement>(null);
@@ -87,6 +107,11 @@ export default function SettingsPage() {
   const binanceConnections = useQuery({
     queryKey: ["binance-connections"],
     queryFn: () => api<BinanceConnection[]>("/exchanges/binance"),
+  });
+  const automationStatus = useQuery({
+    queryKey: ["automation-status"],
+    queryFn: () => api<AutomationStatus>("/automation/status"),
+    refetchInterval: 60_000,
   });
   const latestFxDate = fx.data?.reduce((latest, rate) => (rate.rate_date > latest ? rate.rate_date : latest), "") || "";
 
@@ -119,6 +144,7 @@ export default function SettingsPage() {
       client.invalidateQueries({ queryKey: ["accounts"] });
       client.invalidateQueries({ queryKey: ["positions"] });
       client.invalidateQueries({ queryKey: ["dashboard"] });
+      client.invalidateQueries({ queryKey: ["automation-status"] });
       setExchangeSettingsOpen(false);
       setMessage("幣安已連接，交易所餘額與持倉已同步。");
     },
@@ -406,9 +432,14 @@ export default function SettingsPage() {
                 <Badge tone={binanceConnections.data?.some((item) => item.connected) ? "green" : "amber"}>
                   {binanceConnections.data?.some((item) => item.connected) ? "已連接幣安" : "尚未連接"}
                 </Badge>
+                <Badge tone={automationStatus.data?.enabled ? "green" : "amber"}>
+                  {automationStatus.data?.enabled ? "背景排程已啟用" : "背景排程未啟用"}
+                </Badge>
               </div>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-500">
-                開啟財務居後會自動同步幣安現貨、資金與合約等錢包總額，現貨幣種會另外顯示為持倉明細；持續使用時每十五分鐘更新一次，且不會重複加總。
+                {automationStatus.data?.enabled
+                  ? "伺服器每小時會自動同步幣安現貨、資金與合約等錢包總額，並更新行情與資產快照；不需要持續開著財務居。"
+                  : "開啟財務居時會定期同步幣安；部署背景排程後，即使關閉網站也能每小時自動更新。"}
               </p>
               <p className="mt-2 text-xs leading-5 text-amber-700">
                 請建立只有讀取權限的 API Key，務必關閉現貨交易、合約交易與提領權限。
@@ -430,6 +461,51 @@ export default function SettingsPage() {
               <KeyRound size={15} /> {exchangeSettingsOpen ? "收起設定" : "連接交易所"}
             </Button>
           </div>
+        </div>
+
+        <div className="mt-5 grid gap-3 rounded-2xl border border-slate-100 bg-slate-50 p-4 text-sm sm:grid-cols-3">
+          <div>
+            <p className="text-xs text-slate-400">伺服器排程</p>
+            <p className="mt-1 font-semibold text-slate-800">
+              {automationStatus.data?.running
+                ? "正在更新"
+                : automationStatus.data?.enabled
+                  ? "每小時自動執行"
+                  : "尚未啟用"}
+            </p>
+          </div>
+          <div>
+            <p className="text-xs text-slate-400">上次背景更新</p>
+            <p className="mt-1 font-semibold text-slate-800">
+              {automationStatus.data?.last_run_at
+                ? new Date(`${automationStatus.data.last_run_at}Z`).toLocaleString("zh-TW", { hour12: false })
+                : "尚未執行"}
+            </p>
+          </div>
+          <div>
+            <p className="text-xs text-slate-400">上次結果</p>
+            <p className={cn(
+              "mt-1 font-semibold",
+              automationStatus.data?.last_status === "failed" || automationStatus.data?.last_status === "warning"
+                ? "text-amber-700"
+                : "text-emerald-700",
+            )}>
+              {automationStatus.data?.last_status === "success"
+                ? "更新成功"
+                : automationStatus.data?.last_status === "warning"
+                  ? "部分資料沿用舊值"
+                  : automationStatus.data?.last_status === "failed"
+                    ? "更新失敗"
+                    : automationStatus.data?.last_status === "running"
+                      ? "執行中"
+                      : "等待第一次執行"}
+            </p>
+          </div>
+          {automationStatus.data?.last_error && (
+            <p className="text-xs leading-5 text-amber-700 sm:col-span-3">
+              {automationStatus.data.last_error}
+            </p>
+          )}
         </div>
 
         {binanceConnections.data?.some((item) => item.connected) && (

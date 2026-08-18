@@ -1166,6 +1166,13 @@ def import_csv(
     if not mapping.get("amount") and not (mapping.get("debit") or mapping.get("credit")):
         raise ValueError("必須對應金額，或至少一個收入／支出欄位")
 
+    starting_balance_snapshot = get_latest_balance(db, account.id)
+    balance_before = (
+        decimal_value(starting_balance_snapshot.amount)
+        if starting_balance_snapshot
+        else ZERO
+    )
+
     imported = 0
     duplicates = 0
     failed: list[dict[str, Any]] = []
@@ -1241,11 +1248,24 @@ def import_csv(
     balance_applied_transactions = 0
     balance_change = ZERO
     balance_after: Decimal | None = None
+    balance_source = "unchanged"
     if commit and latest_balance:
         create_balance_snapshot(
             db, account, latest_balance[1], latest_balance[0], source="csv"
         )
-        balance_after = latest_balance[1]
+        if (
+            starting_balance_snapshot is None
+            or latest_balance[0] >= starting_balance_snapshot.snapshot_date
+        ):
+            balance_after = latest_balance[1]
+            balance_change = balance_after - balance_before
+            balance_adjusted = balance_change != ZERO
+            balance_source = "statement"
+        else:
+            # Keep an older statement as historical data without presenting it
+            # as the account's new current balance.
+            balance_after = balance_before
+            balance_source = "historical_statement"
     if commit:
         db.flush()
         applied_ids = _csv_balance_applied_ids(db, account.id)
@@ -1255,6 +1275,7 @@ def import_csv(
             if transaction.id is not None and transaction.id not in applied_ids
         ]
         if latest_balance:
+            balance_applied_transactions = len(candidate_transactions)
             applied_ids.update(transaction.id for transaction in candidate_transactions)
         elif adjust_balance and candidate_transactions:
             latest = get_latest_balance(db, account.id)
@@ -1287,6 +1308,7 @@ def import_csv(
             balance_change = balance_after - current_amount
             balance_adjusted = balance_change != ZERO
             balance_applied_transactions = len(candidate_transactions)
+            balance_source = "transactions"
             applied_ids.update(transaction.id for transaction in candidate_transactions)
 
         if candidate_transactions:
@@ -1302,6 +1324,11 @@ def import_csv(
         "failed": failed[:50],
         "preview": preview,
         "encoding": inspected["encoding"],
+        "account_name": account.name,
+        "account_nature": account.nature,
+        "currency": account.currency,
+        "balance_source": balance_source,
+        "balance_before": float(balance_before),
         "balance_adjusted": balance_adjusted,
         "balance_applied_transactions": balance_applied_transactions,
         "balance_change": float(balance_change),

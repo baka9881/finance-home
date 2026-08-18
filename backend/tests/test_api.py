@@ -74,6 +74,40 @@ def test_cloud_password_protects_financial_api(client: TestClient, monkeypatch: 
     assert authorized.status_code == 200
 
 
+def test_automation_sync_uses_separate_token(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    calls: list[str] = []
+    monkeypatch.setenv("FINANCE_AUTOMATION_TOKEN", "test-automation-token")
+    monkeypatch.setattr(
+        main_module,
+        "run_automatic_updates",
+        lambda: calls.append("started"),
+    )
+
+    assert client.post("/api/automation/sync").status_code == 401
+    assert (
+        client.post(
+            "/api/automation/sync",
+            headers={"X-Automation-Token": "wrong-token"},
+        ).status_code
+        == 401
+    )
+
+    accepted = client.post(
+        "/api/automation/sync",
+        headers={"X-Automation-Token": "test-automation-token"},
+    )
+    assert accepted.status_code == 202
+    assert accepted.json() == {"accepted": True, "status": "scheduled"}
+    assert calls == ["started"]
+
+    status = client.get("/api/automation/status")
+    assert status.status_code == 200
+    assert status.json()["enabled"] is True
+    assert status.json()["schedule"] == "hourly"
+
+
 def test_account_balance_and_dashboard(client: TestClient):
     create_account(client, "薪轉帳戶")
     create_account(client, "信用卡", "liability")
@@ -775,6 +809,72 @@ def test_csv_import_big5_and_duplicate_detection(client: TestClient):
     rows = client.get("/api/transactions").json()
     assert len(rows) == 2
     assert sorted(item["base_amount"] for item in rows) == [-80, 30000]
+
+
+def test_csv_statement_balance_replaces_bank_balance_and_reports_source(client: TestClient):
+    account_id = create_account(client, "銀行帳戶")
+    statement_date = date.today().isoformat()
+    content = (
+        "date,description,amount,balance\n"
+        f"{statement_date},早餐,-100,99900\n"
+        f"{statement_date},薪資,30000,129900\n"
+    ).encode("utf-8")
+    response = client.post(
+        "/api/transactions/import",
+        files={"file": ("bank.csv", io.BytesIO(content), "text/csv")},
+        data={
+            "account_id": str(account_id),
+            "mapping_json": __import__("json").dumps(
+                {
+                    "date": "date",
+                    "description": "description",
+                    "amount": "amount",
+                    "balance": "balance",
+                }
+            ),
+            "commit": "true",
+        },
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["balance_source"] == "statement"
+    assert result["balance_before"] == 100000
+    assert result["balance_after"] == 129900
+    assert result["balance_applied_transactions"] == 2
+    account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
+    assert account["balance"] == 129900
+
+
+def test_older_csv_statement_does_not_replace_newer_balance(client: TestClient):
+    account_id = create_account(client, "銀行帳戶")
+    newer_date = (date.today() + timedelta(days=1)).isoformat()
+    statement_date = date.today().isoformat()
+    client.post(
+        f"/api/accounts/{account_id}/balance",
+        json={"amount": 150000, "snapshot_date": newer_date, "fx_rate": 1},
+    )
+    content = f"date,description,amount,balance\n{statement_date},早餐,-100,99900\n".encode("utf-8")
+    response = client.post(
+        "/api/transactions/import",
+        files={"file": ("old-bank.csv", io.BytesIO(content), "text/csv")},
+        data={
+            "account_id": str(account_id),
+            "mapping_json": __import__("json").dumps(
+                {
+                    "date": "date",
+                    "description": "description",
+                    "amount": "amount",
+                    "balance": "balance",
+                }
+            ),
+            "commit": "true",
+        },
+    )
+    assert response.status_code == 200, response.text
+    assert response.json()["balance_source"] == "historical_statement"
+    assert response.json()["balance_after"] == 150000
+    account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
+    assert account["balance"] == 150000
 
 
 def test_csv_import_adjusts_balance_once_and_can_reconcile_existing_rows(client: TestClient):

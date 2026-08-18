@@ -52,3 +52,16 @@ npm.cmd run dev
 - 匯率：中央銀行統計資料庫
 
 行情與財務健康分數僅供個人管理參考，不構成投資建議。
+
+## 雲端自動更新
+
+正式版會由 Netlify Scheduled Function 每小時呼叫一次 Render 後端。即使沒有開啟網站，系統也會同步已連接的 Binance 帳戶、更新可用行情與匯率，並保存當日資產快照。
+
+部署時需要在 Render 與 Netlify 設定完全相同的 `FINANCE_AUTOMATION_TOKEN`，並在 Netlify 設定：
+
+```text
+FINANCE_AUTOMATION_URL=https://finance-home-api-sg.onrender.com
+FINANCE_AUTOMATION_TOKEN=請使用足夠長的隨機字串
+```
+
+密鑰只能放在平台環境變數，不要寫入 `netlify.toml` 或提交到 Git。設定頁會顯示排程是否啟用、上次執行時間與錯誤狀態。

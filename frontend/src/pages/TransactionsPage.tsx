@@ -231,6 +231,10 @@ export default function TransactionsPage() {
   const importMappingReady = Boolean(
     mapping.date && mapping.description && (mapping.amount || mapping.debit || mapping.credit),
   );
+  const selectedImportAccount = useMemo(
+    () => accounts.data?.find((account) => String(account.id) === String(mapping.account_id)),
+    [accounts.data, mapping.account_id],
+  );
   const unclassifiedCount = (transactions.data || []).filter(
     (transaction) => transaction.category_name === "未分類",
   ).length;
@@ -1182,10 +1186,31 @@ export default function TransactionsPage() {
             <p className="mt-2 text-sm text-slate-500">
               新增 {String(importResult.imported)} 筆，略過 {String(importResult.duplicates)} 筆重複資料。
             </p>
-            {Number(importResult.balance_applied_transactions || 0) > 0 && (
-              <p className="mt-2 text-sm font-medium text-emerald-700">
-                已將 {String(importResult.balance_applied_transactions)} 筆尚未套用的明細同步至帳戶餘額。
-              </p>
+            {String(importResult.balance_source) === "statement" && (
+              <div className="mx-auto mt-5 max-w-md rounded-2xl bg-emerald-50 px-4 py-3 text-left">
+                <p className="text-sm font-semibold text-emerald-900">
+                  {String(importResult.account_nature) === "liability" ? "信用卡負債已依帳單更新" : "帳戶餘額已依對帳單更新"}
+                </p>
+                <p className="mt-1 text-sm text-emerald-700">
+                  {String(importResult.account_name)}目前為 {String(importResult.currency)} {Number(importResult.balance_after || 0).toLocaleString()}。
+                </p>
+              </div>
+            )}
+            {String(importResult.balance_source) === "transactions" && (
+              <div className="mx-auto mt-5 max-w-md rounded-2xl bg-emerald-50 px-4 py-3 text-left">
+                <p className="text-sm font-semibold text-emerald-900">
+                  {String(importResult.account_nature) === "liability" ? "信用卡負債已同步" : "帳戶餘額已同步"}
+                </p>
+                <p className="mt-1 text-sm text-emerald-700">
+                  已套用 {String(importResult.balance_applied_transactions)} 筆新明細，目前為 {String(importResult.currency)} {Number(importResult.balance_after || 0).toLocaleString()}。
+                </p>
+              </div>
+            )}
+            {String(importResult.balance_source) === "historical_statement" && (
+              <div className="mx-auto mt-5 max-w-md rounded-2xl bg-blue-50 px-4 py-3 text-left">
+                <p className="text-sm font-semibold text-blue-900">已保留這份歷史對帳單</p>
+                <p className="mt-1 text-sm text-blue-700">檔案日期早於現有餘額快照，因此不會覆蓋目前帳戶餘額。</p>
+              </div>
             )}
             <Button
               className="mt-6"
@@ -1244,9 +1269,13 @@ export default function TransactionsPage() {
             </Field>
 
             <div className="rounded-2xl border border-blue-100 bg-blue-50/70 px-4 py-3">
-              <p className="text-sm font-semibold text-blue-900">帳戶餘額會一起更新</p>
+              <p className="text-sm font-semibold text-blue-900">
+                {selectedImportAccount?.nature === "liability" ? "信用卡負債會一起更新" : "帳戶餘額會一起更新"}
+              </p>
               <p className="mt-1 text-sm leading-6 text-blue-700">
-                系統只套用尚未反映過的明細；同一份檔案再次匯入不會重複扣款。若 CSV 有餘額欄位，會以檔案餘額為準。
+                {selectedImportAccount?.nature === "liability"
+                  ? "刷卡消費會增加信用卡負債，不會直接扣除銀行存款；實際繳卡費時再用帳戶互轉記錄。"
+                  : "系統只套用尚未反映過的明細；同一份檔案再次匯入不會重複扣款。若 CSV 有餘額欄位，會以最新檔案餘額為準。"}
               </p>
             </div>
 

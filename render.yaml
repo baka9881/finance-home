@@ -18,5 +18,7 @@ services:
         sync: false
       - key: FINANCE_AUTH_SECRET
         generateValue: true
+      - key: FINANCE_AUTOMATION_TOKEN
+        sync: false
       - key: FINANCE_ALLOWED_ORIGINS
         sync: false
