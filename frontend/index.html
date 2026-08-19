@@ -12,6 +12,23 @@
     <meta name="apple-mobile-web-app-capable" content="yes" />
     <meta name="apple-mobile-web-app-status-bar-style" content="black-translucent" />
     <meta name="apple-mobile-web-app-title" content="財務居" />
+    <script>
+      (() => {
+        try {
+          const dark = localStorage.getItem("finance:theme") === "dark";
+          const color = dark ? "#0b1210" : "#f5f7f4";
+          document.documentElement.classList.toggle("dark", dark);
+          document.documentElement.style.colorScheme = dark ? "dark" : "light";
+          document.documentElement.style.backgroundColor = color;
+          document.querySelector('meta[name="theme-color"]')?.setAttribute("content", color);
+          document
+            .querySelector('meta[name="apple-mobile-web-app-status-bar-style"]')
+            ?.setAttribute("content", dark ? "black-translucent" : "default");
+        } catch {
+          // Keep the light defaults if storage is unavailable.
+        }
+      })();
+    </script>
     <link rel="manifest" href="/manifest.webmanifest" />
     <link rel="icon" type="image/png" sizes="32x32" href="/finance-home-favicon-32.png" />
     <link rel="icon" type="image/png" sizes="192x192" href="/finance-home-icon-192.png" />

@@ -62,13 +62,15 @@ interface BinanceConnection {
   owner_label: string;
   connected: boolean;
   last_sync_at?: string;
+  last_cost_sync_at?: string;
+  backoff_until?: string;
 }
 
 interface ExchangeSyncResult {
   connected: number;
   updated: number;
   skipped: number;
-  results: Array<{ account_name: string; warnings?: string[] }>;
+  results: Array<{ account_name: string; skipped?: boolean; warnings?: string[] }>;
   errors: string[];
 }
 
@@ -154,7 +156,7 @@ export default function SettingsPage() {
   const syncBinance = useMutation({
     mutationFn: (accountId?: number) =>
       api<ExchangeSyncResult>(
-        `/exchanges/sync?force=true${accountId ? `&account_id=${accountId}` : ""}`,
+        `/exchanges/sync${accountId ? `?account_id=${accountId}` : ""}`,
         { method: "POST" },
       ),
     onSuccess: (result) => {
@@ -168,7 +170,9 @@ export default function SettingsPage() {
           ? `同步未完成：${result.errors.join("、")}`
           : warnings.length
             ? `交易所已同步；${warnings.join("、")}`
-            : `交易所同步完成，更新 ${result.updated} 個帳戶。`,
+            : result.updated
+              ? `交易所同步完成，更新 ${result.updated} 個帳戶。`
+              : "距離上次完整同步未滿一小時，已保留最新資料；行情仍會每 15 分鐘更新。",
       );
     },
   });
@@ -381,18 +385,15 @@ export default function SettingsPage() {
             <div className="flex-1">
               <h2 className="font-bold text-ink">行情與匯率</h2>
               <p className="mt-2 text-sm leading-6 text-slate-500">
-                美股需要 Alpha Vantage 金鑰；匯率用來把外幣資產換算成新台幣。
+                美股行情會自動從公開來源更新；匯率用來把外幣資產換算成新台幣。
               </p>
             </div>
           </div>
           <div className="mt-5 grid gap-3 sm:grid-cols-2">
             <div className="rounded-2xl border border-slate-100 p-4">
               <p className="text-xs text-slate-400">美股行情</p>
-              <div className="mt-2">
-                <Badge tone={settings.data?.alpha_vantage_configured ? "green" : "amber"}>
-                  {settings.data?.alpha_vantage_configured ? "已設定" : "尚未設定"}
-                </Badge>
-              </div>
+              <div className="mt-2"><Badge tone="green">自動更新</Badge></div>
+              <p className="mt-2 text-xs leading-5 text-slate-400">Nasdaq 優先，失敗時自動改用備援來源。</p>
             </div>
             <div className="rounded-2xl border border-slate-100 p-4">
               <p className="text-xs text-slate-400">匯率資料</p>
@@ -405,22 +406,7 @@ export default function SettingsPage() {
             <Button variant="secondary" onClick={() => refreshFx.mutate()} disabled={refreshFx.isPending}>
               <RefreshCw size={15} className={refreshFx.isPending ? "animate-spin" : ""} /> 更新匯率
             </Button>
-            <Button variant="ghost" onClick={() => setMarketSettingsOpen((value) => !value)}>
-              <KeyRound size={15} /> {settings.data?.alpha_vantage_configured ? "更換美股金鑰" : "設定美股金鑰"}
-            </Button>
           </div>
-          {marketSettingsOpen && (
-            <form className="mt-5 space-y-3" onSubmit={submitSettings}>
-              <FormStep number={1} title="貼上 Alpha Vantage API 金鑰">
-                <div className="flex flex-col gap-3 sm:flex-row">
-                  <Input name="api_key" type="password" placeholder="輸入 API key" required />
-                  <Button type="submit" className="shrink-0" disabled={saveSettings.isPending}>
-                    <Save size={16} /> 儲存金鑰
-                  </Button>
-                </div>
-              </FormStep>
-            </form>
-          )}
         </Card>
       </div>
 
@@ -440,8 +426,8 @@ export default function SettingsPage() {
               </div>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-500">
                 {automationStatus.data?.enabled
-                  ? "伺服器每小時會自動同步幣安現貨、資金與合約等錢包總額，並更新行情與資產快照；不需要持續開著財務居。"
-                  : "開啟財務居時會定期同步幣安；部署背景排程後，即使關閉網站也能每小時自動更新。"}
+                  ? "帳戶餘額與持倉每小時完整同步；行情每 15 分鐘更新，成交成本每天更新一次。不需要持續開著財務居。"
+                  : "開啟財務居時每 15 分鐘更新行情；部署背景排程後，帳戶與持倉會每小時自動同步。"}
               </p>
               <p className="mt-2 text-xs leading-5 text-amber-700">
                 請建立只有讀取權限的 API Key，務必關閉現貨交易、合約交易與提領權限。
@@ -525,6 +511,11 @@ export default function SettingsPage() {
                   上次同步：{item.last_sync_at
                     ? new Date(`${item.last_sync_at}Z`).toLocaleString("zh-TW", { hour12: false })
                     : "尚未同步"}
+                </p>
+                <p className="mt-1 text-xs text-slate-500">
+                  成本更新：{item.last_cost_sync_at
+                    ? new Date(`${item.last_cost_sync_at}Z`).toLocaleString("zh-TW", { hour12: false })
+                    : "尚未更新"}
                 </p>
                 <div className="mt-3 flex gap-2">
                   <Button
@@ -653,7 +644,7 @@ export default function SettingsPage() {
             <div className="rounded-xl bg-slate-100 p-2.5 text-slate-600"><Shield size={18} /></div>
             <div>
               <h2 className="font-bold text-ink">進階資料設定</h2>
-              <p className="mt-1 text-xs text-slate-400">平常不需要碰；需要手動覆蓋匯率或查看明細時再展開。</p>
+              <p className="mt-1 text-xs text-slate-400">平常不需要碰；需要設定備援行情、手動匯率或查看明細時再展開。</p>
             </div>
           </div>
           <Badge>{advancedOpen ? "收起" : "展開"}</Badge>
@@ -663,6 +654,42 @@ export default function SettingsPage() {
           <div className="border-t border-slate-100 p-6">
             <div className="grid gap-6 xl:grid-cols-[.85fr_1.15fr]">
               <div className="space-y-6">
+                <div className="rounded-2xl border border-slate-100 p-5">
+                  <div className="flex flex-wrap items-start justify-between gap-3">
+                    <div>
+                      <div className="flex flex-wrap items-center gap-2">
+                        <h3 className="font-bold text-ink">美股備援行情</h3>
+                        <Badge tone={settings.data?.alpha_vantage_configured ? "green" : "slate"}>
+                          {settings.data?.alpha_vantage_configured ? "備援金鑰已設定" : "選填"}
+                        </Badge>
+                      </div>
+                      <p className="mt-2 text-xs leading-5 text-slate-400">
+                        平常會優先使用 Nasdaq；Alpha Vantage 金鑰只在主要來源失敗時作為備援，沒有設定也能更新行情。
+                      </p>
+                    </div>
+                    <Button variant="ghost" onClick={() => setMarketSettingsOpen((value) => !value)}>
+                      <KeyRound size={15} />
+                      {marketSettingsOpen
+                        ? "收起"
+                        : settings.data?.alpha_vantage_configured
+                          ? "更換備援金鑰"
+                          : "設定備援金鑰"}
+                    </Button>
+                  </div>
+                  {marketSettingsOpen && (
+                    <form className="mt-5 space-y-3" onSubmit={submitSettings}>
+                      <FormStep number={1} title="貼上 Alpha Vantage API 金鑰">
+                        <div className="flex flex-col gap-3 sm:flex-row">
+                          <Input name="api_key" type="password" autoComplete="off" placeholder="輸入 API key" required />
+                          <Button type="submit" className="shrink-0" disabled={saveSettings.isPending}>
+                            <Save size={16} /> 儲存備援金鑰
+                          </Button>
+                        </div>
+                      </FormStep>
+                    </form>
+                  )}
+                </div>
+
                 <div className="rounded-2xl border border-slate-100 p-5">
                   <h3 className="font-bold text-ink">自訂匯率</h3>
                   <p className="mt-1 text-xs text-slate-400">可覆蓋指定日期的官方匯率。</p>

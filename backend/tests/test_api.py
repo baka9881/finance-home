@@ -171,10 +171,11 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
         {"asset": "DUST", "free": "1", "locked": "0"},
     ]
     wallet = {"total_usdt": services_module.Decimal("30500")}
-    monkeypatch.setattr(
-        services_module,
-        "_fetch_binance_spot_snapshot",
-        lambda _key, _secret: (
+    cost_detail_requests: list[bool] = []
+
+    def fake_binance_snapshot(_key, _secret, *, include_cost_details=True):
+        cost_detail_requests.append(include_cost_details)
+        return (
             balances,
             {
                 "BTCUSDT": services_module.Decimal("60000"),
@@ -186,13 +187,19 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
             [],
             [],
             [],
-        ),
+        )
+
+    monkeypatch.setattr(
+        services_module,
+        "_fetch_binance_spot_snapshot",
+        fake_binance_snapshot,
     )
     connected = client.post(
         "/api/exchanges/binance/connect",
         json={"account_id": account_id, "api_key": "read-only-key", "api_secret": "read-only-secret"},
     )
     assert connected.status_code == 200, connected.text
+    assert cost_detail_requests == [True]
 
     account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
     assert account["balance_twd"] == 976000
@@ -220,6 +227,7 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
     refreshed = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
     assert refreshed.status_code == 200, refreshed.text
     assert refreshed.json()["updated"] == 1
+    assert cost_detail_requests == [True, False]
     positions = client.get("/api/positions").json()
     assert len(positions) == 1
     assert positions[0]["symbol"] == "MSTR"
@@ -273,7 +281,7 @@ def test_binance_portfolio_margin_updates_tradfi_position(
     monkeypatch.setattr(
         services_module,
         "_fetch_binance_spot_snapshot",
-        lambda _key, _secret: (
+        lambda _key, _secret, **_kwargs: (
             [{"asset": "USDT", "free": "100", "locked": "0"}],
             {},
             services_module.Decimal("500"),
@@ -388,7 +396,7 @@ def test_binance_funding_wallet_updates_existing_stock_position(
     monkeypatch.setattr(
         services_module,
         "_fetch_binance_spot_snapshot",
-        lambda _key, _secret: (
+        lambda _key, _secret, **_kwargs: (
             [{"asset": "USDT", "free": "100", "locked": "0"}],
             {},
             services_module.Decimal("1661.16"),
@@ -430,6 +438,7 @@ def test_binance_stock_trades_apply_only_new_fills_after_baseline(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
 ):
+    monkeypatch.setattr(services_module, "BINANCE_COST_SYNC_INTERVAL", timedelta(0))
     monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
     client.post(
         "/api/fx/manual",
@@ -480,7 +489,7 @@ def test_binance_stock_trades_apply_only_new_fills_after_baseline(
     monkeypatch.setattr(
         services_module,
         "_fetch_binance_spot_snapshot",
-        lambda _key, _secret: (
+        lambda _key, _secret, **_kwargs: (
             [{"asset": "USDT", "free": "100", "locked": "0"}],
             {},
             services_module.Decimal("1661.16"),
@@ -624,6 +633,22 @@ def test_binance_signature_error_has_actionable_message():
         services_module._binance_response_payload(response)
 
 
+def test_binance_rate_limit_uses_server_ban_timestamp():
+    request = services_module.httpx.Request("GET", "https://api.binance.com/api/v3/account")
+    retry_at = datetime.now(timezone.utc) + timedelta(hours=2)
+    retry_ms = int(retry_at.timestamp() * 1000)
+    response = services_module.httpx.Response(
+        418,
+        request=request,
+        json={"code": -1003, "msg": f"IP banned until {retry_ms}."},
+    )
+
+    with pytest.raises(services_module.BinanceRateLimitError) as caught:
+        services_module._binance_response_payload(response)
+
+    assert abs((caught.value.retry_at - retry_at.replace(tzinfo=None)).total_seconds()) < 1
+
+
 def test_us_market_uses_nasdaq_first_and_daily_cache(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -718,6 +743,8 @@ def test_us_market_uses_nasdaq_first_and_daily_cache(
     assert refreshed.status_code == 200, refreshed.text
     payload = refreshed.json()
     assert payload["updated"] == 1
+    assert payload["updated_items"] == ["MSTR"]
+    assert payload["cached_items"] == []
     assert payload["warnings"] == []
     assert len(calls) == 1
 
@@ -729,7 +756,14 @@ def test_us_market_uses_nasdaq_first_and_daily_cache(
     cached = client.post("/api/market/refresh")
     assert cached.status_code == 200, cached.text
     assert cached.json()["skipped"] == 1
+    assert cached.json()["cached_items"] == ["MSTR"]
     assert len(calls) == 1
+
+    forced = client.post("/api/market/refresh?force=true")
+    assert forced.status_code == 200, forced.text
+    assert forced.json()["updated"] == 1
+    assert forced.json()["updated_items"] == ["MSTR"]
+    assert len(calls) == 2
 
 
 def test_alpha_vantage_failure_reason_is_not_always_reported_as_quota():

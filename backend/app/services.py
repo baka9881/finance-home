@@ -143,6 +143,9 @@ BINANCE_ASSET_SYMBOLS = {
 }
 BINANCE_CASH_ASSETS = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD"}
 BINANCE_MIN_POSITION_VALUE_TWD = Decimal("10")
+BINANCE_FULL_SYNC_INTERVAL = timedelta(hours=1)
+BINANCE_COST_SYNC_INTERVAL = timedelta(hours=24)
+BINANCE_DEFAULT_RATE_LIMIT_BACKOFF = timedelta(minutes=15)
 
 
 def decimal_value(value: Any, default: Decimal = ZERO) -> Decimal:
@@ -1381,6 +1384,7 @@ def _reuse_cached_market_price(
     latest = get_latest_price(db, position.market, position.symbol)
     if latest:
         result["skipped"] += 1
+        _record_market_result_item(result, "cached_items", position)
         result["warnings"].append(
             f"{label}：{reason}，已沿用 {latest.price_date.isoformat()} 的價格"
         )
@@ -1388,8 +1392,28 @@ def _reuse_cached_market_price(
     result["errors"].append(f"{label}：{reason}，且目前沒有可沿用的價格")
 
 
+def _record_market_result_item(
+    result: dict[str, Any],
+    key: str,
+    position: Position,
+) -> None:
+    label = str(position.symbol or position.name or "未知標的")
+    items = result.setdefault(key, [])
+    if label not in items:
+        items.append(label)
+
+
 def _binance_setting_key(account_id: int, suffix: str) -> str:
     return f"binance:{account_id}:{suffix}"
+
+
+BINANCE_GLOBAL_BACKOFF_KEY = "binance:backoff_until"
+
+
+class BinanceRateLimitError(Exception):
+    def __init__(self, message: str, retry_at: datetime):
+        super().__init__(message)
+        self.retry_at = retry_at
 
 
 def _get_setting_value(db: Session, key: str) -> str:
@@ -1457,6 +1481,10 @@ def binance_connection_statuses(db: Session) -> list[dict[str, Any]]:
                 "last_sync_at": _get_setting_value(
                     db, _binance_setting_key(account.id, "last_sync_at")
                 ) or None,
+                "last_cost_sync_at": _get_setting_value(
+                    db, _binance_setting_key(account.id, "last_cost_sync_at")
+                ) or None,
+                "backoff_until": _get_setting_value(db, BINANCE_GLOBAL_BACKOFF_KEY) or None,
             }
         )
     return result
@@ -1465,7 +1493,14 @@ def binance_connection_statuses(db: Session) -> list[dict[str, Any]]:
 def disconnect_binance_account(db: Session, account_id: int) -> None:
     keys = [
         _binance_setting_key(account_id, suffix)
-        for suffix in ("api_key", "api_secret", "last_sync_at", "position_ids")
+        for suffix in (
+            "api_key",
+            "api_secret",
+            "last_sync_at",
+            "last_cost_sync_at",
+            "position_ids",
+            "stock_trade_ids",
+        )
     ]
     db.execute(delete(AppSetting).where(AppSetting.key.in_(keys)))
     db.commit()
@@ -1479,6 +1514,28 @@ def _binance_response_payload(response: httpx.Response) -> Any:
     if response.is_error:
         detail = payload.get("msg") if isinstance(payload, dict) else None
         code = payload.get("code") if isinstance(payload, dict) else None
+        if response.status_code in {418, 429} or code == -1003:
+            retry_at = datetime.utcnow() + BINANCE_DEFAULT_RATE_LIMIT_BACKOFF
+            banned_match = re.search(r"banned until\s+(\d{10,13})", str(detail or ""), re.IGNORECASE)
+            if banned_match:
+                timestamp = int(banned_match.group(1))
+                if timestamp < 10_000_000_000:
+                    timestamp *= 1000
+                retry_at = datetime.fromtimestamp(timestamp / 1000, timezone.utc).replace(tzinfo=None)
+            else:
+                retry_after = response.headers.get("Retry-After", "").strip()
+                try:
+                    retry_at = datetime.utcnow() + timedelta(seconds=max(1, int(retry_after)))
+                except ValueError:
+                    if response.status_code == 418:
+                        retry_at = datetime.utcnow() + timedelta(hours=1)
+            retry_label = retry_at.replace(tzinfo=timezone.utc).astimezone(
+                timezone(timedelta(hours=8))
+            ).strftime("%Y/%m/%d %H:%M")
+            raise BinanceRateLimitError(
+                f"幣安暫時限制同步，系統會在 {retry_label} 後自動重試",
+                retry_at,
+            )
         if code == -1022:
             raise ValueError(
                 "Binance 簽章驗證失敗。請確認 API Key 與 Secret Key 是同一次建立的一組；"
@@ -1578,6 +1635,8 @@ def _binance_spot_average_cost(
 def _fetch_binance_spot_snapshot(
     api_key: str,
     api_secret: str,
+    *,
+    include_cost_details: bool = True,
 ) -> tuple[
     list[dict[str, Any]],
     dict[str, Decimal],
@@ -1711,47 +1770,48 @@ def _fetch_binance_spot_snapshot(
                 )
 
         equity_trades: list[dict[str, Any]] = []
-        try:
-            # Binance Stocks Trading launched on 2026-07-20. Reading from its
-            # first day lets us rebuild current share quantities from every
-            # BUY and SELL fill because the API has no direct positions route.
-            stock_history_start = int(
-                datetime(2026, 7, 20, tzinfo=timezone.utc).timestamp() * 1000
-            )
-            stock_history_end = int(time.time() * 1000) + server_time_offset
-            page = 1
-            while page <= 20:
-                trade_timestamp = int(time.time() * 1000) + server_time_offset
-                trade_query = _binance_signed_query(
-                    api_secret,
-                    trade_timestamp,
-                    ("startTime", str(stock_history_start)),
-                    ("endTime", str(stock_history_end)),
-                    ("current", str(page)),
-                    ("size", "100"),
+        if include_cost_details:
+            try:
+                # Binance Stocks Trading launched on 2026-07-20. Reading from its
+                # first day lets us rebuild current share quantities from every
+                # BUY and SELL fill because the API has no direct positions route.
+                stock_history_start = int(
+                    datetime(2026, 7, 20, tzinfo=timezone.utc).timestamp() * 1000
                 )
-                trade_response = client.get(
-                    f"https://api.binance.com/sapi/v1/equity/trade/history?{trade_query}"
+                stock_history_end = int(time.time() * 1000) + server_time_offset
+                page = 1
+                while page <= 20:
+                    trade_timestamp = int(time.time() * 1000) + server_time_offset
+                    trade_query = _binance_signed_query(
+                        api_secret,
+                        trade_timestamp,
+                        ("startTime", str(stock_history_start)),
+                        ("endTime", str(stock_history_end)),
+                        ("current", str(page)),
+                        ("size", "100"),
+                    )
+                    trade_response = client.get(
+                        f"https://api.binance.com/sapi/v1/equity/trade/history?{trade_query}"
+                    )
+                    trade_payload = _binance_response_payload(trade_response)
+                    rows = (
+                        trade_payload.get("rows", [])
+                        if isinstance(trade_payload, dict)
+                        else []
+                    )
+                    if not isinstance(rows, list):
+                        break
+                    equity_trades.extend(
+                        item for item in rows if isinstance(item, dict)
+                    )
+                    total = int(trade_payload.get("total") or len(equity_trades))
+                    if page * 100 >= total or not rows:
+                        break
+                    page += 1
+            except (ValueError, httpx.HTTPError):
+                wallet_warnings.append(
+                    "暫時無法讀取 Binance 股票成交紀錄，既有股票持倉會先保留"
                 )
-                trade_payload = _binance_response_payload(trade_response)
-                rows = (
-                    trade_payload.get("rows", [])
-                    if isinstance(trade_payload, dict)
-                    else []
-                )
-                if not isinstance(rows, list):
-                    break
-                equity_trades.extend(
-                    item for item in rows if isinstance(item, dict)
-                )
-                total = int(trade_payload.get("total") or len(equity_trades))
-                if page * 100 >= total or not rows:
-                    break
-                page += 1
-        except (ValueError, httpx.HTTPError):
-            wallet_warnings.append(
-                "暫時無法讀取 Binance 股票成交紀錄，既有股票持倉會先保留"
-            )
 
         um_positions: list[dict[str, Any]] = []
         try:
@@ -1799,7 +1859,7 @@ def _fetch_binance_spot_snapshot(
             and item.get("symbol")
             and decimal_value(item.get("price")) > 0
         }
-        for item in account_payload.get("balances", []):
+        for item in account_payload.get("balances", []) if include_cost_details else []:
             if not isinstance(item, dict):
                 continue
             asset = str(item.get("asset") or "").upper()
@@ -1873,12 +1933,37 @@ def sync_binance_account(
     if account.account_type != "crypto" or account.nature != "asset":
         raise ValueError("只能把幣安連接到加密貨幣資產帳戶")
 
+    backoff_value = _get_setting_value(db, BINANCE_GLOBAL_BACKOFF_KEY)
+    if backoff_value:
+        try:
+            backoff_until = datetime.fromisoformat(backoff_value)
+            if datetime.utcnow() < backoff_until:
+                retry_label = backoff_until.replace(tzinfo=timezone.utc).astimezone(
+                    timezone(timedelta(hours=8))
+                ).strftime("%Y/%m/%d %H:%M")
+                return {
+                    "account_id": account.id,
+                    "account_name": account.name,
+                    "updated": False,
+                    "skipped": True,
+                    "last_sync_at": _get_setting_value(
+                        db, _binance_setting_key(account.id, "last_sync_at")
+                    ) or None,
+                    "positions": account_summary(db, account)["positions_count"],
+                    "warnings": [f"幣安限流暫停中，將於 {retry_label} 後自動重試"],
+                }
+            _set_setting_value(db, BINANCE_GLOBAL_BACKOFF_KEY, "")
+            db.commit()
+        except ValueError:
+            _set_setting_value(db, BINANCE_GLOBAL_BACKOFF_KEY, "")
+            db.commit()
+
     last_sync_key = _binance_setting_key(account.id, "last_sync_at")
     last_sync_value = _get_setting_value(db, last_sync_key)
     if not force and not api_key and last_sync_value:
         try:
             last_sync_at = datetime.fromisoformat(last_sync_value)
-            if datetime.utcnow() - last_sync_at < timedelta(minutes=15):
+            if datetime.utcnow() - last_sync_at < BINANCE_FULL_SYNC_INTERVAL:
                 return {
                     "account_id": account.id,
                     "account_name": account.name,
@@ -1899,6 +1984,18 @@ def sync_binance_account(
         api_key = decrypt_credential(encrypted_key)
         api_secret = decrypt_credential(encrypted_secret)
 
+    last_cost_sync_key = _binance_setting_key(account.id, "last_cost_sync_at")
+    last_cost_sync_value = _get_setting_value(db, last_cost_sync_key)
+    include_cost_details = not last_cost_sync_value
+    if last_cost_sync_value:
+        try:
+            include_cost_details = (
+                datetime.utcnow() - datetime.fromisoformat(last_cost_sync_value)
+                >= BINANCE_COST_SYNC_INTERVAL
+            )
+        except ValueError:
+            include_cost_details = True
+
     try:
         (
             balances,
@@ -1909,7 +2006,20 @@ def sync_binance_account(
             equity_trades,
             um_positions,
             wallet_warnings,
-        ) = _fetch_binance_spot_snapshot(api_key, api_secret or "")
+        ) = _fetch_binance_spot_snapshot(
+            api_key,
+            api_secret or "",
+            include_cost_details=include_cost_details,
+        )
+    except BinanceRateLimitError as exc:
+        db.rollback()
+        _set_setting_value(
+            db,
+            BINANCE_GLOBAL_BACKOFF_KEY,
+            exc.retry_at.isoformat(timespec="seconds"),
+        )
+        db.commit()
+        raise ValueError(str(exc)) from exc
     except ValueError:
         raise
     except httpx.HTTPError as exc:
@@ -2224,6 +2334,8 @@ def sync_binance_account(
     )
     synced_at = datetime.utcnow().isoformat(timespec="seconds")
     _set_setting_value(db, last_sync_key, synced_at)
+    if include_cost_details:
+        _set_setting_value(db, last_cost_sync_key, synced_at)
     _set_setting_value(
         db,
         _binance_setting_key(account.id, "position_ids"),
@@ -2240,6 +2352,7 @@ def sync_binance_account(
         "last_sync_at": synced_at,
         "positions": len(seen_position_ids),
         "warnings": warnings,
+        "costs_updated": include_cost_details,
     }
 
 
@@ -2403,11 +2516,20 @@ def _fetch_yahoo_daily_quote(
 
 def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
     positions = db.scalars(select(Position).where(Position.archived.is_(False))).all()
-    result = {"updated": 0, "skipped": 0, "warnings": [], "errors": []}
+    result = {
+        "updated": 0,
+        "skipped": 0,
+        "updated_items": [],
+        "cached_items": [],
+        "manual_items": [],
+        "warnings": [],
+        "errors": [],
+    }
     by_market: dict[str, list[Position]] = defaultdict(list)
     for position in positions:
         if position.manual_price is not None:
             result["skipped"] += 1
+            _record_market_result_item(result, "manual_items", position)
             continue
         latest = get_latest_price(db, position.market, position.symbol)
         cache_duration = timedelta(minutes=15) if position.market == "CRYPTO" else timedelta(hours=24)
@@ -2417,6 +2539,7 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
             and datetime.utcnow() - latest.updated_at < cache_duration
         ):
             result["skipped"] += 1
+            _record_market_result_item(result, "cached_items", position)
             continue
         by_market[position.market].append(position)
 
@@ -2447,6 +2570,7 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                         "TWSE",
                     )
                     result["updated"] += 1
+                    _record_market_result_item(result, "updated_items", position)
             except Exception as exc:
                 result["errors"].append(f"上市行情：{exc}")
 
@@ -2472,6 +2596,7 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                         "TPEX",
                     )
                     result["updated"] += 1
+                    _record_market_result_item(result, "updated_items", position)
             except Exception as exc:
                 result["errors"].append(f"上櫃行情：{exc}")
 
@@ -2493,6 +2618,7 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                         "Nasdaq",
                     )
                     result["updated"] += 1
+                    _record_market_result_item(result, "updated_items", position)
                     continue
                 except httpx.HTTPStatusError as exc:
                     nasdaq_failure = (
@@ -2534,6 +2660,7 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                                 "Alpha Vantage",
                             )
                             result["updated"] += 1
+                            _record_market_result_item(result, "updated_items", position)
                             result["warnings"].append(
                                 f"美股 {position.symbol}：{nasdaq_failure}，"
                                 f"已改用 Alpha Vantage {price_date.isoformat()} 的價格"
@@ -2563,6 +2690,7 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                         "Yahoo Finance",
                     )
                     result["updated"] += 1
+                    _record_market_result_item(result, "updated_items", position)
                     result["warnings"].append(
                         f"美股 {position.symbol}：{nasdaq_failure}；{alpha_failure}，"
                         f"已改用 Yahoo Finance {price_date.isoformat()} 的每日收盤價"
@@ -2605,6 +2733,7 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                     if not quote:
                         if _refresh_crypto_from_binance(client, db, position):
                             result["updated"] += 1
+                            _record_market_result_item(result, "updated_items", position)
                             continue
                         _reuse_cached_market_price(
                             db,
@@ -2631,10 +2760,12 @@ def refresh_market_prices(db: Session, force: bool = False) -> dict[str, Any]:
                         "CoinGecko",
                     )
                     result["updated"] += 1
+                    _record_market_result_item(result, "updated_items", position)
             except Exception:
                 for position in by_market["CRYPTO"]:
                     if _refresh_crypto_from_binance(client, db, position):
                         result["updated"] += 1
+                        _record_market_result_item(result, "updated_items", position)
                         continue
                     _reuse_cached_market_price(
                         db,

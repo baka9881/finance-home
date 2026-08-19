@@ -327,7 +327,9 @@ def run_automatic_updates() -> None:
             if not account:
                 continue
             try:
-                exchange_results.append(sync_binance_account(db, account))
+                # The scheduler itself runs hourly, so it may bypass the manual
+                # one-hour cooldown. Cost history still keeps its own daily limit.
+                exchange_results.append(sync_binance_account(db, account, force=True))
             except Exception as exc:
                 db.rollback()
                 errors.append(f"{account.name}：{exc}")

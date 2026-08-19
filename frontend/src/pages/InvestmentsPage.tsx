@@ -247,7 +247,15 @@ export default function InvestmentsPage() {
   }
 
   const refresh = useMutation({
-    mutationFn: () => api<{ updated: number; skipped: number; warnings?: string[]; errors: string[] }>("/market/refresh", { method: "POST" }),
+    mutationFn: () => api<{
+      updated: number;
+      skipped: number;
+      updated_items?: string[];
+      cached_items?: string[];
+      manual_items?: string[];
+      warnings?: string[];
+      errors: string[];
+    }>("/market/refresh?force=true", { method: "POST" }),
     onSuccess: (result) => {
       client.invalidateQueries({ queryKey: ["positions"] });
       client.invalidateQueries({ queryKey: ["dashboard"] });
@@ -256,8 +264,19 @@ export default function InvestmentsPage() {
         setRefreshMessage("目前行情已是最新，暫時不需要再次呼叫外部服務。");
         return;
       }
-      const summary = [`更新 ${result.updated} 筆`];
-      if (result.skipped > 0) summary.push(`沿用 ${result.skipped} 筆現有行情`);
+      const summary = [
+        result.updated_items?.length
+          ? `已更新：${result.updated_items.join("、")}`
+          : `更新 ${result.updated} 筆`,
+      ];
+      if (result.cached_items?.length) {
+        summary.push(`沿用舊價：${result.cached_items.join("、")}`);
+      } else if (result.skipped > 0 && !result.manual_items?.length) {
+        summary.push(`沿用 ${result.skipped} 筆現有行情`);
+      }
+      if (result.manual_items?.length) {
+        summary.push(`手動價格未更新：${result.manual_items.join("、")}`);
+      }
       if (warnings.length > 0) summary.push(warnings.join("、"));
       if (result.errors.length > 0) summary.push(`失敗 ${result.errors.length} 筆：${result.errors.join("、")}`);
       setRefreshMessage(`行情更新完成：${summary.join("、")}。`);

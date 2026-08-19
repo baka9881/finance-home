@@ -434,8 +434,8 @@ function FinanceApp() {
   }, [ownerFilter, queryClient]);
 
   useEffect(() => {
-    const syncExchanges = () => {
-      void api<{ updated: number }>("/exchanges/sync", { method: "POST" })
+    const refreshPrices = () => {
+      void api<{ updated: number }>("/market/refresh", { method: "POST" })
         .then((result) => {
           if (!result.updated) return;
           void queryClient.invalidateQueries({ queryKey: ["accounts"] });
@@ -444,11 +444,11 @@ function FinanceApp() {
         })
         .catch(() => undefined);
     };
-    const exchangeTimer = window.setTimeout(syncExchanges, 800);
-    const exchangeInterval = window.setInterval(syncExchanges, 15 * 60 * 1_000);
+    const marketTimer = window.setTimeout(refreshPrices, 800);
+    const marketInterval = window.setInterval(refreshPrices, 15 * 60 * 1_000);
     return () => {
-      window.clearTimeout(exchangeTimer);
-      window.clearInterval(exchangeInterval);
+      window.clearTimeout(marketTimer);
+      window.clearInterval(marketInterval);
     };
   }, [queryClient]);
 
