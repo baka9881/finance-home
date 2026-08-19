@@ -15,12 +15,14 @@ import {
   Wallet,
 } from "lucide-react";
 import { api } from "../api";
+import { taipeiDateInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
 import type { Account } from "../types";
 import {
   Badge,
   Button,
   Card,
+  DateInput,
   Dialog,
   EmptyState,
   Field,
@@ -507,7 +509,7 @@ export default function AccountsPage() {
             </Field>
           </div>
           <Field label="餘額日期">
-            <Input name="opening_date" type="date" defaultValue={new Date().toISOString().slice(0, 10)} />
+            <DateInput name="opening_date" defaultValue={taipeiDateInputValue()} />
           </Field>
           <Field label="所有人">
             <Select name="owner" defaultValue={ownerFilter === "all" ? "me" : ownerFilter}>
@@ -623,7 +625,7 @@ export default function AccountsPage() {
           </FormStep>
           <FormStep number={2} title="這筆餘額是哪一天的？" tone="blue">
             <Field label="快照日期">
-              <Input name="snapshot_date" type="date" defaultValue={new Date().toISOString().slice(0, 10)} required />
+              <DateInput name="snapshot_date" defaultValue={taipeiDateInputValue()} required />
             </Field>
           </FormStep>
           {balanceAccount?.currency !== "TWD" && (

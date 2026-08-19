@@ -16,12 +16,14 @@ import {
   Upload,
 } from "lucide-react";
 import { api } from "../api";
+import { taipeiDateInputValue, taipeiMonthInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
 import type { Account, Category, CsvInspection, Transaction } from "../types";
 import {
   Badge,
   Button,
   Card,
+  DateInput,
   Dialog,
   EmptyState,
   Field,
@@ -53,7 +55,7 @@ interface PendingCsvBalance {
   balance_after: number;
 }
 
-const currentMonth = new Date().toISOString().slice(0, 7);
+const currentMonth = taipeiMonthInputValue();
 const kindLabels: Record<string, string> = {
   income: "收入",
   expense: "支出",
@@ -118,6 +120,7 @@ export default function TransactionsPage() {
   const [accountFilter, setAccountFilter] = useState("");
   const [search, setSearch] = useState("");
   const [onlyUnclassified, setOnlyUnclassified] = useState(false);
+  const [showTransfers, setShowTransfers] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
   const [manualScenario, setManualScenario] = useState<ManualScenario | null>(null);
   const [manualKind, setManualKind] = useState("expense");
@@ -215,6 +218,9 @@ export default function TransactionsPage() {
   const filteredTransactions = useMemo(() => {
     const query = search.trim().toLowerCase();
     let rows = transactions.data || [];
+    if (!showTransfers) {
+      rows = rows.filter((transaction) => transaction.transaction_kind !== "transfer");
+    }
     if (query) {
       rows = rows.filter(
         (item) =>
@@ -227,7 +233,7 @@ export default function TransactionsPage() {
       rows = rows.filter((transaction) => transaction.category_name === "未分類");
     }
     return rows;
-  }, [transactions.data, search, onlyUnclassified]);
+  }, [transactions.data, search, onlyUnclassified, showTransfers]);
   const importMappingReady = Boolean(
     mapping.date && mapping.description && (mapping.amount || mapping.debit || mapping.credit),
   );
@@ -236,7 +242,10 @@ export default function TransactionsPage() {
     [accounts.data, mapping.account_id],
   );
   const unclassifiedCount = (transactions.data || []).filter(
-    (transaction) => transaction.category_name === "未分類",
+    (transaction) => transaction.transaction_kind !== "transfer" && transaction.category_name === "未分類",
+  ).length;
+  const transferCount = (transactions.data || []).filter(
+    (transaction) => transaction.transaction_kind === "transfer",
   ).length;
 
   const createTransaction = useMutation({
@@ -567,6 +576,15 @@ export default function TransactionsPage() {
           共 <strong className="text-slate-800">{filteredTransactions.length}</strong> 筆交易
         </p>
         <div className="flex flex-wrap gap-2">
+          {transferCount > 0 && (
+            <Button
+              variant="ghost"
+              onClick={() => setShowTransfers((current) => !current)}
+            >
+              <ArrowRightLeft size={16} />
+              {showTransfers ? "隱藏帳戶互轉" : `顯示帳戶互轉（${transferCount}）`}
+            </Button>
+          )}
           {unclassifiedCount > 0 && (
             <Button
               variant="ghost"
@@ -612,15 +630,25 @@ export default function TransactionsPage() {
         {!filteredTransactions.length ? (
           <EmptyState
             icon={<ArrowRightLeft size={25} />}
-            title={onlyUnclassified ? "這個月份沒有未分類交易" : "這個月份沒有交易"}
+            title={
+              onlyUnclassified
+                ? "這個月份沒有未分類交易"
+                : !showTransfers && transferCount > 0 && !search.trim()
+                    ? "帳戶互轉已隱藏"
+                    : "這個月份沒有交易"
+            }
             description={
               onlyUnclassified
                 ? "目前顯示範圍內的交易都已完成分類。"
+                : !showTransfers && transferCount > 0 && !search.trim()
+                    ? "自己的帳戶之間移動資金不算收入或支出，因此預設不顯示。"
                 : "你可以手動新增交易，或匯入銀行與信用卡提供的 CSV 明細。"
             }
             action={
               onlyUnclassified
                 ? <Button onClick={() => setOnlyUnclassified(false)}>顯示全部交易</Button>
+                : !showTransfers && transferCount > 0 && !search.trim()
+                    ? <Button variant="secondary" onClick={() => setShowTransfers(true)}>查看帳戶互轉</Button>
                 : <Button onClick={() => setImportOpen(true)}>匯入交易</Button>
             }
           />
@@ -899,7 +927,7 @@ export default function TransactionsPage() {
                   </Select>
                 </Field>
                 <Field label="日期">
-                  <Input name="transaction_date" type="date" defaultValue={new Date().toISOString().slice(0, 10)} required />
+                  <DateInput name="transaction_date" defaultValue={taipeiDateInputValue()} required />
                 </Field>
               </div>
             </FormStep>
@@ -1079,7 +1107,7 @@ export default function TransactionsPage() {
           <FormStep number={2} title="這次轉多少？" tone="blue">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="轉帳日期">
-              <Input name="transfer_date" type="date" defaultValue={new Date().toISOString().slice(0, 10)} required />
+              <DateInput name="transfer_date" defaultValue={taipeiDateInputValue()} required />
             </Field>
             <Field label={`轉出金額${transferFromAccount ? `（${transferFromAccount.currency}）` : ""}`}>
               <Input name="amount" type="number" inputMode="decimal" min="0" step="any" placeholder="0" required />

@@ -14,6 +14,7 @@ export function setAuthToken(token: string) {
 }
 
 export function clearAuthToken() {
+  if (!localStorage.getItem(AUTH_TOKEN_KEY)) return;
   localStorage.removeItem(AUTH_TOKEN_KEY);
   window.dispatchEvent(new Event("finance:auth-changed"));
 }

@@ -29,6 +29,7 @@ import {
   YAxis,
 } from "recharts";
 import { api } from "../api";
+import { taipeiMonthInputValue } from "../date";
 import { ownerFilterLabels, useOwnerFilter } from "../ownerFilter";
 import type { Account, Category, Dashboard, HealthScore, SpendingAnalysis } from "../types";
 import { Badge, Button, Card, Dialog, EmptyState, Field, FormStep, Input, MonthInput, PageHeader, Select, money, number } from "../ui";
@@ -60,11 +61,6 @@ function emptyRecurringDraft(ownerFilter: string): RecurringDraft {
     owner: ownerFilter === "all" ? "me" : ownerFilter,
     note: "",
   };
-}
-
-function currentMonth() {
-  const today = new Date();
-  return `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, "0")}`;
 }
 
 function displayMonth(value: string) {
@@ -105,7 +101,7 @@ function indicatorState(key: string, value: number | null) {
 export default function AnalysisPage() {
   const client = useQueryClient();
   const [ownerFilter] = useOwnerFilter();
-  const [selectedMonth, setSelectedMonth] = useState(currentMonth);
+  const [selectedMonth, setSelectedMonth] = useState(taipeiMonthInputValue);
   const [recurringOpen, setRecurringOpen] = useState(false);
   const [editingRecurringId, setEditingRecurringId] = useState<number | null>(null);
   const [recurringDraft, setRecurringDraft] = useState<RecurringDraft>(() => emptyRecurringDraft("me"));
@@ -273,7 +269,7 @@ export default function AnalysisPage() {
                   <MonthInput
                     className="w-full sm:w-44"
                     value={selectedMonth}
-                    onChange={(event) => setSelectedMonth(event.target.value || currentMonth())}
+                    onChange={(event) => setSelectedMonth(event.target.value || taipeiMonthInputValue())}
                   />
                 </label>
                 <div className="rounded-xl bg-slate-50 px-4 py-2.5 sm:min-w-32 sm:text-right">

@@ -1,4 +1,5 @@
 import {
+  useState,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
   type ReactNode,
@@ -68,6 +69,49 @@ export function Input({
   );
 }
 
+export function DateInput({
+  className,
+  value,
+  defaultValue,
+  disabled,
+  onChange,
+  ...props
+}: Omit<InputHTMLAttributes<HTMLInputElement>, "type">) {
+  const initialValue = typeof defaultValue === "string" ? defaultValue : "";
+  const [uncontrolledValue, setUncontrolledValue] = useState(initialValue);
+  const rawValue = typeof value === "string" ? value : uncontrolledValue;
+  const [year, month, day] = rawValue.split("-");
+  const displayValue = year && month && day
+    ? `${year}年${Number(month)}月${Number(day)}日`
+    : "選擇日期";
+
+  return (
+    <div
+      className={cn(
+        "relative flex h-11 min-w-0 w-full max-w-full cursor-pointer items-center overflow-hidden rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none transition focus-within:border-emerald-500 focus-within:ring-4 focus-within:ring-emerald-500/10",
+        disabled && "cursor-not-allowed opacity-50",
+        className,
+      )}
+    >
+      <span className="min-w-0 flex-1 truncate">{displayValue}</span>
+      <CalendarDays className="ml-3 shrink-0 text-slate-500" size={16} aria-hidden="true" />
+      <input
+        className="absolute inset-0 block h-full min-h-0 w-full min-w-0 max-w-full cursor-pointer opacity-0 disabled:cursor-not-allowed"
+        type="date"
+        value={value}
+        defaultValue={defaultValue}
+        disabled={disabled}
+        aria-label={props["aria-label"] || "選擇日期"}
+        onChange={(event) => {
+          if (value === undefined) setUncontrolledValue(event.target.value);
+          onChange?.(event);
+        }}
+        {...props}
+      />
+    </div>
+  );
+}
+
 export function MonthInput({
   className,
   value,
@@ -81,7 +125,7 @@ export function MonthInput({
     : "選擇月份";
 
   return (
-    <label
+    <div
       className={cn(
         "relative flex h-11 min-w-0 w-full max-w-full cursor-pointer items-center overflow-hidden rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none transition focus-within:border-emerald-500 focus-within:ring-4 focus-within:ring-emerald-500/10",
         disabled && "cursor-not-allowed opacity-50",
@@ -98,7 +142,7 @@ export function MonthInput({
         aria-label={props["aria-label"] || "選擇月份"}
         {...props}
       />
-    </label>
+    </div>
   );
 }
 
@@ -127,7 +171,7 @@ export function Field({
   hint?: string;
 }) {
   return (
-    <label className="block space-y-2">
+    <label className="block min-w-0 max-w-full space-y-2">
       <span className="text-sm font-medium text-slate-700">{label}</span>
       {children}
       {hint && <span className="block text-xs text-slate-400">{hint}</span>}
@@ -154,7 +198,7 @@ export function FormStep({
     purple: "bg-purple-100 text-purple-700",
   };
   return (
-    <section className="space-y-4 rounded-2xl border border-slate-200 p-4 sm:p-5">
+    <section className="min-w-0 max-w-full space-y-4 rounded-2xl border border-slate-200 p-4 sm:p-5">
       <div className="flex items-start gap-3">
         <span className={cn("flex size-7 shrink-0 items-center justify-center rounded-full text-sm font-bold", tones[tone])}>
           {number}

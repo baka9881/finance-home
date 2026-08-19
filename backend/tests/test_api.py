@@ -782,6 +782,30 @@ def test_transfer_does_not_pollute_cashflow(client: TestClient):
     assert dashboard["month_expense"] == 0
 
 
+def test_account_transfer_is_not_treated_as_unclassified_expense(client: TestClient):
+    source = create_account(client, "家中現金")
+    target = create_account(client, "生活費帳戶")
+    response = client.post(
+        "/api/account-transfers",
+        json={
+            "from_account_id": source,
+            "to_account_id": target,
+            "transfer_date": date.today().isoformat(),
+            "amount": 1000,
+            "description": "帳戶轉帳",
+        },
+    )
+    assert response.status_code == 201, response.text
+
+    result = client.post("/api/transactions/reclassify")
+    assert result.status_code == 200, result.text
+    assert result.json() == {"updated": 0, "remaining": 0}
+
+    rows = client.get("/api/transactions").json()
+    assert len(rows) == 2
+    assert all(row["transaction_kind"] == "transfer" for row in rows)
+
+
 def test_csv_import_big5_and_duplicate_detection(client: TestClient):
     account_id = create_account(client, "CSV 帳戶")
     csv_text = "日期,摘要,支出,收入,餘額\n115/07/01,早餐,80,,99920\n115/07/02,薪資,,30000,129920\n"

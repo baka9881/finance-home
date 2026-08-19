@@ -267,7 +267,8 @@ def reclassify_uncategorized_transactions(db: Session, owner: str = "all") -> di
         return {"updated": 0, "remaining": 0}
 
     query = select(Transaction).where(
-        or_(Transaction.category_id.is_(None), Transaction.category_id == uncategorized.id)
+        or_(Transaction.category_id.is_(None), Transaction.category_id == uncategorized.id),
+        Transaction.transaction_kind.notin_(["transfer", "investment", "debt_principal"]),
     )
     if owner != "all":
         query = query.join(Account).where(Account.owner == owner)
@@ -285,7 +286,8 @@ def reclassify_uncategorized_transactions(db: Session, owner: str = "all") -> di
         db.commit()
 
     remaining_query = select(func.count(Transaction.id)).where(
-        or_(Transaction.category_id.is_(None), Transaction.category_id == uncategorized.id)
+        or_(Transaction.category_id.is_(None), Transaction.category_id == uncategorized.id),
+        Transaction.transaction_kind.notin_(["transfer", "investment", "debt_principal"]),
     )
     if owner != "all":
         remaining_query = remaining_query.join(Account).where(Account.owner == owner)

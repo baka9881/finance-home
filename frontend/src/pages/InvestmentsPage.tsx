@@ -13,12 +13,14 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { api } from "../api";
+import { taipeiDateInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
 import type { Account, Position } from "../types";
 import {
   Badge,
   Button,
   Card,
+  DateInput,
   Dialog,
   EmptyState,
   Field,
@@ -955,7 +957,7 @@ export default function InvestmentsPage() {
             <summary className="cursor-pointer list-none text-sm font-medium text-slate-600">其他設定（日期、手動價格）</summary>
             <div className="mt-4 grid gap-4 sm:grid-cols-2">
               <Field label="交易日期">
-                <Input name="trade_date" type="date" defaultValue={new Date().toISOString().slice(0, 10)} required />
+                <DateInput name="trade_date" defaultValue={taipeiDateInputValue()} required />
               </Field>
               <Field label="手動價格" hint="選填；填寫後會用這個價格估值。">
                 <Input name="manual_price" type="number" step="any" min="0" placeholder="選填" />

@@ -1,14 +1,10 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { api } from "./api";
+import { taipeiMonthInputValue } from "./date";
 import type { Account, Category, Dashboard, Goal, HealthScore, Position, Transaction } from "./types";
 
 export const APP_QUERY_STALE_TIME = 5 * 60_000;
 export const APP_QUERY_GC_TIME = 30 * 60_000;
-
-function currentMonth() {
-  const now = new Date();
-  return `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}`;
-}
 
 export function preloadPageModules() {
   return Promise.allSettled([
@@ -22,7 +18,7 @@ export function preloadPageModules() {
 }
 
 export function prefetchPrimaryData(client: QueryClient, owner: string) {
-  const month = currentMonth();
+  const month = taipeiMonthInputValue();
   return Promise.allSettled([
     client.prefetchQuery({
       queryKey: ["dashboard", owner],

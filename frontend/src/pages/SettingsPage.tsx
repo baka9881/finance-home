@@ -16,6 +16,7 @@ import {
   Upload,
 } from "lucide-react";
 import { api } from "../api";
+import { taipeiDateInputValue } from "../date";
 import { type AppTheme, getStoredTheme, saveTheme } from "../theme";
 import type { Category } from "../types";
 import {
@@ -23,6 +24,7 @@ import {
   Button,
   Card,
   cn,
+  DateInput,
   FormStep,
   Input,
   PageHeader,
@@ -219,7 +221,7 @@ export default function SettingsPage() {
     const href = URL.createObjectURL(blob);
     const link = document.createElement("a");
     link.href = href;
-    link.download = `finance-backup-${new Date().toISOString().slice(0, 10)}.json`;
+    link.download = `finance-backup-${taipeiDateInputValue()}.json`;
     link.click();
     URL.revokeObjectURL(href);
     const backupTime = new Date().toLocaleString("zh-TW", { hour12: false });
@@ -671,7 +673,7 @@ export default function SettingsPage() {
                       </Select>
                     </FormStep>
                     <FormStep number={2} title="匯率是哪一天的？" tone="blue">
-                      <Input name="rate_date" type="date" defaultValue={new Date().toISOString().slice(0, 10)} />
+                      <DateInput name="rate_date" defaultValue={taipeiDateInputValue()} />
                     </FormStep>
                     <FormStep number={3} title="1 單位可以換多少台幣？" tone="purple">
                       <Input name="rate_to_twd" type="number" min="0.000001" step="any" placeholder="例如：32.5" required />

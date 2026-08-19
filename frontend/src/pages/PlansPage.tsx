@@ -8,6 +8,7 @@ import {
   Badge,
   Button,
   Card,
+  DateInput,
   Dialog,
   EmptyState,
   Field,
@@ -255,7 +256,7 @@ export default function PlansPage() {
           </FormStep>
           <FormStep number={3} title="希望什麼時候完成？" description="沒有期限也可以先留空。" tone="purple">
             <Field label="目標日期">
-              <Input name="target_date" type="date" />
+              <DateInput name="target_date" />
             </Field>
           </FormStep>
           <details className="rounded-2xl border border-slate-200 px-4 py-3">

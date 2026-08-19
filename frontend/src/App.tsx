@@ -21,7 +21,7 @@ import {
 } from "lucide-react";
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { api, AUTH_REQUIRED, clearAuthToken, getAuthToken, setAuthToken } from "./api";
+import { api, ApiError, AUTH_REQUIRED, clearAuthToken, getAuthToken, setAuthToken } from "./api";
 import { prefetchPrimaryData, prefetchSecondaryData, preloadPageModules } from "./appQueries";
 import { ownerFilterOptions, useOwnerFilter } from "./ownerFilter";
 import { Button, cn, Input, Select } from "./ui";
@@ -397,6 +397,17 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
   );
 }
 
+function AuthCheckingScreen() {
+  return (
+    <div className="grid min-h-screen place-items-center bg-canvas px-4">
+      <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm text-slate-600 shadow-card">
+        <RefreshCw className="animate-spin text-forest" size={18} />
+        正在確認登入狀態…
+      </div>
+    </div>
+  );
+}
+
 function FinanceApp() {
   const [compact, setCompact] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -492,14 +503,60 @@ function FinanceApp() {
 }
 
 export default function App() {
-  const [authenticated, setAuthenticated] = useState(!AUTH_REQUIRED || Boolean(getAuthToken()));
+  const queryClient = useQueryClient();
+  const [authState, setAuthState] = useState<"checking" | "authenticated" | "anonymous">(
+    !AUTH_REQUIRED ? "authenticated" : getAuthToken() ? "checking" : "anonymous",
+  );
 
   useEffect(() => {
-    const syncAuth = () => setAuthenticated(!AUTH_REQUIRED || Boolean(getAuthToken()));
-    window.addEventListener("finance:auth-changed", syncAuth);
-    return () => window.removeEventListener("finance:auth-changed", syncAuth);
-  }, []);
+    let validationSequence = 0;
 
-  if (!authenticated) return <LoginScreen onSuccess={() => setAuthenticated(true)} />;
+    const syncAuth = () => {
+      const sequence = ++validationSequence;
+      if (!AUTH_REQUIRED) {
+        setAuthState("authenticated");
+        return;
+      }
+
+      if (!getAuthToken()) {
+        queryClient.clear();
+        setAuthState("anonymous");
+        return;
+      }
+
+      setAuthState("checking");
+      void api<{ authenticated: boolean }>("/auth/status")
+        .then((result) => {
+          if (sequence !== validationSequence) return;
+          if (result.authenticated) {
+            setAuthState("authenticated");
+            return;
+          }
+          clearAuthToken();
+        })
+        .catch((cause) => {
+          if (sequence !== validationSequence) return;
+          if (cause instanceof ApiError && cause.status === 401) {
+            clearAuthToken();
+            return;
+          }
+          // A temporary network outage is not the same as an expired login.
+          // Keep the current session so pages can show their normal retry state.
+          setAuthState("authenticated");
+        });
+    };
+
+    window.addEventListener("finance:auth-changed", syncAuth);
+    syncAuth();
+    return () => {
+      validationSequence += 1;
+      window.removeEventListener("finance:auth-changed", syncAuth);
+    };
+  }, [queryClient]);
+
+  if (authState === "checking") return <AuthCheckingScreen />;
+  if (authState === "anonymous") {
+    return <LoginScreen onSuccess={() => setAuthState("authenticated")} />;
+  }
   return <FinanceApp />;
 }
