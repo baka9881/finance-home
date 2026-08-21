@@ -1,4 +1,7 @@
 import {
+  useEffect,
+  useId,
+  useRef,
   useState,
   type ButtonHTMLAttributes,
   type InputHTMLAttributes,
@@ -248,15 +251,71 @@ export function Dialog({
   onClose: () => void;
   size?: "md" | "lg" | "xl";
 }) {
+  const dialogRef = useRef<HTMLDivElement>(null);
+  const titleId = useId();
+  const descriptionId = useId();
+  const onCloseRef = useRef(onClose);
+
+  useEffect(() => {
+    onCloseRef.current = onClose;
+  }, [onClose]);
+
+  useEffect(() => {
+    if (!open) return;
+    const previousFocus = document.activeElement instanceof HTMLElement ? document.activeElement : null;
+    const previousOverflow = document.body.style.overflow;
+    document.body.style.overflow = "hidden";
+    dialogRef.current?.focus();
+
+    function handleKeyDown(event: KeyboardEvent) {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        onCloseRef.current();
+        return;
+      }
+      if (event.key !== "Tab" || !dialogRef.current) return;
+      const focusable = Array.from(
+        dialogRef.current.querySelectorAll<HTMLElement>(
+          'button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [href], [tabindex]:not([tabindex="-1"])',
+        ),
+      );
+      if (!focusable.length) return;
+      const first = focusable[0];
+      const last = focusable[focusable.length - 1];
+      if (event.shiftKey && document.activeElement === first) {
+        event.preventDefault();
+        last.focus();
+      } else if (!event.shiftKey && document.activeElement === last) {
+        event.preventDefault();
+        first.focus();
+      }
+    }
+
+    document.addEventListener("keydown", handleKeyDown);
+    return () => {
+      document.removeEventListener("keydown", handleKeyDown);
+      document.body.style.overflow = previousOverflow;
+      previousFocus?.focus();
+    };
+  }, [open]);
+
   if (!open) return null;
   const widths = { md: "max-w-lg", lg: "max-w-2xl", xl: "max-w-5xl" };
   return (
     <div className="fixed inset-0 z-50 flex items-center justify-center bg-slate-950/45 p-0 backdrop-blur-sm sm:p-4">
-      <div className={cn("flex h-[100dvh] max-h-[100dvh] w-full flex-col overflow-hidden rounded-none bg-white shadow-2xl sm:h-auto sm:max-h-[92vh] sm:rounded-3xl", widths[size])}>
+      <div
+        ref={dialogRef}
+        role="dialog"
+        aria-modal="true"
+        aria-labelledby={titleId}
+        aria-describedby={description ? descriptionId : undefined}
+        tabIndex={-1}
+        className={cn("flex h-[100dvh] max-h-[100dvh] w-full flex-col overflow-hidden rounded-none bg-white shadow-2xl outline-none sm:h-auto sm:max-h-[92vh] sm:rounded-3xl", widths[size])}
+      >
         <div className="z-10 flex shrink-0 items-start justify-between border-b border-slate-100 bg-white/95 px-4 py-4 backdrop-blur sm:px-6 sm:py-5">
           <div>
-            <h2 className="text-xl font-bold text-ink">{title}</h2>
-            {description && <p className="mt-1 text-sm text-slate-500">{description}</p>}
+            <h2 id={titleId} className="text-xl font-bold text-ink">{title}</h2>
+            {description && <p id={descriptionId} className="mt-1 text-sm text-slate-500">{description}</p>}
           </div>
           <button
             onClick={onClose}
@@ -270,6 +329,10 @@ export function Dialog({
       </div>
     </div>
   );
+}
+
+export function Skeleton({ className }: { className?: string }) {
+  return <div aria-hidden="true" className={cn("animate-pulse rounded-xl bg-slate-200/70", className)} />;
 }
 
 export function MobileWizardProgress({
@@ -336,6 +399,7 @@ export function MobileWizardActions({
   onCancel,
   submitLabel,
   pending = false,
+  submitDisabled = false,
 }: {
   current: number;
   total: number;
@@ -344,6 +408,7 @@ export function MobileWizardActions({
   onCancel: () => void;
   submitLabel: string;
   pending?: boolean;
+  submitDisabled?: boolean;
 }) {
   return (
     <>
@@ -356,12 +421,12 @@ export function MobileWizardActions({
             下一步 <ChevronRight size={16} />
           </Button>
         ) : (
-          <Button type="submit" className="flex-1" disabled={pending}>{submitLabel}</Button>
+          <Button type="submit" className="flex-1" disabled={pending || submitDisabled}>{submitLabel}</Button>
         )}
       </div>
       <div className="hidden justify-end gap-3 pt-2 sm:flex">
         <Button type="button" variant="ghost" onClick={onCancel}>取消</Button>
-        <Button type="submit" disabled={pending}>{submitLabel}</Button>
+        <Button type="submit" disabled={pending || submitDisabled}>{submitLabel}</Button>
       </div>
     </>
   );

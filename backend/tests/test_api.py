@@ -1188,6 +1188,25 @@ def test_spending_analysis_supports_months_and_recurring_expenses(client: TestCl
     assert matching[0]["average_amount"] == 1099
     assert updated_payload["estimated_recurring_total"] == 6599
 
+    ignored = client.post(
+        "/api/recurring-expenses/ignore-detected",
+        json={"account_id": account, "name": "貸款還款"},
+    )
+    assert ignored.status_code == 201, ignored.text
+    ignored_again = client.post(
+        "/api/recurring-expenses/ignore-detected",
+        json={"account_id": account, "name": "貸款還款"},
+    )
+    assert ignored_again.status_code == 201, ignored_again.text
+    after_ignore = client.get(
+        f"/api/analysis/spending?month={month}&owner=me"
+    ).json()
+    assert all(
+        item["name"] != "貸款還款"
+        for item in after_ignore["recurring_expenses"]
+    )
+    assert after_ignore["estimated_recurring_total"] == 1099
+
     assert client.get("/api/analysis/spending?month=not-a-month").status_code == 422
 
 
@@ -1236,3 +1255,80 @@ def test_custom_recurring_expense_crud_and_analysis_override(client: TestClient)
     deleted = client.delete(f"/api/recurring-expenses/{expense_id}")
     assert deleted.status_code == 200
     assert client.get("/api/recurring-expenses?owner=me").json() == []
+
+
+def test_classification_rules_can_be_filtered_and_edited(client: TestClient):
+    rules = client.get("/api/rules")
+    assert rules.status_code == 200
+    assert any(item["is_default"] for item in rules.json())
+
+    categories = client.get("/api/categories").json()
+    shopping = next(item for item in categories if item["name"] == "購物")
+    created = client.post(
+        "/api/rules",
+        json={
+            "keyword": "測試商店",
+            "category_id": shopping["id"],
+            "transaction_kind": "expense",
+            "priority": 100,
+        },
+    )
+    assert created.status_code == 200, created.text
+    rule_id = created.json()["id"]
+
+    updated = client.patch(
+        f"/api/rules/{rule_id}",
+        json={"keyword": "測試網路商店", "enabled": True},
+    )
+    assert updated.status_code == 200, updated.text
+    row = next(item for item in client.get("/api/rules").json() if item["id"] == rule_id)
+    assert row["keyword"] == "測試網路商店"
+    assert row["is_default"] is False
+
+    assert client.delete(f"/api/rules/{rule_id}").status_code == 200
+
+
+def test_credit_card_email_rule_crud_is_scoped_and_hides_pdf_password(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "email-rule-test-secret")
+    payment_account = create_account(client, "生活費帳戶")
+    card_account = create_account(client, "國泰信用卡", "liability")
+
+    missing_filter = client.post(
+        "/api/email/card-rules",
+        json={
+            "name": "國泰信用卡",
+            "card_account_id": card_account,
+            "payment_account_id": payment_account,
+        },
+    )
+    assert missing_filter.status_code == 422
+
+    created = client.post(
+        "/api/email/card-rules",
+        json={
+            "name": "國泰信用卡",
+            "owner": "partner",
+            "card_account_id": card_account,
+            "payment_account_id": payment_account,
+            "sender_pattern": "cathaybk.com.tw",
+            "subject_pattern": "信用卡",
+            "card_last4": "1234",
+            "auto_pay": True,
+            "statement_password": "A123456789",
+        },
+    )
+    assert created.status_code == 201, created.text
+    rule = created.json()
+    assert rule["owner"] == "me"
+    assert rule["statement_password_configured"] is True
+    assert "statement_password" not in rule
+
+    listed = client.get("/api/email/card-rules")
+    assert listed.status_code == 200
+    assert listed.json()[0]["sender_pattern"] == "cathaybk.com.tw"
+
+    deactivated = client.delete(f"/api/email/card-rules/{rule['id']}")
+    assert deactivated.status_code == 200
+    assert client.get("/api/email/card-rules").json()[0]["active"] is False

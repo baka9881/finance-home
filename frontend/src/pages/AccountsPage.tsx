@@ -15,7 +15,7 @@ import {
   Wallet,
 } from "lucide-react";
 import { api } from "../api";
-import { taipeiDateInputValue } from "../date";
+import { daysBetweenDateValues, taipeiDateInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
 import type { Account } from "../types";
 import {
@@ -169,8 +169,21 @@ export default function AccountsPage() {
   const accountFormRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
-    if (searchParams.get("quick") !== "balance") return;
-    setBalancePickerOpen(true);
+    const quickAction = searchParams.get("quick");
+    if (quickAction === "balance") {
+      setBalancePickerOpen(true);
+    } else if (quickAction === "loan") {
+      setAccountType("loan");
+      setNature("liability");
+      setInstitutionChoice("");
+      setCustomInstitution("");
+      setAccountName("貸款");
+      setUseCustomAccountName(false);
+      setAccountStep(1);
+      setCreateOpen(true);
+    } else {
+      return;
+    }
     const nextParams = new URLSearchParams(searchParams);
     nextParams.delete("quick");
     setSearchParams(nextParams, { replace: true });
@@ -743,6 +756,8 @@ function AccountGroup({
       <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
         {accounts.map((account) => {
           const Icon = iconFor(account.account_type);
+          const staleDays = daysBetweenDateValues(account.balance_date);
+          const snapshotIsStale = staleDays !== null && staleDays >= 7;
           return (
             <Card key={account.id} className="overflow-hidden">
               <div className="p-5">
@@ -771,9 +786,13 @@ function AccountGroup({
                     {money(Math.abs(account.total_twd))}
                   </p>
                 </div>
-                <div className="mt-6 flex items-center justify-between text-xs text-slate-400">
+                <div className="mt-6 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
                   <span>快照 {account.balance_date || "尚未建立"}</span>
-                  {account.is_liquid && <Badge tone="blue">流動資產</Badge>}
+                  <div className="flex flex-wrap items-center gap-2">
+                    {!account.balance_date && <Badge tone="amber">尚未更新</Badge>}
+                    {snapshotIsStale && <Badge tone="amber">{staleDays} 天未更新</Badge>}
+                    {account.is_liquid && <Badge tone="blue">流動資產</Badge>}
+                  </div>
                 </div>
               </div>
               <div className="flex border-t border-slate-100 bg-slate-50/60 p-2">

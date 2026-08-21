@@ -34,8 +34,12 @@ from .database import (
     Budget,
     Category,
     ClassificationRule,
+    CreditCardBill,
+    EmailCardRule,
+    EmailImportRecord,
     FxRate,
     Goal,
+    IgnoredRecurringExpense,
     Position,
     PriceSnapshot,
     RecurringExpense,
@@ -658,6 +662,10 @@ def _recurring_display_name(description: str) -> str:
     return re.sub(r"\s+", " ", normalized).strip()
 
 
+def recurring_expense_signature(description: str) -> str:
+    return _recurring_display_name(description).casefold()
+
+
 def calculate_spending_analysis(
     db: Session, month: str, owner: str = "all"
 ) -> dict[str, Any]:
@@ -703,7 +711,7 @@ def calculate_spending_analysis(
         display_name = _recurring_display_name(row.description)
         if not display_name:
             continue
-        key = (row.account_id, display_name.casefold())
+        key = (row.account_id, recurring_expense_signature(display_name))
         group = groups.setdefault(
             key,
             {
@@ -762,27 +770,37 @@ def calculate_spending_analysis(
         custom_query = custom_query.where(RecurringExpense.owner == owner)
     custom_rows = db.scalars(custom_query.order_by(RecurringExpense.id)).all()
 
+    ignored_keys = {
+        (row.account_id, row.normalized_name)
+        for row in db.scalars(select(IgnoredRecurringExpense)).all()
+    }
+    recurring_expenses = [
+        item
+        for item in recurring_expenses
+        if (item.get("account_id"), recurring_expense_signature(item["name"]))
+        not in ignored_keys
+    ]
+
     custom_keys = {
-        (row.account_id, _recurring_display_name(row.name).casefold())
+        (row.account_id, recurring_expense_signature(row.name))
         for row in custom_rows
     }
     recurring_expenses = [
         item
         for item in recurring_expenses
-        if (item.get("account_id"), _recurring_display_name(item["name"]).casefold())
+        if (item.get("account_id"), recurring_expense_signature(item["name"]))
         not in custom_keys
-        and (None, _recurring_display_name(item["name"]).casefold())
+        and (None, recurring_expense_signature(item["name"]))
         not in custom_keys
     ]
 
     for row in custom_rows:
-        normalized_name = _recurring_display_name(row.name).casefold()
+        normalized_name = recurring_expense_signature(row.name)
         matching_rows = [
             transaction
             for transaction in month_rows
             if (row.account_id is None or transaction.account_id == row.account_id)
-            and _recurring_display_name(transaction.description).casefold()
-            == normalized_name
+            and recurring_expense_signature(transaction.description) == normalized_name
         ]
         current_amount = sum(
             (abs(decimal_value(transaction.base_amount)) for transaction in matching_rows),
@@ -1187,6 +1205,13 @@ def import_csv(
         transaction.fingerprint: transaction
         for transaction in db.scalars(select(Transaction)).all()
     }
+    email_autopay_candidates = db.scalars(
+        select(Transaction).where(
+            Transaction.account_id == account.id,
+            Transaction.source == "gmail_autopay",
+            Transaction.transaction_kind == "transfer",
+        )
+    ).all()
     balance_candidates: dict[str, Transaction] = {}
 
     for index, row in frame.iterrows():
@@ -1208,6 +1233,17 @@ def import_csv(
             category_id, kind = classify_transaction(db, description, amount)
             fingerprint = transaction_fingerprint(account.id, tx_date, amount, description)
             existing_transaction = existing_by_fingerprint.get(fingerprint)
+            if existing_transaction is None:
+                existing_transaction = next(
+                    (
+                        candidate
+                        for candidate in email_autopay_candidates
+                        if candidate.currency == currency
+                        and decimal_value(candidate.amount) == amount
+                        and abs((candidate.transaction_date - tx_date).days) <= 3
+                    ),
+                    None,
+                )
             is_duplicate = existing_transaction is not None
             if is_duplicate:
                 duplicates += 1
@@ -2953,28 +2989,39 @@ def serialize_model(row: Any) -> dict[str, Any]:
 BACKUP_MODELS = [
     Category,
     Account,
+    EmailCardRule,
     BalanceSnapshot,
     Transaction,
     ClassificationRule,
     TransferLink,
+    EmailImportRecord,
+    CreditCardBill,
     Position,
     PriceSnapshot,
     FxRate,
     Budget,
     Goal,
     RecurringExpense,
+    IgnoredRecurringExpense,
     ValuationSnapshot,
 ]
 
 
 def export_backup(db: Session) -> dict[str, Any]:
+    def backup_row(row: Any) -> dict[str, Any]:
+        serialized = serialize_model(row)
+        if isinstance(row, EmailCardRule):
+            # PDF passwords and Gmail OAuth credentials never leave the server backup.
+            serialized["statement_password"] = None
+        return serialized
+
     return {
         "version": 1,
         "exported_at": datetime.now().isoformat(),
         "mode": APP_MODE,
         "data": {
             model.__tablename__: [
-                serialize_model(row) for row in db.scalars(select(model)).all()
+                backup_row(row) for row in db.scalars(select(model)).all()
             ]
             for model in BACKUP_MODELS
         },

@@ -22,3 +22,13 @@ services:
         sync: false
       - key: FINANCE_ALLOWED_ORIGINS
         sync: false
+      - key: FINANCE_CREDENTIAL_SECRET
+        sync: false
+      - key: FINANCE_GOOGLE_CLIENT_ID
+        sync: false
+      - key: FINANCE_GOOGLE_CLIENT_SECRET
+        sync: false
+      - key: FINANCE_GOOGLE_REDIRECT_URI
+        sync: false
+      - key: FINANCE_FRONTEND_URL
+        sync: false

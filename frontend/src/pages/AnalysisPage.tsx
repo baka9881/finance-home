@@ -32,7 +32,7 @@ import { api } from "../api";
 import { taipeiMonthInputValue } from "../date";
 import { ownerFilterLabels, useOwnerFilter } from "../ownerFilter";
 import type { Account, Category, Dashboard, HealthScore, SpendingAnalysis } from "../types";
-import { Badge, Button, Card, Dialog, EmptyState, Field, FormStep, Input, MonthInput, PageHeader, Select, money, number } from "../ui";
+import { Badge, Button, Card, Dialog, EmptyState, Field, FormStep, Input, MonthInput, PageHeader, Select, Skeleton, money, number } from "../ui";
 
 const recurringPresets = ["房貸", "車貸", "信貸", "學貸", "房租", "保險", "健身房月費", "手機費", "網路費", "訂閱服務"];
 const recurringOwnerOptions = [
@@ -150,6 +150,15 @@ export default function AnalysisPage() {
     onSuccess: () => client.invalidateQueries({ queryKey: ["spending-analysis"] }),
   });
 
+  const ignoreDetectedRecurring = useMutation({
+    mutationFn: (item: SpendingAnalysis["recurring_expenses"][number]) =>
+      api("/recurring-expenses/ignore-detected", {
+        method: "POST",
+        body: JSON.stringify({ account_id: item.account_id, name: item.name }),
+      }),
+    onSuccess: () => client.invalidateQueries({ queryKey: ["spending-analysis"] }),
+  });
+
   function openNewRecurring() {
     setEditingRecurringId(null);
     setRecurringDraft(emptyRecurringDraft(ownerFilter));
@@ -188,7 +197,7 @@ export default function AnalysisPage() {
   }
 
   const data = health.data;
-  const recommendations = makeRecommendations(data, dashboard.data);
+  const recommendations = makeRecommendations(data);
   const componentsByKey = Object.fromEntries(
     (data?.components || []).map((component) => [component.key, component]),
   );
@@ -205,6 +214,8 @@ export default function AnalysisPage() {
   const categoryExpenses = spending.data?.category_expenses || [];
   const recurringExpenses = spending.data?.recurring_expenses || [];
   const monthLabel = displayMonth(selectedMonth);
+  const primaryLoading = health.isLoading || dashboard.isLoading;
+  const primaryError = health.isError || dashboard.isError;
 
   return (
     <>
@@ -214,8 +225,28 @@ export default function AnalysisPage() {
         description="用透明公式檢視現金流、預備金、負債與預算執行情況。"
       />
 
-      {!data ? (
-        <div className="h-80 animate-pulse rounded-2xl bg-slate-200/70" />
+      {primaryError ? (
+        <Card>
+          <EmptyState
+            icon={<AlertTriangle size={24} />}
+            title="財務分析載入失敗"
+            description="資料仍安全保留，請檢查連線後重新載入。"
+            action={<Button onClick={() => { health.refetch(); dashboard.refetch(); }}>重新載入</Button>}
+          />
+        </Card>
+      ) : primaryLoading || !data ? (
+        <div className="space-y-6" aria-label="正在載入財務分析" aria-busy="true">
+          <Card className="p-6">
+            <div className="flex items-center justify-between"><Skeleton className="h-5 w-28" /><Skeleton className="h-7 w-24 rounded-full" /></div>
+            <div className="mt-5 grid gap-4 md:grid-cols-3">
+              {[1, 2, 3].map((item) => <Skeleton key={item} className="h-48 rounded-2xl" />)}
+            </div>
+          </Card>
+          <Card className="p-6">
+            <div className="flex items-center justify-between"><Skeleton className="h-5 w-36" /><Skeleton className="h-11 w-44" /></div>
+            <Skeleton className="mt-6 h-64 rounded-2xl" />
+          </Card>
+        </div>
       ) : (
         <>
           <Card className="p-5 sm:p-6">
@@ -274,12 +305,25 @@ export default function AnalysisPage() {
                 </label>
                 <div className="rounded-xl bg-slate-50 px-4 py-2.5 sm:min-w-32 sm:text-right">
                   <p className="text-xs text-slate-400">當月總支出</p>
-                  <p className="mt-0.5 text-xl font-bold text-slate-800">{money(totalExpense)}</p>
+                  {spending.isPending
+                    ? <Skeleton className="mt-1 h-6 w-24 sm:ml-auto" />
+                    : <p className="mt-0.5 text-xl font-bold text-slate-800">{money(totalExpense)}</p>}
                 </div>
               </div>
             </div>
 
-            {categoryExpenses.length ? (
+            {spending.isError ? (
+              <div className="mt-6 rounded-2xl border border-amber-200 bg-amber-50 p-5 text-center">
+                <p className="text-sm font-semibold text-amber-900">這個月份的消費資料載入失敗</p>
+                <p className="mt-1 text-xs text-amber-700">目前不會顯示 NT$0，以免誤以為沒有消費。</p>
+                <Button className="mt-4" variant="secondary" onClick={() => spending.refetch()}>重新載入</Button>
+              </div>
+            ) : spending.isPending ? (
+              <div className="mt-6 grid gap-7 lg:grid-cols-[320px_1fr] lg:items-center" aria-busy="true">
+                <Skeleton className="mx-auto h-60 w-60 rounded-full" />
+                <div className="space-y-4">{[1, 2, 3, 4].map((item) => <Skeleton key={item} className="h-9" />)}</div>
+              </div>
+            ) : categoryExpenses.length ? (
               <div className="mt-6 grid gap-7 lg:grid-cols-[320px_1fr] lg:items-center">
                 <div className="relative mx-auto h-[250px] w-full max-w-[320px] [&_*]:outline-none">
                   <ResponsiveContainer width="100%" height="100%">
@@ -360,7 +404,9 @@ export default function AnalysisPage() {
               </div>
             </div>
 
-            {spending.isPending ? (
+            {spending.isError ? (
+              <div className="mt-5 rounded-2xl bg-slate-50 p-5 text-center text-sm text-slate-500">固定花費暫時無法載入，請先重新載入上方的消費資料。</div>
+            ) : spending.isPending ? (
               <div className="mt-5 h-36 animate-pulse rounded-2xl bg-slate-100" />
             ) : recurringExpenses.length ? (
               <div className="mt-5 grid gap-3 lg:grid-cols-2">
@@ -397,7 +443,7 @@ export default function AnalysisPage() {
                         <p className="mt-1 text-xs text-slate-400">
                           {item.status === "recorded" ? "當月金額" : "過去平均"}
                         </p>
-                        {item.source === "custom" && item.id && (
+                        {item.source === "custom" && item.id ? (
                           <div className="mt-2 flex justify-end gap-1">
                             <button
                               type="button"
@@ -420,7 +466,23 @@ export default function AnalysisPage() {
                               <Trash2 size={14} />
                             </button>
                           </div>
-                        )}
+                        ) : item.source === "detected" && item.account_id ? (
+                          <div className="mt-2 flex justify-end">
+                            <button
+                              type="button"
+                              className="rounded-lg p-2 text-slate-400 hover:bg-red-50 hover:text-red-600"
+                              aria-label={`移除自動辨識固定花費 ${item.name}`}
+                              disabled={ignoreDetectedRecurring.isPending}
+                              onClick={() => {
+                                if (window.confirm(`不再把「${item.name}」辨識為固定花費嗎？原始交易不會被刪除。`)) {
+                                  ignoreDetectedRecurring.mutate(item);
+                                }
+                              }}
+                            >
+                              <Trash2 size={14} />
+                            </button>
+                          </div>
+                        ) : null}
                       </div>
                     </div>
                   </div>
@@ -435,7 +497,7 @@ export default function AnalysisPage() {
               />
             )}
             <p className="mt-4 text-xs leading-5 text-slate-400">
-              自訂項目只用於每月預估與提醒，不會直接扣除帳戶餘額；實際交易匯入後會標記為「當月已發生」。自動辨識規則為最近六個月內至少出現兩個月，且每月金額差異不超過 20%。
+              自訂項目只用於每月預估與提醒，不會直接扣除帳戶餘額；實際交易匯入後會標記為「當月已發生」。自動辨識規則為最近六個月內至少出現兩個月，且每月金額差異不超過 20%。移除自動辨識項目只會隱藏固定花費，不會刪除原始交易。
             </p>
           </Card>
 
@@ -614,23 +676,28 @@ export default function AnalysisPage() {
   );
 }
 
-function makeRecommendations(health?: HealthScore, dashboard?: Dashboard) {
+export function makeRecommendations(health?: HealthScore) {
   if (!health) return [];
   const result: string[] = [];
   const byKey = Object.fromEntries(health.components.map((item) => [item.key, item]));
-  if (byKey.savings?.value !== null && byKey.savings.value < 20) {
-    result.push(`目前儲蓄率約 ${number(byKey.savings.value, 1)}%，可先從最高的非必要支出分類設定預算。`);
+  const savings = byKey.savings?.value;
+  const emergency = byKey.emergency?.value;
+  const debt = byKey.debt?.value;
+  const budget = byKey.budget?.value;
+  if (typeof savings === "number" && savings < 20) {
+    result.push(`目前儲蓄率約 ${number(savings, 1)}%，可先從最高的非必要支出分類設定預算。`);
   }
-  if (byKey.emergency?.value !== null && byKey.emergency.value < 3) {
-    result.push(`緊急預備金約可支撐 ${number(byKey.emergency.value, 1)} 個月，建議先以 3 個月必要支出為短期目標。`);
+  if (typeof emergency === "number" && emergency < 3) {
+    result.push(`緊急預備金約可支撐 ${number(emergency, 1)} 個月，建議先以 3 個月必要支出為短期目標。`);
   }
-  if (byKey.debt?.value !== null && byKey.debt.value > 30) {
-    result.push(`債務支出比為 ${number(byKey.debt.value, 1)}%，新增負債前應先降低每月還款壓力。`);
+  if (typeof debt === "number" && debt > 30) {
+    result.push(`債務支出比為 ${number(debt, 1)}%，新增負債前應先降低每月還款壓力。`);
   }
-  if (byKey.budget?.value !== null && byKey.budget.value > 100) {
-    result.push(`本月已超出整體預算 ${number(byKey.budget.value - 100, 1)}%，檢查是否有一次性支出需要另外規劃。`);
+  if (typeof budget === "number" && budget > 100) {
+    result.push(`本月已超出整體預算 ${number(budget - 100, 1)}%，檢查是否有一次性支出需要另外規劃。`);
   }
-  if (!dashboard?.month_income) {
+  const hasIncomeBasedIndicator = typeof savings === "number" || typeof debt === "number";
+  if (!hasIncomeBasedIndicator) {
     result.push("補上最近三個月的收入交易，才能計算儲蓄率、必要支出比與債務支出比。");
   }
   return result.slice(0, 3);

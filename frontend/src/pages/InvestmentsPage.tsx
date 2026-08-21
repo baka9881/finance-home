@@ -111,6 +111,22 @@ const defaultCurrencyForMarket = (market: string) =>
 const defaultMarketForAccount = (account?: Account) =>
   account?.account_type === "crypto" ? "CRYPTO" : "TWSE";
 
+export function investmentTradeValidation({
+  side,
+  quantity,
+  totalAmount,
+  availableQuantity,
+}: {
+  side: "buy" | "sell";
+  quantity: number;
+  totalAmount: number;
+  availableQuantity?: number;
+}) {
+  const hasValidAmount = quantity > 0 && totalAmount > 0;
+  const quantityWithinHolding = side === "buy" || (availableQuantity !== undefined && quantity <= availableQuantity);
+  return { hasValidAmount, quantityWithinHolding, valid: hasValidAmount && quantityWithinHolding };
+}
+
 export default function InvestmentsPage() {
   const client = useQueryClient();
   const [ownerFilter] = useOwnerFilter();
@@ -339,11 +355,21 @@ export default function InvestmentsPage() {
     selectedCashAccount.balance_includes_positions,
   );
   const hasSellPosition = tradeSide === "buy" || Boolean(selectedSellPosition);
+  const tradeValidation = investmentTradeValidation({
+    side: tradeSide,
+    quantity: tradeQuantityValue,
+    totalAmount: tradeTotalValue,
+    availableQuantity: selectedSellPosition?.quantity,
+  });
+  const hasValidTradeAmount = tradeValidation.hasValidAmount;
+  const sellQuantityWithinHolding = tradeValidation.quantityWithinHolding;
   const submitDisabled =
     !investmentAccounts.length ||
     !selectedAccountId ||
     !selectedCashAccountId ||
     !hasSellPosition ||
+    !hasValidTradeAmount ||
+    !sellQuantityWithinHolding ||
     (tradeSide === "buy" && !resolvedSymbol) ||
     createTrade.isPending;
   const submitButtonText = createTrade.isPending
@@ -357,7 +383,11 @@ export default function InvestmentsPage() {
           : !hasSellPosition
             ? "請選持倉"
             : tradeSide === "buy" && !resolvedSymbol
-          ? "請選標的"
+              ? "請選標的"
+              : !hasValidTradeAmount
+                ? "請填數量與總額"
+                : !sellQuantityWithinHolding
+                  ? "賣出數量超過持有"
           : tradeSide === "buy"
             ? "記錄買入"
             : "記錄賣出";
@@ -1018,7 +1048,8 @@ export default function InvestmentsPage() {
             }}
             onCancel={closeTradeDialog}
             submitLabel={submitButtonText}
-            pending={submitDisabled}
+            pending={createTrade.isPending}
+            submitDisabled={submitDisabled}
           />
         </form>
       </Dialog>

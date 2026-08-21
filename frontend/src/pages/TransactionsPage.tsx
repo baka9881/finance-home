@@ -1,6 +1,6 @@
 import { FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
+import { useNavigate, useSearchParams } from "react-router-dom";
 import {
   ArrowDownLeft,
   ArrowRightLeft,
@@ -8,6 +8,7 @@ import {
   Check,
   ChevronDown,
   FileSpreadsheet,
+  Landmark,
   Link2,
   Plus,
   Search,
@@ -81,6 +82,12 @@ const scenarioDescriptions: Record<ManualScenario, string> = {
   loan_payment: "還款時一次填本金與利息，系統會同步降低貸款負債。",
 };
 
+export function categoriesForTransactionKind(categories: Category[], kind: string) {
+  if (kind === "income") return categories.filter((category) => category.kind === "income");
+  if (kind === "expense") return categories.filter((category) => category.kind === "expense");
+  return [];
+}
+
 function normalizedAccountMatchText(value: string) {
   return value
     .toLowerCase()
@@ -114,6 +121,7 @@ function guessImportAccountId(fileName: string, accounts: Account[], selectedAcc
 
 export default function TransactionsPage() {
   const client = useQueryClient();
+  const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
   const [month, setMonth] = useState(currentMonth);
   const [ownerFilter] = useOwnerFilter();
@@ -450,6 +458,7 @@ export default function TransactionsPage() {
     const amount = Number(form.get("amount"));
     const kind = String(form.get("transaction_kind"));
     if (kind === "loan_payment") {
+      if (!loanAccountOptions.length || !form.get("loan_account_id")) return;
       createLoanPayment.mutate({
         payment_account_id: Number(form.get("account_id")),
         loan_account_id: Number(form.get("loan_account_id")),
@@ -957,31 +966,61 @@ export default function TransactionsPage() {
               {manualKind === "loan_payment" ? (
               <>
                 <div className="grid gap-4">
-                  <Field label="貸款帳戶" hint="如果沒有選項，先到帳戶頁新增一個類型為「貸款」的負債帳戶。">
-                    <Select
-                      name="loan_account_id"
-                      value={loanAccountId}
-                      onChange={(event) => setLoanAccountId(event.target.value)}
-                      required
-                    >
-                      <option value="">選擇貸款帳戶</option>
-                      {loanAccountOptions.map((account) => (
-                        <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
-                      ))}
-                    </Select>
-                  </Field>
+                  {accounts.isLoading ? (
+                    <div className="rounded-2xl bg-slate-50 p-4 text-sm text-slate-500">正在載入貸款帳戶…</div>
+                  ) : loanAccountOptions.length > 0 ? (
+                    <Field label="貸款帳戶">
+                      <Select
+                        name="loan_account_id"
+                        value={loanAccountId}
+                        onChange={(event) => setLoanAccountId(event.target.value)}
+                        required
+                      >
+                        <option value="">選擇貸款帳戶</option>
+                        {loanAccountOptions.map((account) => (
+                          <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
+                        ))}
+                      </Select>
+                    </Field>
+                  ) : (
+                    <div className="rounded-2xl border border-amber-200 bg-amber-50 p-4">
+                      <div className="flex items-start gap-3">
+                        <span className="flex size-10 shrink-0 items-center justify-center rounded-xl bg-white text-amber-600">
+                          <Landmark size={20} />
+                        </span>
+                        <div className="min-w-0 flex-1">
+                          <p className="font-semibold text-slate-800">目前沒有可選的貸款帳戶</p>
+                          <p className="mt-1 text-xs leading-5 text-slate-500">
+                            「車貸」固定花費是每月支出規則，不是貸款餘額帳戶。先建立貸款帳戶，才能分開記錄本金與利息。
+                          </p>
+                          <Button
+                            type="button"
+                            variant="secondary"
+                            className="mt-3 w-full sm:w-auto"
+                            onClick={() => navigate("/accounts?quick=loan")}
+                          >
+                            <Plus size={16} /> 建立貸款帳戶
+                          </Button>
+                        </div>
+                      </div>
+                    </div>
+                  )}
                 </div>
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <Field label="本金">
-                    <Input name="principal" type="number" inputMode="decimal" min="0" step="any" placeholder="0" required />
-                  </Field>
-                  <Field label="利息">
-                    <Input name="interest" type="number" inputMode="decimal" min="0" step="any" placeholder="0" required />
-                  </Field>
-                </div>
-                <p className="rounded-xl bg-slate-50 p-4 text-xs leading-5 text-slate-500">
-                  系統會把本金用來降低貸款負債，利息列為支出；付款帳戶會扣除本金加利息。
-                </p>
+                {loanAccountOptions.length > 0 && (
+                  <>
+                    <div className="grid gap-4 sm:grid-cols-2">
+                      <Field label="本金">
+                        <Input name="principal" type="number" inputMode="decimal" min="0" step="any" placeholder="0" required />
+                      </Field>
+                      <Field label="利息">
+                        <Input name="interest" type="number" inputMode="decimal" min="0" step="any" placeholder="0" required />
+                      </Field>
+                    </div>
+                    <p className="rounded-xl bg-slate-50 p-4 text-xs leading-5 text-slate-500">
+                      系統會把本金用來降低貸款負債，利息列為支出；付款帳戶會扣除本金加利息。
+                    </p>
+                  </>
+                )}
               </>
               ) : (
               <>
@@ -1006,7 +1045,7 @@ export default function TransactionsPage() {
                 <Field label="分類">
                   <Select name="category_id">
                     <option value="">自動分類</option>
-                    {categories.data?.map((category) => (
+                    {categoriesForTransactionKind(categories.data || [], manualKind).map((category) => (
                       <option key={category.id} value={category.id}>{category.name}</option>
                     ))}
                   </Select>
@@ -1050,6 +1089,7 @@ export default function TransactionsPage() {
                       : "儲存支出"
               }
               pending={createTransaction.isPending || createLoanPayment.isPending}
+              submitDisabled={manualKind === "loan_payment" && loanAccountOptions.length === 0}
             />
           </form>
         )}

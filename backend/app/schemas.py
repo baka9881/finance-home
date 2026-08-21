@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from datetime import date, datetime
 from decimal import Decimal
+from typing import Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -150,11 +151,24 @@ class RecurringExpenseUpdate(BaseModel):
     note: str | None = None
 
 
+class DetectedRecurringIgnoreCreate(BaseModel):
+    account_id: int
+    name: str = Field(min_length=1, max_length=300)
+
+
 class RuleCreate(BaseModel):
     keyword: str
     category_id: int
     transaction_kind: str = "expense"
     priority: int = 100
+
+
+class RuleUpdate(BaseModel):
+    keyword: str | None = Field(default=None, min_length=1, max_length=100)
+    category_id: int | None = None
+    transaction_kind: str | None = None
+    priority: int | None = None
+    enabled: bool | None = None
 
 
 class FxRateCreate(BaseModel):
@@ -196,6 +210,34 @@ class BinanceConnectionCreate(BaseModel):
     account_id: int
     api_key: str = Field(min_length=8, max_length=200)
     api_secret: str = Field(min_length=8, max_length=300)
+
+
+class EmailCardRuleCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=100)
+    owner: Literal["me", "partner", "shared"] = "me"
+    card_account_id: int
+    payment_account_id: int
+    sender_pattern: str | None = Field(default=None, max_length=200)
+    subject_pattern: str | None = Field(default=None, max_length=200)
+    card_last4: str | None = Field(default=None, pattern=r"^\d{4}$")
+    lookback_days: int = Field(default=30, ge=1, le=365)
+    auto_pay: bool = True
+    active: bool = True
+    statement_password: str | None = Field(default=None, max_length=200)
+
+
+class EmailCardRuleUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    owner: Literal["me", "partner", "shared"] | None = None
+    card_account_id: int | None = None
+    payment_account_id: int | None = None
+    sender_pattern: str | None = Field(default=None, max_length=200)
+    subject_pattern: str | None = Field(default=None, max_length=200)
+    card_last4: str | None = Field(default=None, pattern=r"^\d{4}$")
+    lookback_days: int | None = Field(default=None, ge=1, le=365)
+    auto_pay: bool | None = None
+    active: bool | None = None
+    statement_password: str | None = Field(default=None, max_length=200)
 
 
 class BackupPayload(BaseModel):

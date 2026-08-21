@@ -18,3 +18,11 @@ export function taipeiDateInputValue(date = new Date()) {
 export function taipeiMonthInputValue(date = new Date()) {
   return taipeiDateInputValue(date).slice(0, 7);
 }
+
+export function daysBetweenDateValues(from?: string | null, to = taipeiDateInputValue()) {
+  if (!from) return null;
+  const start = Date.parse(`${from}T00:00:00Z`);
+  const end = Date.parse(`${to}T00:00:00Z`);
+  if (!Number.isFinite(start) || !Number.isFinite(end)) return null;
+  return Math.max(0, Math.floor((end - start) / 86_400_000));
+}

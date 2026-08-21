@@ -26,7 +26,7 @@ from fastapi import (
     UploadFile,
 )
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from sqlalchemy import delete, func, select, text
 from sqlalchemy.exc import IntegrityError
@@ -42,8 +42,11 @@ from .database import (
     Budget,
     Category,
     ClassificationRule,
+    CreditCardBill,
+    EmailCardRule,
     FxRate,
     Goal,
+    IgnoredRecurringExpense,
     Position,
     RecurringExpense,
     Transaction,
@@ -69,8 +72,12 @@ from .schemas import (
     PositionUpdate,
     RecurringExpenseCreate,
     RecurringExpenseUpdate,
+    DetectedRecurringIgnoreCreate,
     RuleCreate,
+    RuleUpdate,
     SettingsUpdate,
+    EmailCardRuleCreate,
+    EmailCardRuleUpdate,
     TransactionCreate,
     TransactionUpdate,
     TransferCreate,
@@ -86,6 +93,7 @@ from .services import (
     create_balance_snapshot,
     decimal_value,
     disconnect_binance_account,
+    encrypt_credential,
     export_backup,
     get_latest_balance,
     import_csv,
@@ -97,6 +105,7 @@ from .services import (
     record_valuation,
     refresh_fx_rates,
     refresh_market_prices,
+    recurring_expense_signature,
     restore_backup,
     seed_defaults,
     seed_demo,
@@ -104,6 +113,19 @@ from .services import (
     sync_binance_account,
     transaction_fingerprint,
     OWNER_LABELS,
+    DEFAULT_RULES,
+)
+from .email_sync import (
+    complete_gmail_authorization,
+    disconnect_gmail,
+    frontend_settings_url,
+    gmail_authorization_url,
+    gmail_callback_url,
+    gmail_status,
+    process_due_card_bills,
+    serialize_card_bill,
+    serialize_email_rule,
+    sync_gmail,
 )
 
 
@@ -235,6 +257,7 @@ async def protect_cloud_api(request: Request, call_next):
         "/api/auth/login",
         "/api/auth/status",
         AUTOMATION_SYNC_PATH,
+        "/api/email/gmail/callback",
     }
     if (
         FINANCE_APP_PASSWORD
@@ -283,6 +306,7 @@ def _automation_status_payload(db: Session) -> dict[str, Any]:
         "schedule": "hourly",
         "running": _automation_lock.locked(),
         "connected_exchanges": connected,
+        "email_connected": gmail_status(db)["connected"],
         "last_status": _app_setting_value(db, "automation:last_status") or "idle",
         "last_started_at": _app_setting_value(db, "automation:last_started_at"),
         "last_run_at": _app_setting_value(db, "automation:last_run_at"),
@@ -355,6 +379,18 @@ def run_automatic_updates() -> None:
             market_result = {"updated": 0, "skipped": 0, "warnings": [], "errors": []}
             errors.append(f"行情：{exc}")
 
+        email_result: dict[str, Any] | None = None
+        if gmail_status(db)["connected"]:
+            try:
+                email_result = sync_gmail(db)
+            except Exception as exc:
+                db.rollback()
+                errors.append(f"信用卡郵件：{exc}")
+                try:
+                    process_due_card_bills(db)
+                except Exception:
+                    db.rollback()
+
         errors.extend(str(item) for item in market_result.get("errors", []))
         record_valuation(db)
         finished_at = datetime.utcnow().isoformat(timespec="seconds")
@@ -368,6 +404,13 @@ def run_automatic_updates() -> None:
             "market_updated": int(market_result.get("updated", 0)),
             "market_skipped": int(market_result.get("skipped", 0)),
             "fx_saved": int((fx_result or {}).get("saved", 0)),
+            "email_transactions_imported": int(
+                (email_result or {}).get("transactions_imported", 0)
+            ),
+            "email_bills_found": int((email_result or {}).get("bills_found", 0)),
+            "email_payments_created": int(
+                (email_result or {}).get("payments_created", 0)
+            ),
             "warnings": [
                 *[
                     warning
@@ -1712,6 +1755,7 @@ def update_goal(goal_id: int, payload: GoalUpdate, db: DB):
 
 @app.get("/api/rules")
 def list_rules(db: DB):
+    default_keywords = {keyword.casefold() for keyword, _, _ in DEFAULT_RULES}
     return [
         {
             "id": row.id,
@@ -1721,6 +1765,7 @@ def list_rules(db: DB):
             "transaction_kind": row.transaction_kind,
             "priority": row.priority,
             "enabled": row.enabled,
+            "is_default": row.keyword.casefold() in default_keywords,
         }
         for row in db.scalars(
             select(ClassificationRule).order_by(
@@ -1749,6 +1794,33 @@ def create_rule(payload: RuleCreate, db: DB):
         db.add(row)
     db.commit()
     return {"id": row.id}
+
+
+@app.patch("/api/rules/{rule_id}")
+def update_rule(rule_id: int, payload: RuleUpdate, db: DB):
+    row = db.get(ClassificationRule, rule_id)
+    if not row:
+        raise HTTPException(404, "找不到規則")
+    changes = payload.model_dump(exclude_unset=True)
+    if "category_id" in changes and not db.get(Category, changes["category_id"]):
+        raise HTTPException(404, "找不到分類")
+    if "keyword" in changes:
+        keyword = str(changes["keyword"]).strip()
+        if not keyword:
+            raise HTTPException(422, "關鍵字不可空白")
+        duplicate = db.scalar(
+            select(ClassificationRule).where(
+                func.lower(ClassificationRule.keyword) == keyword.lower(),
+                ClassificationRule.id != rule_id,
+            )
+        )
+        if duplicate:
+            raise HTTPException(409, "已有相同關鍵字的規則")
+        changes["keyword"] = keyword
+    for key, value in changes.items():
+        setattr(row, key, value)
+    db.commit()
+    return {"ok": True}
 
 
 @app.delete("/api/rules/{rule_id}")
@@ -1872,6 +1944,34 @@ def delete_recurring_expense(expense_id: int, db: DB):
     return {"ok": True}
 
 
+@app.post("/api/recurring-expenses/ignore-detected", status_code=201)
+def ignore_detected_recurring_expense(
+    payload: DetectedRecurringIgnoreCreate, db: DB
+):
+    account = require_account(db, payload.account_id)
+    display_name = payload.name.strip()
+    normalized_name = recurring_expense_signature(display_name)
+    if not normalized_name:
+        raise HTTPException(422, "固定花費名稱不能為空")
+    existing = db.scalar(
+        select(IgnoredRecurringExpense).where(
+            IgnoredRecurringExpense.account_id == account.id,
+            IgnoredRecurringExpense.normalized_name == normalized_name,
+        )
+    )
+    if existing:
+        return {"ok": True, "id": existing.id}
+    row = IgnoredRecurringExpense(
+        owner=account.owner,
+        account_id=account.id,
+        normalized_name=normalized_name,
+        display_name=display_name,
+    )
+    db.add(row)
+    db.commit()
+    return {"ok": True, "id": row.id}
+
+
 @app.get("/api/exchanges/binance")
 def get_binance_connections(db: DB):
     return binance_connection_statuses(db)
@@ -1929,6 +2029,170 @@ def sync_exchanges(db: DB, account_id: int | None = None, force: bool = False):
         "results": results,
         "errors": errors,
     }
+
+
+def _validate_email_rule_accounts(
+    db: Session, card_account_id: int, payment_account_id: int
+) -> tuple[Account, Account]:
+    card_account = require_account(db, card_account_id)
+    payment_account = require_account(db, payment_account_id)
+    if card_account.archived or payment_account.archived:
+        raise HTTPException(422, "不能使用已停用的帳戶")
+    if card_account.nature != "liability" or card_account.account_type != "credit_card":
+        raise HTTPException(422, "信用卡帳戶必須是負債性質的信用卡帳戶")
+    if payment_account.nature != "asset":
+        raise HTTPException(422, "扣款帳戶必須是資產帳戶")
+    if card_account.currency != payment_account.currency:
+        raise HTTPException(422, "第一版只支援信用卡與扣款帳戶使用相同幣別")
+    return card_account, payment_account
+
+
+def _validate_email_patterns(sender_pattern: str | None, subject_pattern: str | None) -> None:
+    if not (sender_pattern or "").strip() and not (subject_pattern or "").strip():
+        raise HTTPException(422, "寄件者或主旨關鍵字至少要填一項，避免讀取不相關郵件")
+
+
+@app.get("/api/email/gmail/status")
+def get_gmail_status(db: DB):
+    return gmail_status(db)
+
+
+@app.post("/api/email/gmail/authorize")
+def authorize_gmail(request: Request, db: DB):
+    try:
+        redirect_uri = gmail_callback_url(str(request.base_url))
+        return {
+            "authorization_url": gmail_authorization_url(db, redirect_uri),
+            "redirect_uri": redirect_uri,
+        }
+    except ValueError as exc:
+        raise HTTPException(503, str(exc)) from exc
+
+
+@app.get("/api/email/gmail/callback", include_in_schema=False)
+def gmail_callback(
+    request: Request,
+    db: DB,
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    destination = frontend_settings_url()
+    if error or not code or not state:
+        return RedirectResponse(f"{destination}?gmail=error")
+    try:
+        complete_gmail_authorization(
+            db,
+            code,
+            state,
+            gmail_callback_url(str(request.base_url)),
+        )
+        return RedirectResponse(f"{destination}?gmail=connected")
+    except ValueError:
+        db.rollback()
+        return RedirectResponse(f"{destination}?gmail=error")
+
+
+@app.delete("/api/email/gmail")
+def remove_gmail_connection(db: DB):
+    disconnect_gmail(db)
+    return {"ok": True}
+
+
+@app.post("/api/email/gmail/sync")
+def synchronize_gmail(db: DB):
+    try:
+        return sync_gmail(db)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.get("/api/email/card-rules")
+def list_email_card_rules(db: DB):
+    return [
+        serialize_email_rule(item)
+        for item in db.scalars(select(EmailCardRule).order_by(EmailCardRule.id)).all()
+    ]
+
+
+@app.post("/api/email/card-rules", status_code=201)
+def create_email_card_rule(payload: EmailCardRuleCreate, db: DB):
+    _validate_email_patterns(payload.sender_pattern, payload.subject_pattern)
+    card_account, _ = _validate_email_rule_accounts(
+        db, payload.card_account_id, payload.payment_account_id
+    )
+    row = EmailCardRule(
+        **payload.model_dump(
+            exclude={"owner", "statement_password", "sender_pattern", "subject_pattern"}
+        ),
+        owner=card_account.owner,
+        sender_pattern=(payload.sender_pattern or "").strip() or None,
+        subject_pattern=(payload.subject_pattern or "").strip() or None,
+        statement_password=encrypt_credential(payload.statement_password)
+        if payload.statement_password
+        else None,
+    )
+    db.add(row)
+    db.commit()
+    db.refresh(row)
+    return serialize_email_rule(row)
+
+
+@app.patch("/api/email/card-rules/{rule_id}")
+def update_email_card_rule(rule_id: int, payload: EmailCardRuleUpdate, db: DB):
+    row = db.get(EmailCardRule, rule_id)
+    if not row:
+        raise HTTPException(404, "找不到信用卡郵件規則")
+    values = payload.model_dump(exclude_unset=True)
+    sender_pattern = values.get("sender_pattern", row.sender_pattern)
+    subject_pattern = values.get("subject_pattern", row.subject_pattern)
+    _validate_email_patterns(sender_pattern, subject_pattern)
+    card_id = int(values.get("card_account_id", row.card_account_id))
+    payment_id = int(values.get("payment_account_id", row.payment_account_id))
+    card_account, _ = _validate_email_rule_accounts(db, card_id, payment_id)
+    password_supplied = "statement_password" in values
+    statement_password = values.pop("statement_password", None)
+    for key, value in values.items():
+        if key == "owner":
+            continue
+        if key in {"sender_pattern", "subject_pattern"}:
+            value = (value or "").strip() or None
+        setattr(row, key, value)
+    row.owner = card_account.owner
+    if password_supplied:
+        row.statement_password = (
+            encrypt_credential(statement_password) if statement_password else None
+        )
+    db.commit()
+    return serialize_email_rule(row)
+
+
+@app.delete("/api/email/card-rules/{rule_id}")
+def deactivate_email_card_rule(rule_id: int, db: DB):
+    row = db.get(EmailCardRule, rule_id)
+    if not row:
+        raise HTTPException(404, "找不到信用卡郵件規則")
+    row.active = False
+    db.commit()
+    return {"ok": True}
+
+
+@app.get("/api/email/card-bills")
+def list_credit_card_bills(db: DB, limit: int = Query(12, ge=1, le=100)):
+    return [
+        serialize_card_bill(item)
+        for item in db.scalars(
+            select(CreditCardBill)
+            .order_by(CreditCardBill.due_date.desc(), CreditCardBill.id.desc())
+            .limit(limit)
+        ).all()
+    ]
+
+
+@app.post("/api/email/card-bills/process")
+def process_credit_card_bills(db: DB):
+    return process_due_card_bills(db)
 
 
 @app.get("/api/settings")

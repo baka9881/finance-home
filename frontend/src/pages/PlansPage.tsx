@@ -1,6 +1,6 @@
 import { FormEvent, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { CalendarDays, CheckCircle2, Goal as GoalIcon, Plus, Target } from "lucide-react";
+import { AlertTriangle, CalendarDays, CheckCircle2, Goal as GoalIcon, Plus, Target } from "lucide-react";
 import { api } from "../api";
 import { useOwnerFilter } from "../ownerFilter";
 import type { Account, Dashboard, Goal, Position } from "../types";
@@ -18,6 +18,7 @@ import {
   PageHeader,
   Progress,
   Select,
+  Skeleton,
   money,
   number,
 } from "../ui";
@@ -108,6 +109,8 @@ export default function PlansPage() {
   const totalProgress = totalTarget ? Math.min(100, (totalCurrent / totalTarget) * 100) : 0;
   const activeGoals = goalMetrics.filter((item) => item.remaining > 0);
   const remaining = goalMetrics.reduce((sum, item) => sum + item.remaining, 0);
+  const isLoading = goals.isLoading || dashboard.isLoading || positions.isLoading;
+  const hasLoadError = goals.isError || dashboard.isError || positions.isError;
 
   return (
     <>
@@ -134,25 +137,44 @@ export default function PlansPage() {
         目前累積金額取自「總覽」的淨資產；如果你新增帳戶、更新餘額或投資行情，這裡的目標進度會跟著變。
       </div>
 
-      <div className="mb-6 grid gap-4 sm:grid-cols-3">
-        <Card className="p-5">
-          <p className="text-sm text-slate-500">目標總額</p>
-          <p className="mt-2 text-2xl font-bold text-ink">{money(totalTarget)}</p>
-          <p className="mt-4 text-xs text-slate-400">{activeGoals.length} 個進行中目標</p>
-        </Card>
-        <Card className="p-5">
-          <p className="text-sm text-slate-500">目前累積</p>
-          <p className="mt-2 text-2xl font-bold text-emerald-700">{money(totalCurrent)}</p>
-          <p className="mt-4 text-xs text-slate-400">{number(totalProgress, 1)}% 的總進度</p>
-        </Card>
-        <Card className="p-5">
-          <p className="text-sm text-slate-500">剩餘金額</p>
-          <p className="mt-2 text-2xl font-bold text-ink">{money(remaining)}</p>
-          <p className="mt-4 text-xs text-slate-400">距離所有目標還需要累積</p>
-        </Card>
+      <div className="mb-6 grid gap-4 sm:grid-cols-3" aria-busy={isLoading}>
+        {isLoading || hasLoadError ? [1, 2, 3].map((item) => (
+          <Card key={item} className="p-5">
+            <Skeleton className="h-4 w-24" />
+            <Skeleton className="mt-3 h-8 w-40" />
+            <Skeleton className="mt-5 h-3 w-32" />
+          </Card>
+        )) : (
+          <>
+            <Card className="p-5">
+              <p className="text-sm text-slate-500">目標總額</p>
+              <p className="mt-2 text-2xl font-bold text-ink">{money(totalTarget)}</p>
+              <p className="mt-4 text-xs text-slate-400">{activeGoals.length} 個進行中目標</p>
+            </Card>
+            <Card className="p-5">
+              <p className="text-sm text-slate-500">目前累積</p>
+              <p className="mt-2 text-2xl font-bold text-emerald-700">{money(totalCurrent)}</p>
+              <p className="mt-4 text-xs text-slate-400">{number(totalProgress, 1)}% 的總進度</p>
+            </Card>
+            <Card className="p-5">
+              <p className="text-sm text-slate-500">剩餘金額</p>
+              <p className="mt-2 text-2xl font-bold text-ink">{money(remaining)}</p>
+              <p className="mt-4 text-xs text-slate-400">距離所有目標還需要累積</p>
+            </Card>
+          </>
+        )}
       </div>
 
-      {goals.isLoading || dashboard.isLoading || positions.isLoading ? (
+      {hasLoadError ? (
+        <Card>
+          <EmptyState
+            icon={<AlertTriangle size={26} />}
+            title="財務目標載入失敗"
+            description="資料沒有被清空，請檢查連線後再試一次。"
+            action={<Button onClick={() => { goals.refetch(); dashboard.refetch(); positions.refetch(); }}>重新載入</Button>}
+          />
+        </Card>
+      ) : isLoading ? (
         <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
           {[1, 2, 3].map((item) => (
             <div key={item} className="h-64 animate-pulse rounded-2xl bg-slate-200/70" />

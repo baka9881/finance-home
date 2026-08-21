@@ -240,6 +240,90 @@ class RecurringExpense(Base, TimestampMixin):
     category: Mapped["Category | None"] = relationship()
 
 
+class IgnoredRecurringExpense(Base, TimestampMixin):
+    __tablename__ = "ignored_recurring_expenses"
+    __table_args__ = (
+        UniqueConstraint(
+            "account_id",
+            "normalized_name",
+            name="uq_ignored_recurring_account_name",
+        ),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    owner: Mapped[str] = mapped_column(String(20), default="me", index=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    normalized_name: Mapped[str] = mapped_column(String(300))
+    display_name: Mapped[str] = mapped_column(String(300))
+
+    account: Mapped["Account"] = relationship()
+
+
+class EmailCardRule(Base, TimestampMixin):
+    __tablename__ = "email_card_rules"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    name: Mapped[str] = mapped_column(String(100))
+    owner: Mapped[str] = mapped_column(String(20), default="me", index=True)
+    card_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    payment_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    sender_pattern: Mapped[str | None] = mapped_column(String(200))
+    subject_pattern: Mapped[str | None] = mapped_column(String(200))
+    card_last4: Mapped[str | None] = mapped_column(String(4))
+    lookback_days: Mapped[int] = mapped_column(Integer, default=30)
+    auto_pay: Mapped[bool] = mapped_column(Boolean, default=True)
+    active: Mapped[bool] = mapped_column(Boolean, default=True)
+    statement_password: Mapped[str | None] = mapped_column(Text)
+
+    card_account: Mapped["Account"] = relationship(foreign_keys=[card_account_id])
+    payment_account: Mapped["Account"] = relationship(foreign_keys=[payment_account_id])
+
+
+class EmailImportRecord(Base, TimestampMixin):
+    __tablename__ = "email_import_records"
+    __table_args__ = (
+        UniqueConstraint("provider", "provider_message_id", name="uq_email_provider_message"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    provider: Mapped[str] = mapped_column(String(20), default="gmail")
+    provider_message_id: Mapped[str] = mapped_column(String(200), index=True)
+    rule_id: Mapped[int | None] = mapped_column(ForeignKey("email_card_rules.id"), index=True)
+    message_date: Mapped[datetime | None] = mapped_column(DateTime)
+    sender: Mapped[str | None] = mapped_column(String(300))
+    subject: Mapped[str | None] = mapped_column(String(500))
+    status: Mapped[str] = mapped_column(String(30), default="processed", index=True)
+    imported_transactions: Mapped[int] = mapped_column(Integer, default=0)
+    error: Mapped[str | None] = mapped_column(Text)
+
+    rule: Mapped["EmailCardRule | None"] = relationship()
+
+
+class CreditCardBill(Base, TimestampMixin):
+    __tablename__ = "credit_card_bills"
+    __table_args__ = (
+        UniqueConstraint("rule_id", "due_date", "amount_due", name="uq_card_bill_rule_due_amount"),
+    )
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    rule_id: Mapped[int] = mapped_column(ForeignKey("email_card_rules.id"), index=True)
+    card_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    payment_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    statement_date: Mapped[date | None] = mapped_column(Date)
+    due_date: Mapped[date] = mapped_column(Date, index=True)
+    amount_due: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+    currency: Mapped[str] = mapped_column(String(3), default="TWD")
+    status: Mapped[str] = mapped_column(String(30), default="pending", index=True)
+    source_message_id: Mapped[str | None] = mapped_column(String(200))
+    transfer_link_id: Mapped[int | None] = mapped_column(ForeignKey("transfer_links.id"))
+    last_error: Mapped[str | None] = mapped_column(Text)
+
+    rule: Mapped["EmailCardRule"] = relationship()
+    card_account: Mapped["Account"] = relationship(foreign_keys=[card_account_id])
+    payment_account: Mapped["Account"] = relationship(foreign_keys=[payment_account_id])
+    transfer_link: Mapped["TransferLink | None"] = relationship()
+
+
 class ValuationSnapshot(Base, TimestampMixin):
     __tablename__ = "valuation_snapshots"
 
