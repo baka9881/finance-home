@@ -180,6 +180,7 @@ export default function SettingsPage() {
   const [marketSettingsOpen, setMarketSettingsOpen] = useState(false);
   const [exchangeSettingsOpen, setExchangeSettingsOpen] = useState(false);
   const [emailSettingsOpen, setEmailSettingsOpen] = useState(false);
+  const [editingEmailRule, setEditingEmailRule] = useState<EmailCardRule | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [theme, setTheme] = useState<AppTheme>(() => getStoredTheme());
   const [lastBackupAt, setLastBackupAt] = useState(() => localStorage.getItem("finance:lastBackupAt") || "");
@@ -338,15 +339,16 @@ export default function SettingsPage() {
     onError: (error) => setMessage(`郵件同步失敗：${(error as Error).message}`),
   });
   const saveEmailRule = useMutation({
-    mutationFn: (payload: Record<string, unknown>) =>
-      api<EmailCardRule>("/email/card-rules", {
-        method: "POST",
+    mutationFn: ({ ruleId, payload }: { ruleId?: number; payload: Record<string, unknown> }) =>
+      api<EmailCardRule>(ruleId ? `/email/card-rules/${ruleId}` : "/email/card-rules", {
+        method: ruleId ? "PATCH" : "POST",
         body: JSON.stringify(payload),
       }),
     onSuccess: () => {
       client.invalidateQueries({ queryKey: ["email-card-rules"] });
       client.invalidateQueries({ queryKey: ["gmail-status"] });
       setEmailSettingsOpen(false);
+      setEditingEmailRule(null);
       setMessage("信用卡郵件規則已儲存；可以立即同步測試。");
     },
     onError: (error) => setMessage((error as Error).message),
@@ -476,17 +478,32 @@ export default function SettingsPage() {
     const cardAccountId = Number(form.get("card_account_id"));
     const cardAccount = cardAccounts.find((account) => account.id === cardAccountId);
     saveEmailRule.mutate({
-      name: String(form.get("name") || "").trim(),
-      owner: cardAccount?.owner || "me",
-      card_account_id: cardAccountId,
-      payment_account_id: Number(form.get("payment_account_id")),
-      sender_pattern: String(form.get("sender_pattern") || "").trim() || null,
-      subject_pattern: String(form.get("subject_pattern") || "").trim() || null,
-      card_last4: String(form.get("card_last4") || "").trim() || null,
-      lookback_days: Number(form.get("lookback_days") || 30),
-      auto_pay: form.get("auto_pay") === "on",
-      statement_password: String(form.get("statement_password") || "") || null,
+      ruleId: editingEmailRule?.id,
+      payload: {
+        name: String(form.get("name") || "").trim(),
+        owner: cardAccount?.owner || "me",
+        card_account_id: cardAccountId,
+        payment_account_id: Number(form.get("payment_account_id")),
+        sender_pattern: String(form.get("sender_pattern") || "").trim() || null,
+        subject_pattern: String(form.get("subject_pattern") || "").trim() || null,
+        card_last4: String(form.get("card_last4") || "").trim() || null,
+        lookback_days: Number(form.get("lookback_days") || 30),
+        auto_pay: form.get("auto_pay") === "on",
+        ...(String(form.get("statement_password") || "")
+          ? { statement_password: String(form.get("statement_password")) }
+          : {}),
+      },
     });
+  }
+
+  function startEditingEmailRule(rule: EmailCardRule) {
+    setEditingEmailRule(rule);
+    setEmailSettingsOpen(true);
+  }
+
+  function startCreatingEmailRule() {
+    setEditingEmailRule(null);
+    setEmailSettingsOpen(true);
   }
 
   useEffect(() => {
@@ -843,7 +860,17 @@ export default function SettingsPage() {
                   <RefreshCw size={15} className={syncGmail.isPending ? "animate-spin" : ""} />
                   {syncGmail.isPending ? "同步中…" : "立即同步"}
                 </Button>
-                <Button variant="ghost" onClick={() => setEmailSettingsOpen((value) => !value)}>
+                <Button
+                  variant="ghost"
+                  onClick={() => {
+                    if (emailSettingsOpen) {
+                      setEmailSettingsOpen(false);
+                      setEditingEmailRule(null);
+                    } else {
+                      startCreatingEmailRule();
+                    }
+                  }}
+                >
                   <KeyRound size={15} /> {emailSettingsOpen ? "收起設定" : "新增信用卡"}
                 </Button>
               </>
@@ -893,25 +920,41 @@ export default function SettingsPage() {
         </div>
 
         {gmail.data?.connected && emailSettingsOpen && (
-          <form className="mt-5 space-y-4" onSubmit={submitEmailRule}>
+          <form
+            key={editingEmailRule?.id || "new-email-rule"}
+            className="mt-5 space-y-4"
+            onSubmit={submitEmailRule}
+          >
+            {editingEmailRule && (
+              <div className="flex items-center justify-between rounded-xl bg-blue-50 px-4 py-3 text-sm text-blue-800">
+                <span>正在編輯「{editingEmailRule.name}」</span>
+                <button
+                  type="button"
+                  className="font-semibold"
+                  onClick={startCreatingEmailRule}
+                >
+                  改為新增
+                </button>
+              </div>
+            )}
             <div className="grid gap-3 lg:grid-cols-3">
               <FormStep number={1} title="是哪張信用卡？">
                 <div className="space-y-3">
-                  <Input name="name" placeholder="例如：國泰信用卡" required />
-                  <Select name="card_account_id" required>
+                  <Input name="name" defaultValue={editingEmailRule?.name || ""} placeholder="例如：國泰信用卡" required />
+                  <Select name="card_account_id" defaultValue={editingEmailRule ? String(editingEmailRule.card_account_id) : ""} required>
                     <option value="">選擇信用卡帳戶</option>
                     {cardAccounts.map((account) => (
                       <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
                     ))}
                   </Select>
-                  <Input name="card_last4" inputMode="numeric" pattern="[0-9]{4}" maxLength={4} placeholder="卡號末四碼（選填）" />
+                  <Input name="card_last4" defaultValue={editingEmailRule?.card_last4 || ""} inputMode="numeric" pattern="[0-9]{4}" maxLength={4} placeholder="卡號末四碼（選填）" />
                 </div>
               </FormStep>
               <FormStep number={2} title="只看哪些郵件？" tone="blue">
                 <div className="space-y-3">
-                  <Input name="sender_pattern" placeholder="寄件者，例如 cathaybk.com.tw" />
-                  <Input name="subject_pattern" placeholder="主旨關鍵字，例如 信用卡" />
-                  <Select name="lookback_days" defaultValue="30">
+                  <Input name="sender_pattern" defaultValue={editingEmailRule?.sender_pattern || ""} placeholder="寄件者，例如 cathaybk.com.tw" />
+                  <Input name="subject_pattern" defaultValue={editingEmailRule?.subject_pattern || ""} placeholder="主旨關鍵字，例如 消費彙整通知" />
+                  <Select name="lookback_days" defaultValue={String(editingEmailRule?.lookback_days || 30)}>
                     <option value="14">第一次回看 14 天</option>
                     <option value="30">第一次回看 30 天</option>
                     <option value="60">第一次回看 60 天</option>
@@ -922,7 +965,7 @@ export default function SettingsPage() {
               </FormStep>
               <FormStep number={3} title="繳款怎麼記錄？" tone="purple">
                 <div className="space-y-3">
-                  <Select name="payment_account_id" required>
+                  <Select name="payment_account_id" defaultValue={editingEmailRule ? String(editingEmailRule.payment_account_id) : ""} required>
                     <option value="">選擇扣款帳戶</option>
                     {paymentAccounts.map((account) => (
                       <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
@@ -930,7 +973,7 @@ export default function SettingsPage() {
                   </Select>
                   <Input name="statement_password" type="password" autoComplete="off" placeholder="電子帳單 PDF 密碼（選填）" />
                   <label className="flex items-start gap-3 rounded-xl bg-slate-50 p-3 text-sm text-slate-600">
-                    <input name="auto_pay" type="checkbox" defaultChecked className="mt-1" />
+                    <input name="auto_pay" type="checkbox" defaultChecked={editingEmailRule?.auto_pay ?? true} className="mt-1" />
                     <span>到繳款日自動在財務居記錄扣款；餘額不足或金額不合理時先暫停並提醒。</span>
                   </label>
                 </div>
@@ -938,7 +981,7 @@ export default function SettingsPage() {
             </div>
             <div className="flex justify-end">
               <Button type="submit" disabled={saveEmailRule.isPending || !cardAccounts.length || !paymentAccounts.length}>
-                <Save size={15} /> {saveEmailRule.isPending ? "儲存中…" : "儲存自動記帳規則"}
+                <Save size={15} /> {saveEmailRule.isPending ? "儲存中…" : editingEmailRule ? "儲存規則變更" : "儲存自動記帳規則"}
               </Button>
             </div>
             {!cardAccounts.length && (
@@ -965,17 +1008,21 @@ export default function SettingsPage() {
                   <p>主旨：{rule.subject_pattern || "不限"}</p>
                   <p>PDF 密碼：{rule.statement_password_configured ? "已安全儲存" : "未設定"}</p>
                 </div>
-                <Button
-                  className="mt-3"
-                  variant="ghost"
-                  onClick={() => {
-                    if (window.confirm(`停止「${rule.name}」的郵件同步嗎？既有資料會保留。`)) {
-                      deactivateEmailRule.mutate(rule.id);
-                    }
-                  }}
-                >
-                  停止規則
-                </Button>
+                <div className="mt-3 flex flex-wrap gap-2">
+                  <Button variant="secondary" onClick={() => startEditingEmailRule(rule)}>
+                    編輯規則
+                  </Button>
+                  <Button
+                    variant="ghost"
+                    onClick={() => {
+                      if (window.confirm(`停止「${rule.name}」的郵件同步嗎？既有資料會保留。`)) {
+                        deactivateEmailRule.mutate(rule.id);
+                      }
+                    }}
+                  >
+                    停止規則
+                  </Button>
+                </div>
               </div>
             ))}
           </div>
