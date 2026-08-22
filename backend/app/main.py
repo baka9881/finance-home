@@ -116,6 +116,7 @@ from .services import (
     DEFAULT_RULES,
 )
 from .email_sync import (
+    _refresh_current_gmail_card_balance,
     complete_gmail_authorization,
     disconnect_gmail,
     frontend_settings_url,
@@ -179,6 +180,16 @@ async def lifespan(_: FastAPI):
     with Session(engine) as db:
         seed_defaults(db)
         seed_demo(db)
+        adjusted_email_balances = False
+        for rule in db.scalars(
+            select(EmailCardRule)
+            .where(EmailCardRule.active.is_(True))
+            .order_by(EmailCardRule.id)
+        ).all():
+            if _refresh_current_gmail_card_balance(db, rule) is not None:
+                adjusted_email_balances = True
+        if adjusted_email_balances:
+            record_valuation(db)
         db.commit()
     yield
 
