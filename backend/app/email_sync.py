@@ -356,10 +356,32 @@ def _cathay_digest_transactions(compact: str, message_date: date) -> list[dict[s
     """Parse Cathay's consumption digest, whose labels and values use separate table rows."""
     lines = [line.strip() for line in compact.splitlines() if line.strip()]
     transactions: list[dict[str, Any]] = []
-    for index, line in enumerate(lines[:-1]):
-        if "消費金額" not in line or "商店名稱" not in line:
+    for index, line in enumerate(lines):
+        if "消費金額" not in line:
             continue
-        value_cells = [cell.strip() for cell in lines[index + 1].split("\t") if cell.strip()]
+
+        # Cathay's production HTML puts each <td> on its own source line, while
+        # simpler emails keep a complete table row on one line.  Reconstruct the
+        # header and value rows from either representation.
+        header_end = index
+        header_window: list[str] = []
+        while header_end < min(len(lines), index + 6):
+            header_window.extend(
+                cell.strip() for cell in lines[header_end].split("\t") if cell.strip()
+            )
+            if "備註" in lines[header_end]:
+                break
+            header_end += 1
+        if not any("商店名稱" in cell for cell in header_window):
+            continue
+
+        value_cells: list[str] = []
+        value_index = header_end + 1
+        while value_index < len(lines) and len(value_cells) < 4:
+            value_cells.extend(
+                cell.strip() for cell in lines[value_index].split("\t") if cell.strip()
+            )
+            value_index += 1
         if not value_cells:
             continue
         amount_match = re.match(
@@ -374,7 +396,7 @@ def _cathay_digest_transactions(compact: str, message_date: date) -> list[dict[s
             continue
         description = value_cells[1] if len(value_cells) > 1 else "信用卡消費"
         transaction_date = message_date
-        for previous in reversed(lines[max(0, index - 3):index]):
+        for previous in reversed(lines[max(0, index - 10):index]):
             date_match = re.search(r"\b\d{4}[/.-]\d{1,2}[/.-]\d{1,2}\b", previous)
             if date_match:
                 transaction_date = _parse_date(date_match.group(0), message_date) or message_date

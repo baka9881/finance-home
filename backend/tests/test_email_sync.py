@@ -69,9 +69,25 @@ def test_parse_cathay_consumption_digest_table() -> None:
     text = _plain_html(
         """
         <table>
-          <tr><td>正卡</td><td>6196</td><td>2026/08/21</td><td>16:05</td><td>TW</td></tr>
-          <tr><td colspan="2">消費金額</td><td>商店名稱</td><td>消費類別</td><td>備註</td></tr>
-          <tr><td colspan="2">NT$50</td><td>統一超商－鑽寶</td><td>超市∕量販</td><td>&nbsp;</td></tr>
+          <tr>
+            <td>正卡</td>
+            <td>6196</td>
+            <td>2026/08/21</td>
+            <td>16:05</td>
+            <td>TW</td>
+          </tr>
+          <tr>
+            <td colspan="2">消費金額</td>
+            <td>商店名稱</td>
+            <td>消費類別</td>
+            <td>備註</td>
+          </tr>
+          <tr>
+            <td colspan="2">NT$50</td>
+            <td>統一超商－鑽寶</td>
+            <td>超市∕量販</td>
+            <td>&nbsp;</td>
+          </tr>
         </table>
         """
     )
