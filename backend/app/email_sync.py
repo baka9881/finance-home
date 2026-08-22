@@ -246,6 +246,21 @@ def _gmail_get(token: str, path: str, params: dict[str, Any] | None = None) -> d
     return payload
 
 
+def _gmail_search_value(value: str) -> str:
+    """Quote a user-entered Gmail search value without broadening the query."""
+    return value.replace("\\", "\\\\").replace('"', '\\"').strip()
+
+
+def _gmail_rule_search_query(rule: EmailCardRule) -> str:
+    """Build a narrow Gmail query before downloading any message bodies."""
+    terms = [f"newer_than:{rule.lookback_days}d"]
+    if rule.sender_pattern:
+        terms.append(f'from:"{_gmail_search_value(rule.sender_pattern)}"')
+    if rule.subject_pattern:
+        terms.append(f'subject:"{_gmail_search_value(rule.subject_pattern)}"')
+    return " ".join(terms)
+
+
 def _decode_gmail_data(value: str | None) -> bytes:
     if not value:
         return b""
@@ -697,21 +712,26 @@ def sync_gmail(db: Session) -> dict[str, Any]:
         return result
 
     token = _gmail_access_token(db)
-    max_lookback = max(rule.lookback_days for rule in rules)
     message_ids: list[str] = []
-    page_token: str | None = None
-    for _ in range(5):
-        params: dict[str, Any] = {
-            "q": f"newer_than:{max_lookback}d",
-            "maxResults": 100,
-        }
-        if page_token:
-            params["pageToken"] = page_token
-        listed = _gmail_get(token, "/messages", params)
-        message_ids.extend(str(item["id"]) for item in listed.get("messages") or [])
-        page_token = listed.get("nextPageToken")
-        if not page_token:
-            break
+    seen_message_ids: set[str] = set()
+    for rule in rules:
+        page_token: str | None = None
+        for _ in range(5):
+            params: dict[str, Any] = {
+                "q": _gmail_rule_search_query(rule),
+                "maxResults": 100,
+            }
+            if page_token:
+                params["pageToken"] = page_token
+            listed = _gmail_get(token, "/messages", params)
+            for item in listed.get("messages") or []:
+                message_id = str(item["id"])
+                if message_id not in seen_message_ids:
+                    seen_message_ids.add(message_id)
+                    message_ids.append(message_id)
+            page_token = listed.get("nextPageToken")
+            if not page_token:
+                break
 
     result: dict[str, Any] = {
         "messages_scanned": len(message_ids),

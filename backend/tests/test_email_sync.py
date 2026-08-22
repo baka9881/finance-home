@@ -1,5 +1,6 @@
 from datetime import date
 from decimal import Decimal
+from types import SimpleNamespace
 
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
@@ -12,7 +13,11 @@ from app.database import (
     EmailCardRule,
     Transaction,
 )
-from app.email_sync import parse_card_email, process_due_card_bills
+from app.email_sync import (
+    _gmail_rule_search_query,
+    parse_card_email,
+    process_due_card_bills,
+)
 from app.services import create_balance_snapshot, get_latest_balance, seed_defaults
 
 
@@ -229,6 +234,30 @@ def test_due_bill_does_not_create_the_same_payment_twice() -> None:
     ).all()
     assert len(rows) == 2
     db.close()
+
+
+def test_gmail_rule_search_query_uses_sender_and_subject_filters() -> None:
+    rule = SimpleNamespace(
+        lookback_days=90,
+        sender_pattern="cathaybk.com.tw",
+        subject_pattern="信用卡",
+    )
+
+    assert _gmail_rule_search_query(rule) == (
+        'newer_than:90d from:"cathaybk.com.tw" subject:"信用卡"'
+    )
+
+
+def test_gmail_rule_search_query_escapes_quotes_and_supports_one_filter() -> None:
+    rule = SimpleNamespace(
+        lookback_days=30,
+        sender_pattern=None,
+        subject_pattern='電子「帳單"通知',
+    )
+
+    assert _gmail_rule_search_query(rule) == (
+        'newer_than:30d subject:"電子「帳單\\"通知"'
+    )
 
 
 def decimal_amount(snapshot: BalanceSnapshot | None) -> Decimal:
