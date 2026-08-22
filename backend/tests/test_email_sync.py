@@ -14,6 +14,7 @@ from app.database import (
     Transaction,
 )
 from app.email_sync import (
+    _refresh_current_gmail_card_balance,
     _gmail_rule_search_query,
     _plain_html,
     parse_card_email,
@@ -102,6 +103,75 @@ def test_parse_cathay_consumption_digest_table() -> None:
             "kind": "expense",
         }
     ]
+
+
+def test_gmail_card_balance_uses_current_month_without_old_statements() -> None:
+    db = make_session()
+    payment = Account(
+        name="生活費帳戶",
+        account_type="bank",
+        nature="asset",
+        currency="TWD",
+        owner="me",
+    )
+    card = Account(
+        name="國泰信用卡",
+        account_type="credit_card",
+        nature="liability",
+        currency="TWD",
+        owner="me",
+    )
+    db.add_all([payment, card])
+    db.flush()
+    create_balance_snapshot(db, card, Decimal("27806"), date(2026, 8, 21))
+    rule = EmailCardRule(
+        name="國泰信用卡",
+        owner="me",
+        card_account_id=card.id,
+        payment_account_id=payment.id,
+        sender_pattern="cathaybk.com.tw",
+        auto_pay=True,
+        active=True,
+    )
+    db.add(rule)
+    db.flush()
+    db.add_all(
+        [
+            Transaction(
+                account_id=card.id,
+                transaction_date=date(2026, 7, 30),
+                description="舊月份消費",
+                amount=Decimal("-20000"),
+                currency="TWD",
+                fx_rate=Decimal("1"),
+                base_amount=Decimal("-20000"),
+                transaction_kind="expense",
+                fingerprint="gmail-old",
+                source="gmail",
+            ),
+            Transaction(
+                account_id=card.id,
+                transaction_date=date(2026, 8, 10),
+                description="本月消費",
+                amount=Decimal("-6458"),
+                currency="TWD",
+                fx_rate=Decimal("1"),
+                base_amount=Decimal("-6458"),
+                transaction_kind="expense",
+                fingerprint="gmail-current",
+                source="gmail",
+            ),
+        ]
+    )
+    db.flush()
+
+    rebuilt = _refresh_current_gmail_card_balance(db, rule, date(2026, 8, 23))
+
+    assert rebuilt == Decimal("6458")
+    latest = get_latest_balance(db, card.id)
+    assert decimal_amount(latest) == Decimal("6458")
+    assert latest.source == "gmail_current_month"
+    db.close()
 
 
 def test_due_bill_creates_internal_transfer_and_updates_balances() -> None:

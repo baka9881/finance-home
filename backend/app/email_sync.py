@@ -560,17 +560,54 @@ def _create_card_transaction(
     )
     db.add(row)
     db.flush()
-    latest = get_latest_balance(db, account.id)
-    current = decimal_value(latest.amount) if latest else ZERO
-    snapshot_date = max(transaction_date, latest.snapshot_date) if latest else transaction_date
+    return True
+
+
+def _refresh_current_gmail_card_balance(
+    db: Session, rule: EmailCardRule, as_of: date | None = None
+) -> Decimal | None:
+    """Rebuild the current card liability from this month's Gmail activity.
+
+    Gmail synchronization may backfill several months of purchase notices.  Those
+    historical transactions belong in cash-flow analysis, but adding every one of
+    them to the latest balance makes already-paid statements become current debt.
+    The balance shown for an email-managed card is therefore rebuilt from the
+    current calendar month's Gmail purchases, refunds and recorded repayments.
+    """
+    as_of = as_of or date.today()
+    month_start = as_of.replace(day=1)
+    rows = db.scalars(
+        select(Transaction).where(
+            Transaction.account_id == rule.card_account_id,
+            Transaction.transaction_date >= month_start,
+            Transaction.transaction_date <= as_of,
+            Transaction.source.in_(["gmail", "gmail_autopay"]),
+        )
+    ).all()
+    if not rows:
+        return None
+
+    balance = max(
+        ZERO,
+        -sum((decimal_value(item.amount) for item in rows), ZERO),
+    )
+    latest = get_latest_balance(db, rule.card_account_id)
+    if (
+        latest
+        and latest.snapshot_date == as_of
+        and decimal_value(latest.amount) == balance
+        and latest.source == "gmail_current_month"
+    ):
+        return balance
+
     create_balance_snapshot(
         db,
-        account,
-        _next_balance(account, current, amount),
-        snapshot_date,
-        source="gmail",
+        rule.card_account,
+        balance,
+        as_of,
+        source="gmail_current_month",
     )
-    return True
+    return balance
 
 
 def _create_or_update_bill(
@@ -892,6 +929,14 @@ def sync_gmail(db: Session) -> dict[str, Any]:
 
     payment_result = process_due_card_bills(db)
     result["payments_created"] = payment_result["paid"]
+    adjusted_balances: dict[str, float] = {}
+    for rule in rules:
+        rebuilt = _refresh_current_gmail_card_balance(db, rule)
+        if rebuilt is not None:
+            adjusted_balances[rule.card_account.name] = float(rebuilt)
+    result["adjusted_card_balances"] = adjusted_balances
+    if adjusted_balances:
+        record_valuation(db)
     _set_setting(db, "gmail:last_sync_at", datetime.utcnow().isoformat(timespec="seconds"))
     _set_setting(db, "gmail:last_error", "、".join(result["errors"]))
     _set_setting(db, "gmail:last_result", json.dumps(result, ensure_ascii=False, default=str))
