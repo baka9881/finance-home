@@ -269,8 +269,9 @@ def _decode_gmail_data(value: str | None) -> bytes:
 
 def _plain_html(value: str) -> str:
     value = re.sub(r"(?is)<(script|style).*?>.*?</\1>", " ", value)
+    value = re.sub(r"(?i)</(?:td|th)>", "\t", value)
     value = re.sub(r"(?i)<br\s*/?>|</p>|</div>|</tr>", "\n", value)
-    return re.sub(r"[ \t]+", " ", unescape(re.sub(r"(?s)<[^>]+>", " ", value)))
+    return re.sub(r" +", " ", unescape(re.sub(r"(?s)<[^>]+>", " ", value)))
 
 
 def _pdf_text(content: bytes, password: str | None) -> str:
@@ -351,9 +352,49 @@ DATE_VALUE = r"((?:\d{2,4}[年/.-])?\d{1,2}[月/.-]\d{1,2}日?)"
 MONEY_VALUE = r"(?:NT\$|NTD|TWD|新臺幣|新台幣|US\$|USD|\$)?\s*([\d,]+(?:\.\d{1,2})?)"
 
 
+def _cathay_digest_transactions(compact: str, message_date: date) -> list[dict[str, Any]]:
+    """Parse Cathay's consumption digest, whose labels and values use separate table rows."""
+    lines = [line.strip() for line in compact.splitlines() if line.strip()]
+    transactions: list[dict[str, Any]] = []
+    for index, line in enumerate(lines[:-1]):
+        if "消費金額" not in line or "商店名稱" not in line:
+            continue
+        value_cells = [cell.strip() for cell in lines[index + 1].split("\t") if cell.strip()]
+        if not value_cells:
+            continue
+        amount_match = re.match(
+            r"^(?:NT\$|NTD|TWD|新臺幣|新台幣|\$)?\s*([\d,]+(?:\.\d{1,2})?)",
+            value_cells[0],
+            re.I,
+        )
+        if not amount_match:
+            continue
+        amount = _money(amount_match.group(1))
+        if not amount or amount <= 0:
+            continue
+        description = value_cells[1] if len(value_cells) > 1 else "信用卡消費"
+        transaction_date = message_date
+        for previous in reversed(lines[max(0, index - 3):index]):
+            date_match = re.search(r"\b\d{4}[/.-]\d{1,2}[/.-]\d{1,2}\b", previous)
+            if date_match:
+                transaction_date = _parse_date(date_match.group(0), message_date) or message_date
+                break
+        transactions.append(
+            {
+                "date": transaction_date,
+                "description": description,
+                "amount": -amount,
+                "kind": "expense",
+            }
+        )
+    return transactions
+
+
 def parse_card_email(text: str, message_date: date) -> dict[str, Any]:
+    cathay_transactions = _cathay_digest_transactions(text, message_date)
     compact = re.sub(r"[\u3000\t]+", " ", text)
     result: dict[str, Any] = {"transactions": [], "bill": None}
+    result["transactions"].extend(cathay_transactions)
     bill_amount_match = re.search(
         rf"(?:應繳總金額|本期應繳金額|本期帳單金額|本期應繳款|total\s+amount\s+due|amount\s+due)\s*[:：]?\s*{MONEY_VALUE}",
         compact,
@@ -743,12 +784,13 @@ def sync_gmail(db: Session) -> dict[str, Any]:
         "errors": [],
     }
     for message_id in message_ids:
-        if db.scalar(
+        existing_record = db.scalar(
             select(EmailImportRecord).where(
                 EmailImportRecord.provider == "gmail",
                 EmailImportRecord.provider_message_id == message_id,
             )
-        ):
+        )
+        if existing_record and existing_record.status != "no_finance_data":
             result["ignored"] += 1
             continue
         message = _gmail_get(token, f"/messages/{message_id}", {"format": "full"})
@@ -780,8 +822,16 @@ def sync_gmail(db: Session) -> dict[str, Any]:
                 1 for item in parsed["transactions"] if _create_card_transaction(db, rule, item, message_id)
             )
             bill_created = bool(parsed["bill"] and _create_or_update_bill(db, rule, parsed["bill"], message_id))
-            db.add(
-                EmailImportRecord(
+            if existing_record:
+                existing_record.rule_id = rule.id
+                existing_record.message_date = message_datetime
+                existing_record.sender = sender[:300]
+                existing_record.subject = subject[:500]
+                existing_record.status = "processed" if imported or parsed["bill"] else "no_finance_data"
+                existing_record.imported_transactions = imported
+                existing_record.error = None
+            else:
+                db.add(EmailImportRecord(
                     provider="gmail",
                     provider_message_id=message_id,
                     rule_id=rule.id,
@@ -790,16 +840,22 @@ def sync_gmail(db: Session) -> dict[str, Any]:
                     subject=subject[:500],
                     status="processed" if imported or parsed["bill"] else "no_finance_data",
                     imported_transactions=imported,
-                )
-            )
+                ))
             db.commit()
             result["matched"] += 1
             result["transactions_imported"] += imported
             result["bills_found"] += int(bill_created)
         except Exception as exc:
             db.rollback()
-            db.add(
-                EmailImportRecord(
+            if existing_record:
+                existing_record.rule_id = rule.id
+                existing_record.message_date = message_datetime
+                existing_record.sender = sender[:300]
+                existing_record.subject = subject[:500]
+                existing_record.status = "error"
+                existing_record.error = str(exc)
+            else:
+                db.add(EmailImportRecord(
                     provider="gmail",
                     provider_message_id=message_id,
                     rule_id=rule.id,
@@ -808,8 +864,7 @@ def sync_gmail(db: Session) -> dict[str, Any]:
                     subject=subject[:500],
                     status="error",
                     error=str(exc),
-                )
-            )
+                ))
             db.commit()
             result["errors"].append(f"{subject or message_id}：{exc}")
 

@@ -15,6 +15,7 @@ from app.database import (
 )
 from app.email_sync import (
     _gmail_rule_search_query,
+    _plain_html,
     parse_card_email,
     process_due_card_bills,
 )
@@ -62,6 +63,29 @@ def test_parse_purchase_notification_and_statement() -> None:
         "due_date": date(2026, 9, 9),
         "statement_date": date(2026, 8, 23),
     }
+
+
+def test_parse_cathay_consumption_digest_table() -> None:
+    text = _plain_html(
+        """
+        <table>
+          <tr><td>正卡</td><td>6196</td><td>2026/08/21</td><td>16:05</td><td>TW</td></tr>
+          <tr><td colspan="2">消費金額</td><td>商店名稱</td><td>消費類別</td><td>備註</td></tr>
+          <tr><td colspan="2">NT$50</td><td>統一超商－鑽寶</td><td>超市∕量販</td><td>&nbsp;</td></tr>
+        </table>
+        """
+    )
+
+    parsed = parse_card_email(text, date(2026, 8, 22))
+
+    assert parsed["transactions"] == [
+        {
+            "date": date(2026, 8, 21),
+            "description": "統一超商－鑽寶",
+            "amount": Decimal("-50"),
+            "kind": "expense",
+        }
+    ]
 
 
 def test_due_bill_creates_internal_transfer_and_updates_balances() -> None:
