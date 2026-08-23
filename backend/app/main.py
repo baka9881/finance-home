@@ -93,12 +93,14 @@ from .services import (
     create_balance_snapshot,
     decimal_value,
     disconnect_binance_account,
+    effective_transaction_kind,
     encrypt_credential,
     export_backup,
     get_latest_balance,
     import_csv,
     inspect_csv,
     latest_fx_rate,
+    linked_transfer_transaction_ids,
     pending_csv_balance_status,
     position_summary,
     reclassify_uncategorized_transactions,
@@ -107,6 +109,7 @@ from .services import (
     refresh_market_prices,
     recurring_expense_signature,
     repair_cross_source_card_duplicates,
+    repair_linked_transfer_kinds,
     restore_backup,
     seed_defaults,
     seed_demo,
@@ -181,6 +184,10 @@ async def lifespan(_: FastAPI):
     with Session(engine) as db:
         seed_defaults(db)
         seed_demo(db)
+        # Reconcile historical data at startup so a deployed fix is effective
+        # immediately instead of waiting for the next hourly automation run.
+        repair_linked_transfer_kinds(db)
+        repair_cross_source_card_duplicates(db)
         adjusted_email_balances = False
         for rule in db.scalars(
             select(EmailCardRule)
@@ -391,6 +398,13 @@ def run_automatic_updates() -> None:
             market_result = {"updated": 0, "skipped": 0, "warnings": [], "errors": []}
             errors.append(f"行情：{exc}")
 
+        transfer_repair: dict[str, int] | None = None
+        try:
+            transfer_repair = repair_linked_transfer_kinds(db)
+        except Exception as exc:
+            db.rollback()
+            errors.append(f"帳戶互轉整理：{exc}")
+
         duplicate_repair: dict[str, Any] | None = None
         try:
             # Existing CSV/Gmail duplicates must be repairable even after the
@@ -435,6 +449,9 @@ def run_automatic_updates() -> None:
             ),
             "duplicate_card_transactions_removed": int(
                 (duplicate_repair or {}).get("removed", 0)
+            ),
+            "linked_transfer_kinds_repaired": int(
+                (transfer_repair or {}).get("updated", 0)
             ),
             "warnings": [
                 *[
@@ -754,6 +771,7 @@ def list_transactions(
         except ValueError as exc:
             raise HTTPException(422, "月份格式必須是 YYYY-MM") from exc
     rows = db.scalars(query.limit(limit)).all()
+    linked_ids = linked_transfer_transaction_ids(db)
     return [
         {
             "id": item.id,
@@ -766,7 +784,7 @@ def list_transactions(
             "base_amount": float(item.base_amount),
             "fx_rate": float(item.fx_rate),
             "fx_estimated": item.fx_estimated,
-            "transaction_kind": item.transaction_kind,
+            "transaction_kind": effective_transaction_kind(item, linked_ids),
             "category_id": item.category_id,
             "category_name": item.category.name if item.category else "未分類",
             "category_color": item.category.color if item.category else "#94a3b8",
@@ -853,9 +871,22 @@ def update_transaction(transaction_id: int, payload: TransactionUpdate, db: DB):
     values = payload.model_dump(
         exclude_unset=True, exclude={"create_rule", "rule_keyword"}
     )
+    linked = db.scalar(
+        select(TransferLink).where(
+            TransferLink.confirmed.is_(True),
+            (TransferLink.from_transaction_id == transaction_id)
+            | (TransferLink.to_transaction_id == transaction_id)
+        )
+    )
+    if linked:
+        # A category edit must never turn one side of an internal transfer back
+        # into income/expense.  TransferLink is the accounting source of truth.
+        values.pop("transaction_kind", None)
+        if row.transaction_kind != "debt_principal":
+            row.transaction_kind = "transfer"
     for key, value in values.items():
         setattr(row, key, value)
-    if payload.create_rule and payload.category_id:
+    if payload.create_rule and payload.category_id and not linked:
         keyword = (payload.rule_keyword or payload.description or row.description).strip()
         if keyword:
             rule = db.scalar(

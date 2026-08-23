@@ -248,6 +248,49 @@ def transaction_fingerprint(
     return hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
 
+def linked_transfer_transaction_ids(db: Session) -> set[int]:
+    """Return every transaction that belongs to a confirmed account movement.
+
+    A transaction's category/kind can be edited independently from its
+    TransferLink.  Cash-flow calculations therefore use the relationship as
+    the source of truth instead of trusting the editable label alone.
+    """
+    confirmed_links = TransferLink.confirmed.is_(True)
+    return set(
+        db.scalars(
+            select(TransferLink.from_transaction_id).where(confirmed_links)
+        ).all()
+    ) | set(
+        db.scalars(
+            select(TransferLink.to_transaction_id).where(confirmed_links)
+        ).all()
+    )
+
+
+def effective_transaction_kind(
+    transaction: Transaction, linked_ids: set[int]
+) -> str:
+    if transaction.id in linked_ids and transaction.transaction_kind != "debt_principal":
+        return "transfer"
+    return transaction.transaction_kind
+
+
+def repair_linked_transfer_kinds(db: Session) -> dict[str, int]:
+    """Restore corrupted transfer labels while preserving loan principal rows."""
+    linked_ids = linked_transfer_transaction_ids(db)
+    if not linked_ids:
+        return {"updated": 0}
+    rows = db.scalars(select(Transaction).where(Transaction.id.in_(linked_ids))).all()
+    updated = 0
+    for row in rows:
+        if row.transaction_kind not in {"transfer", "debt_principal"}:
+            row.transaction_kind = "transfer"
+            updated += 1
+    if updated:
+        db.commit()
+    return {"updated": updated}
+
+
 def classify_transaction(db: Session, description: str, amount: Decimal) -> tuple[int | None, str]:
     normalized_description = unicodedata.normalize("NFKC", description).casefold()
     rules = db.scalars(
@@ -273,10 +316,13 @@ def reclassify_uncategorized_transactions(db: Session, owner: str = "all") -> di
     if not uncategorized:
         return {"updated": 0, "remaining": 0}
 
+    linked_ids = linked_transfer_transaction_ids(db)
     query = select(Transaction).where(
         or_(Transaction.category_id.is_(None), Transaction.category_id == uncategorized.id),
         Transaction.transaction_kind.notin_(["transfer", "investment", "debt_principal"]),
     )
+    if linked_ids:
+        query = query.where(Transaction.id.notin_(linked_ids))
     if owner != "all":
         query = query.join(Account).where(Account.owner == owner)
 
@@ -296,6 +342,8 @@ def reclassify_uncategorized_transactions(db: Session, owner: str = "all") -> di
         or_(Transaction.category_id.is_(None), Transaction.category_id == uncategorized.id),
         Transaction.transaction_kind.notin_(["transfer", "investment", "debt_principal"]),
     )
+    if linked_ids:
+        remaining_query = remaining_query.where(Transaction.id.notin_(linked_ids))
     if owner != "all":
         remaining_query = remaining_query.join(Account).where(Account.owner == owner)
     remaining = int(db.scalar(remaining_query) or 0)
@@ -541,7 +589,10 @@ def calculate_dashboard(db: Session, owner: str = "all") -> dict[str, Any]:
     )
     if owner != "all":
         transaction_query = transaction_query.where(Account.owner == owner)
-    month_transactions = db.scalars(transaction_query).all()
+    linked_ids = linked_transfer_transaction_ids(db)
+    month_transactions = [
+        item for item in db.scalars(transaction_query).all() if item.id not in linked_ids
+    ]
     income = sum(
         (
             decimal_value(tx.base_amount)
@@ -577,6 +628,8 @@ def calculate_dashboard(db: Session, owner: str = "all") -> dict[str, Any]:
         .group_by(Category.id)
         .order_by(func.sum(func.abs(Transaction.base_amount)).desc())
     )
+    if linked_ids:
+        category_query = category_query.where(Transaction.id.notin_(linked_ids))
     if owner != "all":
         category_query = category_query.where(Account.owner == owner)
     category_rows = db.execute(category_query).all()
@@ -596,7 +649,9 @@ def calculate_dashboard(db: Session, owner: str = "all") -> dict[str, Any]:
         )
         if owner != "all":
             month_query = month_query.where(Account.owner == owner)
-        rows = db.scalars(month_query).all()
+        rows = [
+            item for item in db.scalars(month_query).all() if item.id not in linked_ids
+        ]
         month_income = sum(
             (decimal_value(item.base_amount) for item in rows if item.transaction_kind == "income"),
             ZERO,
@@ -843,7 +898,10 @@ def calculate_spending_analysis(
     )
     if owner != "all":
         month_query = month_query.where(Account.owner == owner)
-    month_rows = db.scalars(month_query).all()
+    linked_ids = linked_transfer_transaction_ids(db)
+    month_rows = [
+        row for row in db.scalars(month_query).all() if row.id not in linked_ids
+    ]
 
     category_totals: dict[tuple[str, str], Decimal] = defaultdict(lambda: ZERO)
     month_expense = ZERO
@@ -863,7 +921,9 @@ def calculate_spending_analysis(
     )
     if owner != "all":
         recurring_query = recurring_query.where(Account.owner == owner)
-    recurring_rows = db.scalars(recurring_query).all()
+    recurring_rows = [
+        row for row in db.scalars(recurring_query).all() if row.id not in linked_ids
+    ]
 
     groups: dict[tuple[int, str], dict[str, Any]] = {}
     for row in recurring_rows:
@@ -1050,7 +1110,10 @@ def calculate_health_score(db: Session, owner: str = "all") -> dict[str, Any]:
     )
     if owner != "all":
         transaction_query = transaction_query.where(Account.owner == owner)
-    transactions = db.scalars(transaction_query).all()
+    linked_ids = linked_transfer_transaction_ids(db)
+    transactions = [
+        row for row in db.scalars(transaction_query).all() if row.id not in linked_ids
+    ]
     income = sum(
         (decimal_value(tx.base_amount) for tx in transactions if tx.transaction_kind == "income"),
         ZERO,
@@ -1107,9 +1170,8 @@ def calculate_health_score(db: Session, owner: str = "all") -> dict[str, Any]:
     current_spend = sum(
         (
             abs(decimal_value(tx.base_amount))
-            for tx in db.scalars(
-                current_transaction_query
-            ).all()
+            for tx in db.scalars(current_transaction_query).all()
+            if tx.id not in linked_ids
             if tx.transaction_kind in {"expense", "interest"}
         ),
         ZERO,
@@ -1383,15 +1445,60 @@ def detach_csv_balance_effect(
     return True
 
 
+def _matched_cross_source_csv_rows(
+    gmail_rows: list[Transaction], csv_rows: list[Transaction]
+) -> list[Transaction]:
+    gmail_groups: dict[tuple[str, date, Decimal, str], list[Transaction]] = defaultdict(list)
+    csv_groups: dict[tuple[str, date, Decimal, str], list[Transaction]] = defaultdict(list)
+    for row in gmail_rows:
+        owner = getattr(row.account, "owner", None) or "me"
+        gmail_groups[
+            (owner, row.transaction_date, decimal_value(row.amount), row.currency)
+        ].append(row)
+    for row in csv_rows:
+        owner = getattr(row.account, "owner", None) or "me"
+        csv_groups[
+            (owner, row.transaction_date, decimal_value(row.amount), row.currency)
+        ].append(row)
+
+    duplicates: list[Transaction] = []
+    for key in gmail_groups.keys() & csv_groups.keys():
+        gmail_candidates = sorted(gmail_groups[key], key=lambda row: row.id)
+        csv_candidates = sorted(csv_groups[key], key=lambda row: row.id)
+        matched_csv_ids: set[int] = set()
+
+        for gmail_row in gmail_candidates:
+            matching = [
+                csv_row
+                for csv_row in csv_candidates
+                if csv_row.id not in matched_csv_ids
+                and _normalized_duplicate_description(csv_row.description)
+                == _normalized_duplicate_description(gmail_row.description)
+            ]
+            if len(matching) == 1:
+                matched_csv_ids.add(matching[0].id)
+
+        remaining_csv = [row for row in csv_candidates if row.id not in matched_csv_ids]
+        unmatched_gmail_count = len(gmail_candidates) - len(matched_csv_ids)
+        # Date, signed amount, currency, owner and equal multiplicity is a safe
+        # fallback for bank/Gmail descriptions that use unrelated merchant labels.
+        if remaining_csv and len(remaining_csv) == unmatched_gmail_count:
+            matched_csv_ids.update(row.id for row in remaining_csv)
+        duplicates.extend(row for row in csv_candidates if row.id in matched_csv_ids)
+    return duplicates
+
+
 def repair_cross_source_card_duplicates(db: Session) -> dict[str, Any]:
-    """Remove CSV copies of Gmail card purchases linked through an email rule."""
+    """Remove CSV copies of Gmail card purchases, even after Gmail disconnects."""
     removed = 0
     duplicate_amount = ZERO
     corrected_accounts: set[int] = set()
     preserved_accounts: set[int] = set()
-    rules = db.scalars(
-        select(EmailCardRule).where(EmailCardRule.active.is_(True))
-    ).all()
+    duplicates_by_id: dict[int, Transaction] = {}
+
+    # Keep historical/inactive rules useful for repairing old data after the
+    # Gmail OAuth connection has been removed.
+    rules = db.scalars(select(EmailCardRule)).all()
     for rule in rules:
         gmail_rows = list(
             db.scalars(
@@ -1411,49 +1518,74 @@ def repair_cross_source_card_duplicates(db: Session) -> dict[str, Any]:
                 )
             ).all()
         )
-        gmail_groups: dict[tuple[date, Decimal, str], list[Transaction]] = defaultdict(list)
-        csv_groups: dict[tuple[date, Decimal, str], list[Transaction]] = defaultdict(list)
-        for row in gmail_rows:
-            gmail_groups[(row.transaction_date, decimal_value(row.amount), row.currency)].append(row)
-        for row in csv_rows:
-            csv_groups[(row.transaction_date, decimal_value(row.amount), row.currency)].append(row)
+        for row in _matched_cross_source_csv_rows(gmail_rows, csv_rows):
+            duplicates_by_id[row.id] = row
 
-        duplicates_to_remove: list[Transaction] = []
-        for key in gmail_groups.keys() & csv_groups.keys():
-            gmail_candidates = sorted(gmail_groups[key], key=lambda row: row.id)
-            csv_candidates = sorted(csv_groups[key], key=lambda row: row.id)
-            matched_csv_ids: set[int] = set()
-
-            for gmail_row in gmail_candidates:
-                matching = [
-                    csv_row
-                    for csv_row in csv_candidates
-                    if csv_row.id not in matched_csv_ids
-                    and _normalized_duplicate_description(csv_row.description)
-                    == _normalized_duplicate_description(gmail_row.description)
-                ]
-                if len(matching) == 1:
-                    matched_csv_ids.add(matching[0].id)
-
-            remaining_csv = [row for row in csv_candidates if row.id not in matched_csv_ids]
-            unmatched_gmail_count = len(gmail_candidates) - len(matched_csv_ids)
-            # Linked account, date, amount and equal multiplicity is a safe
-            # fallback when bank and Gmail merchant labels differ completely.
-            if remaining_csv and len(remaining_csv) == unmatched_gmail_count:
-                matched_csv_ids.update(row.id for row in remaining_csv)
-            duplicates_to_remove.extend(
-                row for row in csv_candidates if row.id in matched_csv_ids
+    # If the rule itself was removed, infer the relationship from immutable
+    # source/account facts: Gmail purchase on a credit-card account versus a
+    # CSV copy belonging to the same owner.
+    gmail_rows = list(
+        db.scalars(
+            select(Transaction)
+            .join(Account)
+            .where(
+                Transaction.source == "gmail",
+                Transaction.transaction_kind != "transfer",
+                Transaction.amount < 0,
+                Account.account_type == "credit_card",
             )
+        ).all()
+    )
+    csv_rows = list(
+        db.scalars(
+            select(Transaction)
+            .join(Account)
+            .where(
+                Transaction.source == "csv",
+                Transaction.transaction_kind != "transfer",
+                Transaction.amount < 0,
+            )
+        ).all()
+    )
+    gmail_by_account: dict[int, list[Transaction]] = defaultdict(list)
+    csv_by_account: dict[int, list[Transaction]] = defaultdict(list)
+    for row in gmail_rows:
+        gmail_by_account[row.account_id].append(row)
+    for row in csv_rows:
+        csv_by_account[row.account_id].append(row)
 
-        payment_account = rule.payment_account
-        for csv_row in duplicates_to_remove:
-            if detach_csv_balance_effect(db, payment_account, csv_row):
-                corrected_accounts.add(payment_account.id)
-            else:
-                preserved_accounts.add(payment_account.id)
-            duplicate_amount += abs(decimal_value(csv_row.base_amount))
-            db.delete(csv_row)
-            removed += 1
+    # Without a saved rule, only infer a card/payment-account relationship
+    # after at least three statement rows agree.  A single same-day/same-amount
+    # purchase can be coincidental and must never be deleted automatically.
+    for card_rows in gmail_by_account.values():
+        card_owner = getattr(card_rows[0].account, "owner", None) or "me"
+        candidates: list[tuple[int, list[Transaction]]] = []
+        for payment_rows in csv_by_account.values():
+            payment_owner = getattr(payment_rows[0].account, "owner", None) or "me"
+            if payment_owner != card_owner:
+                continue
+            matches = _matched_cross_source_csv_rows(card_rows, payment_rows)
+            if len(matches) >= 3:
+                candidates.append((len(matches), matches))
+        if not candidates:
+            continue
+        best_count = max(count for count, _ in candidates)
+        best_matches = [matches for count, matches in candidates if count == best_count]
+        if len(best_matches) != 1:
+            # Ambiguous payment account: retain all rows for manual review.
+            continue
+        for row in best_matches[0]:
+            duplicates_by_id[row.id] = row
+
+    for csv_row in duplicates_by_id.values():
+        account = csv_row.account
+        if detach_csv_balance_effect(db, account, csv_row):
+            corrected_accounts.add(account.id)
+        else:
+            preserved_accounts.add(account.id)
+        duplicate_amount += abs(decimal_value(csv_row.base_amount))
+        db.delete(csv_row)
+        removed += 1
 
     if removed:
         record_valuation(db)

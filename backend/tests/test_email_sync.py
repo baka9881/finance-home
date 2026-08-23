@@ -13,6 +13,7 @@ from app.database import (
     CreditCardBill,
     EmailCardRule,
     Transaction,
+    TransferLink,
 )
 from app.email_sync import (
     _create_card_transaction,
@@ -23,10 +24,12 @@ from app.email_sync import (
     process_due_card_bills,
 )
 from app.services import (
+    calculate_dashboard,
     create_balance_snapshot,
     get_latest_balance,
     import_csv,
     repair_cross_source_card_duplicates,
+    repair_linked_transfer_kinds,
     seed_defaults,
 )
 
@@ -409,6 +412,178 @@ def test_existing_cross_source_repair_preserves_newer_manual_balance() -> None:
     remaining = db.scalars(select(Transaction).order_by(Transaction.id)).all()
     assert len(remaining) == 4
     assert all(row.account_id == card.id and row.source == "gmail" for row in remaining)
+    db.close()
+
+
+def test_cross_source_repair_works_after_email_rule_is_removed() -> None:
+    db = make_session()
+    payment = Account(
+        name="生活費帳戶",
+        account_type="bank",
+        nature="asset",
+        currency="TWD",
+        owner="me",
+    )
+    card = Account(
+        name="國泰信用卡",
+        account_type="credit_card",
+        nature="liability",
+        currency="TWD",
+        owner="me",
+    )
+    db.add_all([payment, card])
+    db.flush()
+    for index, (transaction_date, amount) in enumerate(
+        [
+            (date(2026, 7, 19), Decimal("-148")),
+            (date(2026, 7, 20), Decimal("-208")),
+            (date(2026, 7, 21), Decimal("-42")),
+        ]
+    ):
+        db.add_all(
+            [
+                Transaction(
+                    account_id=payment.id,
+                    transaction_date=transaction_date,
+                    description=f"銀行摘要 {index}",
+                    amount=amount,
+                    currency="TWD",
+                    fx_rate=Decimal("1"),
+                    base_amount=amount,
+                    transaction_kind="expense",
+                    fingerprint=f"csv-without-rule-{index}",
+                    source="csv",
+                ),
+                Transaction(
+                    account_id=card.id,
+                    transaction_date=transaction_date,
+                    description=f"信用卡商店 {index}",
+                    amount=amount,
+                    currency="TWD",
+                    fx_rate=Decimal("1"),
+                    base_amount=amount,
+                    transaction_kind="expense",
+                    fingerprint=f"gmail-without-rule-{index}",
+                    source="gmail",
+                ),
+            ]
+        )
+    db.commit()
+
+    result = repair_cross_source_card_duplicates(db)
+
+    assert result["removed"] == 3
+    remaining = db.scalars(select(Transaction)).all()
+    assert len(remaining) == 3
+    assert all(row.source == "gmail" for row in remaining)
+    db.close()
+
+
+def test_ruleless_cross_source_repair_keeps_a_single_coincidental_match() -> None:
+    db = make_session()
+    payment = Account(
+        name="生活費帳戶",
+        account_type="bank",
+        nature="asset",
+        currency="TWD",
+        owner="me",
+    )
+    card = Account(
+        name="信用卡",
+        account_type="credit_card",
+        nature="liability",
+        currency="TWD",
+        owner="me",
+    )
+    db.add_all([payment, card])
+    db.flush()
+    for account, source, fingerprint in [
+        (payment, "csv", "coincidental-csv"),
+        (card, "gmail", "coincidental-gmail"),
+    ]:
+        db.add(
+            Transaction(
+                account_id=account.id,
+                transaction_date=date(2026, 7, 19),
+                description="不同的消費",
+                amount=Decimal("-100"),
+                currency="TWD",
+                fx_rate=Decimal("1"),
+                base_amount=Decimal("-100"),
+                transaction_kind="expense",
+                fingerprint=fingerprint,
+                source=source,
+            )
+        )
+    db.commit()
+
+    result = repair_cross_source_card_duplicates(db)
+
+    assert result["removed"] == 0
+    assert len(db.scalars(select(Transaction)).all()) == 2
+    db.close()
+
+
+def test_linked_transfer_relationship_overrides_corrupted_income_kind() -> None:
+    db = make_session()
+    source = Account(
+        name="家中現金",
+        account_type="cash",
+        nature="asset",
+        currency="TWD",
+        owner="me",
+    )
+    target = Account(
+        name="生活費帳戶",
+        account_type="bank",
+        nature="asset",
+        currency="TWD",
+        owner="me",
+    )
+    db.add_all([source, target])
+    db.flush()
+    outgoing = Transaction(
+        account_id=source.id,
+        transaction_date=date.today(),
+        description="帳戶轉帳 → 生活費帳戶",
+        amount=Decimal("-79000"),
+        currency="TWD",
+        fx_rate=Decimal("1"),
+        base_amount=Decimal("-79000"),
+        transaction_kind="transfer",
+        fingerprint="transfer-out",
+        source="manual",
+    )
+    incoming = Transaction(
+        account_id=target.id,
+        transaction_date=date.today(),
+        description="帳戶轉帳 ← 家中現金",
+        amount=Decimal("79000"),
+        currency="TWD",
+        fx_rate=Decimal("1"),
+        base_amount=Decimal("79000"),
+        transaction_kind="income",
+        fingerprint="transfer-in-corrupted",
+        source="manual",
+    )
+    db.add_all([outgoing, incoming])
+    db.flush()
+    db.add(
+        TransferLink(
+            from_transaction_id=outgoing.id,
+            to_transaction_id=incoming.id,
+            confirmed=True,
+        )
+    )
+    db.commit()
+
+    dashboard = calculate_dashboard(db, owner="me")
+    assert dashboard["month_income"] == 0
+    assert dashboard["month_expense"] == 0
+
+    result = repair_linked_transfer_kinds(db)
+    assert result == {"updated": 1}
+    assert incoming.transaction_kind == "transfer"
     db.close()
 
 

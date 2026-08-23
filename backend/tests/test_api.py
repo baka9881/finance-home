@@ -937,6 +937,37 @@ def test_account_transfer_is_not_treated_as_unclassified_expense(client: TestCli
     assert all(row["transaction_kind"] == "transfer" for row in rows)
 
 
+def test_linked_transfer_cannot_be_reclassified_as_income(client: TestClient):
+    source = create_account(client, "家中現金")
+    target = create_account(client, "生活費帳戶")
+    response = client.post(
+        "/api/account-transfers",
+        json={
+            "from_account_id": source,
+            "to_account_id": target,
+            "transfer_date": date.today().isoformat(),
+            "amount": 79000,
+            "description": "帳戶轉帳",
+        },
+    )
+    assert response.status_code == 201, response.text
+
+    incoming = next(
+        row for row in client.get("/api/transactions").json() if row["amount"] > 0
+    )
+    update = client.patch(
+        f"/api/transactions/{incoming['id']}",
+        json={"transaction_kind": "income"},
+    )
+    assert update.status_code == 200, update.text
+
+    rows = client.get("/api/transactions").json()
+    assert all(row["transaction_kind"] == "transfer" for row in rows)
+    dashboard = client.get("/api/dashboard").json()
+    assert dashboard["month_income"] == 0
+    assert dashboard["month_expense"] == 0
+
+
 def test_csv_import_big5_and_duplicate_detection(client: TestClient):
     account_id = create_account(client, "CSV 帳戶")
     csv_text = "日期,摘要,支出,收入,餘額\n115/07/01,早餐,80,,99920\n115/07/02,薪資,,30000,129920\n"
