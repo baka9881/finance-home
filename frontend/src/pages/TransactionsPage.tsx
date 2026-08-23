@@ -238,7 +238,11 @@ export default function TransactionsPage() {
       );
     }
     if (onlyUnclassified) {
-      rows = rows.filter((transaction) => transaction.category_name === "未分類");
+      rows = rows.filter(
+        (transaction) =>
+          transaction.transaction_kind !== "transfer" &&
+          transaction.category_name === "未分類",
+      );
     }
     return rows;
   }, [transactions.data, search, onlyUnclassified, showTransfers]);
@@ -273,9 +277,35 @@ export default function TransactionsPage() {
   const updateTransaction = useMutation({
     mutationFn: ({ id, payload }: { id: number; payload: Record<string, unknown> }) =>
       api(`/transactions/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
-    onSuccess: () => {
+    onSuccess: (_result, variables) => {
       client.invalidateQueries({ queryKey: ["transactions"] });
       client.invalidateQueries({ queryKey: ["dashboard"] });
+
+      const previous = (transactions.data || []).find(
+        (transaction) => transaction.id === variables.id,
+      );
+      const selectedCategory = categories.data?.find(
+        (category) => category.id === Number(variables.payload.category_id),
+      );
+      const completedManualClassification =
+        previous?.transaction_kind !== "transfer" &&
+        previous?.category_name === "未分類" &&
+        selectedCategory?.name !== "未分類";
+
+      if (completedManualClassification && onlyUnclassified) {
+        const remaining = (transactions.data || []).filter(
+          (transaction) =>
+            transaction.id !== variables.id &&
+            transaction.transaction_kind !== "transfer" &&
+            transaction.category_name === "未分類",
+        ).length;
+        if (remaining === 0) {
+          setOnlyUnclassified(false);
+          setClassificationMessage("分類完成，已返回完整交易清單。");
+        } else {
+          setClassificationMessage(`已完成一筆分類，還有 ${remaining} 筆待處理。`);
+        }
+      }
     },
   });
 

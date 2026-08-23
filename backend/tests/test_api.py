@@ -434,6 +434,103 @@ def test_binance_funding_wallet_updates_existing_stock_position(
     assert positions[0]["price"] == 94.64
 
 
+def test_binance_light_sync_preserves_and_repairs_managed_stock_position(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
+    client.post(
+        "/api/fx/manual",
+        json={
+            "currency": "USD",
+            "rate_date": date.today().isoformat(),
+            "rate_to_twd": 32,
+        },
+    )
+    account_response = client.post(
+        "/api/accounts",
+        json={
+            "name": "幣安交易所",
+            "institution": "Binance",
+            "account_type": "crypto",
+            "nature": "asset",
+            "currency": "TWD",
+            "is_liquid": True,
+            "opening_balance": 0,
+            "opening_date": date.today().isoformat(),
+        },
+    )
+    account_id = account_response.json()["id"]
+    created = client.post(
+        "/api/positions",
+        json={
+            "account_id": account_id,
+            "market": "US",
+            "symbol": "MSTR",
+            "name": "微策略",
+            "quantity": 4.3,
+            "average_cost": 92.39,
+            "currency": "USD",
+            "manual_price": 94.64,
+        },
+    )
+    position_id = created.json()["id"]
+
+    funding_balances = [
+        {"asset": "MSTR", "free": "4.3", "locked": "0", "freeze": "0"}
+    ]
+    monkeypatch.setattr(
+        services_module,
+        "_fetch_binance_spot_snapshot",
+        lambda _key, _secret, **_kwargs: (
+            [{"asset": "USDT", "free": "100", "locked": "0"}],
+            {},
+            services_module.Decimal("500"),
+            funding_balances,
+            {"MSTR": "MSTR"},
+            [],
+            [],
+            [],
+        ),
+    )
+
+    connected = client.post(
+        "/api/exchanges/binance/connect",
+        json={
+            "account_id": account_id,
+            "api_key": "read-only-key",
+            "api_secret": "read-only-secret",
+        },
+    )
+    assert connected.status_code == 200, connected.text
+
+    # A later light sync can omit Binance Stocks entirely. It must not treat
+    # that omission as proof that the holding was sold.
+    funding_balances.clear()
+    refreshed = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert refreshed.status_code == 200, refreshed.text
+    positions = client.get("/api/positions").json()
+    assert [item["symbol"] for item in positions] == ["MSTR"]
+    assert positions[0]["quantity"] == 4.3
+
+    # Repair positions that an older version already archived incorrectly.
+    archived = client.post(f"/api/positions/{position_id}/archive")
+    assert archived.status_code == 200, archived.text
+    disconnected = client.delete(f"/api/exchanges/binance/{account_id}")
+    assert disconnected.status_code == 200, disconnected.text
+    repaired = client.post(
+        "/api/exchanges/binance/connect",
+        json={
+            "account_id": account_id,
+            "api_key": "read-only-key",
+            "api_secret": "read-only-secret",
+        },
+    )
+    assert repaired.status_code == 200, repaired.text
+    positions = client.get("/api/positions").json()
+    assert [item["symbol"] for item in positions] == ["MSTR"]
+
+
 def test_binance_stock_trades_apply_only_new_fills_after_baseline(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

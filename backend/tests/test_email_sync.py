@@ -7,6 +7,7 @@ from sqlalchemy.orm import Session
 
 from app.database import (
     Account,
+    AppSetting,
     BalanceSnapshot,
     Base,
     CreditCardBill,
@@ -14,13 +15,20 @@ from app.database import (
     Transaction,
 )
 from app.email_sync import (
+    _create_card_transaction,
     _refresh_current_gmail_card_balance,
     _gmail_rule_search_query,
     _plain_html,
     parse_card_email,
     process_due_card_bills,
 )
-from app.services import create_balance_snapshot, get_latest_balance, seed_defaults
+from app.services import (
+    create_balance_snapshot,
+    get_latest_balance,
+    import_csv,
+    repair_cross_source_card_duplicates,
+    seed_defaults,
+)
 
 
 def make_session() -> Session:
@@ -171,6 +179,236 @@ def test_gmail_card_balance_uses_current_month_without_old_statements() -> None:
     latest = get_latest_balance(db, card.id)
     assert decimal_amount(latest) == Decimal("6458")
     assert latest.source == "gmail_current_month"
+    db.close()
+
+
+def test_csv_import_skips_purchase_already_recorded_by_linked_gmail_card() -> None:
+    db = make_session()
+    payment = Account(
+        name="生活費帳戶",
+        account_type="bank",
+        nature="asset",
+        currency="TWD",
+        owner="me",
+    )
+    card = Account(
+        name="國泰信用卡",
+        account_type="credit_card",
+        nature="liability",
+        currency="TWD",
+        owner="me",
+    )
+    db.add_all([payment, card])
+    db.flush()
+    create_balance_snapshot(db, payment, Decimal("10000"), date(2026, 7, 1))
+    db.add(
+        EmailCardRule(
+            name="國泰信用卡",
+            owner="me",
+            card_account_id=card.id,
+            payment_account_id=payment.id,
+            active=True,
+        )
+    )
+    db.add(
+        Transaction(
+            account_id=card.id,
+            transaction_date=date(2026, 7, 19),
+            description="APPLE.COM/BILL",
+            amount=Decimal("-208"),
+            currency="TWD",
+            fx_rate=Decimal("1"),
+            base_amount=Decimal("-208"),
+            transaction_kind="expense",
+            fingerprint="gmail-apple",
+            source="gmail",
+        )
+    )
+    db.commit()
+
+    result = import_csv(
+        db,
+        b"date,description,amount,currency\n2026-07-19,APPLE.COM/BILL,-208,TWD\n",
+        payment,
+        {
+            "date": "date",
+            "description": "description",
+            "amount": "amount",
+            "currency": "currency",
+        },
+    )
+
+    assert result["imported"] == 0
+    assert result["duplicates"] == 1
+    assert decimal_amount(get_latest_balance(db, payment.id)) == Decimal("10000")
+    assert len(db.scalars(select(Transaction)).all()) == 1
+    db.close()
+
+
+def test_gmail_purchase_claims_csv_copy_and_reverses_active_csv_balance() -> None:
+    db = make_session()
+    payment = Account(
+        name="生活費帳戶",
+        account_type="bank",
+        nature="asset",
+        currency="TWD",
+        owner="me",
+    )
+    card = Account(
+        name="國泰信用卡",
+        account_type="credit_card",
+        nature="liability",
+        currency="TWD",
+        owner="me",
+    )
+    db.add_all([payment, card])
+    db.flush()
+    rule = EmailCardRule(
+        name="國泰信用卡",
+        owner="me",
+        card_account_id=card.id,
+        payment_account_id=payment.id,
+        active=True,
+    )
+    db.add(rule)
+    db.flush()
+    create_balance_snapshot(db, payment, Decimal("10000"), date(2026, 7, 1))
+    csv_row = Transaction(
+        account_id=payment.id,
+        transaction_date=date(2026, 7, 19),
+        description="APPLE.COM/BILL",
+        amount=Decimal("-208"),
+        currency="TWD",
+        fx_rate=Decimal("1"),
+        base_amount=Decimal("-208"),
+        transaction_kind="expense",
+        fingerprint="csv-apple",
+        source="csv",
+    )
+    db.add(csv_row)
+    db.flush()
+    create_balance_snapshot(
+        db, payment, Decimal("9792"), date(2026, 7, 19), source="csv_transactions"
+    )
+    db.add(
+        AppSetting(
+            key=f"csv_balance_applied:{payment.id}",
+            value=f"[{csv_row.id}]",
+        )
+    )
+    db.commit()
+
+    created = _create_card_transaction(
+        db,
+        rule,
+        {
+            "date": date(2026, 7, 19),
+            "description": "APPLE.COM/BILL",
+            "amount": Decimal("-208"),
+            "kind": "expense",
+        },
+        "message-apple",
+    )
+    db.commit()
+
+    rows = db.scalars(select(Transaction)).all()
+    assert created is True
+    assert len(rows) == 1
+    assert rows[0].account_id == card.id
+    assert rows[0].source == "gmail"
+    assert decimal_amount(get_latest_balance(db, payment.id)) == Decimal("10000")
+    db.close()
+
+
+def test_existing_cross_source_repair_preserves_newer_manual_balance() -> None:
+    db = make_session()
+    payment = Account(
+        name="生活費帳戶",
+        account_type="bank",
+        nature="asset",
+        currency="TWD",
+        owner="me",
+    )
+    card = Account(
+        name="國泰信用卡",
+        account_type="credit_card",
+        nature="liability",
+        currency="TWD",
+        owner="me",
+    )
+    db.add_all([payment, card])
+    db.flush()
+    db.add(
+        EmailCardRule(
+            name="國泰信用卡",
+            owner="me",
+            card_account_id=card.id,
+            payment_account_id=payment.id,
+            active=True,
+        )
+    )
+    db.flush()
+    csv_rows: list[Transaction] = []
+    for index, (tx_date, amount, description) in enumerate(
+        [
+            (date(2026, 6, 30), Decimal("-119"), "GOOGLE YOUTUBE"),
+            (date(2026, 7, 19), Decimal("-208"), "APPLE.COM/BILL"),
+            (date(2026, 7, 20), Decimal("-42"), "全聯福利中心 A"),
+            (date(2026, 7, 20), Decimal("-42"), "全聯福利中心 B"),
+        ]
+    ):
+        csv_row = Transaction(
+            account_id=payment.id,
+            transaction_date=tx_date,
+            description=description,
+            amount=amount,
+            currency="TWD",
+            fx_rate=Decimal("1"),
+            base_amount=amount,
+            transaction_kind="expense",
+            fingerprint=f"csv-{index}",
+            source="csv",
+        )
+        gmail_description = {
+            0: "YOUTUBE PREMIUM",
+            2: "福利中心甲",
+            3: "福利中心乙",
+        }.get(index, description)
+        gmail_row = Transaction(
+            account_id=card.id,
+            transaction_date=tx_date,
+            description=gmail_description,
+            amount=amount,
+            currency="TWD",
+            fx_rate=Decimal("1"),
+            base_amount=amount,
+            transaction_kind="expense",
+            fingerprint=f"gmail-{index}",
+            source="gmail",
+        )
+        db.add_all([csv_row, gmail_row])
+        csv_rows.append(csv_row)
+    db.flush()
+    db.add(
+        AppSetting(
+            key=f"csv_balance_applied:{payment.id}",
+            value="[" + ",".join(str(row.id) for row in csv_rows) + "]",
+        )
+    )
+    create_balance_snapshot(db, payment, Decimal("61403"), date(2026, 7, 31), source="csv_transactions")
+    create_balance_snapshot(db, payment, Decimal("61730"), date(2026, 8, 18), source="manual")
+    db.commit()
+
+    result = repair_cross_source_card_duplicates(db)
+
+    assert result["removed"] == 4
+    assert result["duplicate_amount_twd"] == 411
+    assert result["balance_corrected_accounts"] == 0
+    assert result["newer_balance_preserved_accounts"] == 1
+    assert decimal_amount(get_latest_balance(db, payment.id)) == Decimal("61730")
+    remaining = db.scalars(select(Transaction).order_by(Transaction.id)).all()
+    assert len(remaining) == 4
+    assert all(row.account_id == card.id and row.source == "gmail" for row in remaining)
     db.close()
 
 

@@ -666,6 +666,165 @@ def recurring_expense_signature(description: str) -> str:
     return _recurring_display_name(description).casefold()
 
 
+_STRONG_RECURRING_KEYWORDS = (
+    "月費",
+    "月租",
+    "訂閱",
+    "subscription",
+    "subscr",
+    "房貸",
+    "車貸",
+    "信貸",
+    "貸款",
+    "房租",
+    "租金",
+    "管理費",
+    "健身房",
+    "保險",
+    "電信",
+    "網路費",
+    "netflix",
+    "spotify",
+    "youtube premium",
+    "youtubepremium",
+    "chatgpt",
+    "openai",
+    "icloud",
+    "google one",
+    "googleone",
+    "microsoft 365",
+    "microsoft365",
+    "office 365",
+    "office365",
+    "adobe",
+    "disney+",
+    "disney plus",
+    "disneyplus",
+)
+
+_VARIABLE_SPENDING_KEYWORDS = (
+    "蝦皮",
+    "shopee",
+    "全家便利商店",
+    "familymart",
+    "統一超商",
+    "7-eleven",
+    "7eleven",
+    "全聯",
+    "家樂福",
+    "萊爾富",
+    "ok超商",
+    "高鐵",
+    "臺灣鐵路",
+    "台灣鐵路",
+    "鐵路公司",
+    "網路購票",
+    "車票",
+    "uber",
+    "foodpanda",
+)
+
+_GENERIC_RECURRING_CATEGORIES = {
+    "居住",
+    "水電與通訊",
+    "保險",
+    "稅務",
+    "利息與費用",
+}
+
+
+def _recurring_detection_signature(description: str) -> str:
+    """Collapse harmless statement variations without changing display text."""
+    normalized = recurring_expense_signature(description)
+    normalized = re.sub(r"(?:網路購票?|網購)$", "", normalized)
+    normalized = re.sub(r"\d{4,}", "", normalized)
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", normalized)
+
+
+def _recurring_keyword_signature(value: str) -> str:
+    return re.sub(
+        r"[^0-9a-z\u4e00-\u9fff]+",
+        "",
+        recurring_expense_signature(value),
+    )
+
+
+def _month_number(value: str) -> int:
+    year, month_number = map(int, value.split("-"))
+    return year * 12 + month_number
+
+
+def _recurring_dates_are_consistent(
+    monthly: dict[str, dict[str, Any]], tolerance: int
+) -> bool:
+    representative_days: list[int] = []
+    for item in monthly.values():
+        dates = item.get("dates") or []
+        if dates:
+            representative_days.append(round(sum(value.day for value in dates) / len(dates)))
+    if len(representative_days) < 2:
+        return False
+
+    # Days 31 and 1 are close around a month boundary. Measure the shortest
+    # span on a 31-day circle so weekend/holiday posting shifts are tolerated.
+    ordered = sorted(representative_days)
+    gaps = [right - left for left, right in zip(ordered, ordered[1:])]
+    gaps.append(ordered[0] + 31 - ordered[-1])
+    shortest_span = 31 - max(gaps)
+    return shortest_span <= tolerance
+
+
+def _is_detected_recurring_group(group: dict[str, Any]) -> bool:
+    monthly = group["months"]
+    category_name = max(group["categories"], key=group["categories"].get)
+    normalized_name = _recurring_detection_signature(group["name"])
+    strong_signal = (
+        group["has_loan_principal"]
+        or category_name == "訂閱"
+        or any(
+            _recurring_keyword_signature(keyword) in normalized_name
+            for keyword in _STRONG_RECURRING_KEYWORDS
+        )
+    )
+
+    required_months = 2 if strong_signal else 3
+    if len(monthly) < required_months:
+        return False
+    if max(item["count"] for item in monthly.values()) > 2:
+        return False
+
+    observed_months = sorted(_month_number(value) for value in monthly)
+    if any(
+        current - previous != 1
+        for previous, current in zip(observed_months, observed_months[1:])
+    ):
+        return False
+
+    if not strong_signal:
+        if category_name not in _GENERIC_RECURRING_CATEGORIES:
+            return False
+        if any(
+            _recurring_keyword_signature(keyword) in normalized_name
+            for keyword in _VARIABLE_SPENDING_KEYWORDS
+        ):
+            return False
+        if any(item["count"] != 1 for item in monthly.values()):
+            return False
+
+    amounts = [item["amount"] for item in monthly.values()]
+    average = sum(amounts, ZERO) / Decimal(len(amounts))
+    if average <= 0:
+        return False
+    variation_limit = Decimal("0.15") if strong_signal else Decimal("0.10")
+    if any(abs(amount - average) / average > variation_limit for amount in amounts):
+        return False
+
+    return _recurring_dates_are_consistent(
+        monthly,
+        tolerance=10 if strong_signal else 7,
+    )
+
+
 def calculate_spending_analysis(
     db: Session, month: str, owner: str = "all"
 ) -> dict[str, Any]:
@@ -711,14 +870,17 @@ def calculate_spending_analysis(
         display_name = _recurring_display_name(row.description)
         if not display_name:
             continue
-        key = (row.account_id, recurring_expense_signature(display_name))
+        key = (row.account_id, _recurring_detection_signature(display_name))
         group = groups.setdefault(
             key,
             {
                 "name": display_name,
                 "account_id": row.account_id,
                 "account_name": row.account.name,
-                "months": defaultdict(lambda: {"amount": ZERO, "count": 0}),
+                "months": defaultdict(
+                    lambda: {"amount": ZERO, "count": 0, "dates": []}
+                ),
+                "names": defaultdict(int),
                 "categories": defaultdict(int),
                 "has_loan_principal": False,
                 "latest_date": row.transaction_date,
@@ -727,6 +889,8 @@ def calculate_spending_analysis(
         row_month = row.transaction_date.strftime("%Y-%m")
         group["months"][row_month]["amount"] += abs(decimal_value(row.base_amount))
         group["months"][row_month]["count"] += 1
+        group["months"][row_month]["dates"].append(row.transaction_date)
+        group["names"][display_name] += 1
         category_name = row.category.name if row.category else "未分類"
         group["categories"][category_name] += 1
         group["has_loan_principal"] = group["has_loan_principal"] or row.transaction_kind == "debt_principal"
@@ -736,16 +900,16 @@ def calculate_spending_analysis(
     recurring_expenses: list[dict[str, Any]] = []
     for group in groups.values():
         monthly = group["months"]
-        if len(monthly) < 2 or max(item["count"] for item in monthly.values()) > 2:
-            continue
         if month not in monthly and previous_month not in monthly:
+            continue
+        group["name"] = max(
+            group["names"],
+            key=lambda name: (group["names"][name], len(name), name),
+        )
+        if not _is_detected_recurring_group(group):
             continue
         amounts = [item["amount"] for item in monthly.values()]
         average = sum(amounts, ZERO) / Decimal(len(amounts))
-        if average <= 0:
-            continue
-        if any(abs(amount - average) / average > Decimal("0.20") for amount in amounts):
-            continue
         if group["has_loan_principal"]:
             category_name = "貸款"
         else:
@@ -1119,6 +1283,189 @@ def _csv_transactions_balance_delta(
     return balance_delta
 
 
+def _normalized_duplicate_description(value: str) -> str:
+    """Normalize merchant text only for resolving otherwise ambiguous matches."""
+    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", value.casefold())
+
+
+def _pick_cross_source_duplicate(
+    candidates: list[Transaction], description: str
+) -> Transaction | None:
+    if len(candidates) == 1:
+        return candidates[0]
+    normalized = _normalized_duplicate_description(description)
+    exact = [
+        candidate
+        for candidate in candidates
+        if _normalized_duplicate_description(candidate.description) == normalized
+    ]
+    return exact[0] if len(exact) == 1 else None
+
+
+def find_linked_gmail_transaction_for_csv(
+    db: Session,
+    payment_account_id: int,
+    transaction_date: date,
+    amount: Decimal,
+    currency: str,
+    description: str,
+) -> Transaction | None:
+    """Find the card-side copy of a statement row imported to its payment account."""
+    card_account_ids = list(
+        db.scalars(
+            select(EmailCardRule.card_account_id).where(
+                EmailCardRule.payment_account_id == payment_account_id,
+                EmailCardRule.active.is_(True),
+            )
+        ).all()
+    )
+    if not card_account_ids:
+        return None
+    candidates = db.scalars(
+        select(Transaction).where(
+            Transaction.account_id.in_(card_account_ids),
+            Transaction.transaction_date == transaction_date,
+            Transaction.amount == amount,
+            Transaction.currency == currency,
+            Transaction.source == "gmail",
+            Transaction.transaction_kind != "transfer",
+        )
+    ).all()
+    return _pick_cross_source_duplicate(list(candidates), description)
+
+
+def find_linked_csv_transaction_for_gmail(
+    db: Session,
+    rule: EmailCardRule,
+    transaction_date: date,
+    amount: Decimal,
+    currency: str,
+    description: str,
+) -> Transaction | None:
+    """Find the payment-account CSV copy before creating a Gmail card row."""
+    candidates = db.scalars(
+        select(Transaction).where(
+            Transaction.account_id == rule.payment_account_id,
+            Transaction.transaction_date == transaction_date,
+            Transaction.amount == amount,
+            Transaction.currency == currency,
+            Transaction.source == "csv",
+            Transaction.transaction_kind != "transfer",
+        )
+    ).all()
+    return _pick_cross_source_duplicate(list(candidates), description)
+
+
+def detach_csv_balance_effect(
+    db: Session, account: Account, transaction: Transaction
+) -> bool:
+    """Remove a CSV row's balance effect without overwriting a newer manual snapshot."""
+    applied_ids = _csv_balance_applied_ids(db, account.id)
+    if transaction.id not in applied_ids:
+        return False
+    applied_ids.discard(transaction.id)
+    _store_csv_balance_applied_ids(db, account.id, applied_ids)
+
+    latest = get_latest_balance(db, account.id)
+    if not latest or latest.source not in {"csv_transactions", "csv_dedup"}:
+        return False
+    transaction_delta = _csv_transactions_balance_delta(db, account, [transaction])
+    applied_effect = (
+        -transaction_delta if account.nature == "liability" else transaction_delta
+    )
+    create_balance_snapshot(
+        db,
+        account,
+        decimal_value(latest.amount) - applied_effect,
+        max(date.today(), latest.snapshot_date),
+        source="csv_dedup",
+    )
+    return True
+
+
+def repair_cross_source_card_duplicates(db: Session) -> dict[str, Any]:
+    """Remove CSV copies of Gmail card purchases linked through an email rule."""
+    removed = 0
+    duplicate_amount = ZERO
+    corrected_accounts: set[int] = set()
+    preserved_accounts: set[int] = set()
+    rules = db.scalars(
+        select(EmailCardRule).where(EmailCardRule.active.is_(True))
+    ).all()
+    for rule in rules:
+        gmail_rows = list(
+            db.scalars(
+                select(Transaction).where(
+                    Transaction.account_id == rule.card_account_id,
+                    Transaction.source == "gmail",
+                    Transaction.transaction_kind != "transfer",
+                )
+            ).all()
+        )
+        csv_rows = list(
+            db.scalars(
+                select(Transaction).where(
+                    Transaction.account_id == rule.payment_account_id,
+                    Transaction.source == "csv",
+                    Transaction.transaction_kind != "transfer",
+                )
+            ).all()
+        )
+        gmail_groups: dict[tuple[date, Decimal, str], list[Transaction]] = defaultdict(list)
+        csv_groups: dict[tuple[date, Decimal, str], list[Transaction]] = defaultdict(list)
+        for row in gmail_rows:
+            gmail_groups[(row.transaction_date, decimal_value(row.amount), row.currency)].append(row)
+        for row in csv_rows:
+            csv_groups[(row.transaction_date, decimal_value(row.amount), row.currency)].append(row)
+
+        duplicates_to_remove: list[Transaction] = []
+        for key in gmail_groups.keys() & csv_groups.keys():
+            gmail_candidates = sorted(gmail_groups[key], key=lambda row: row.id)
+            csv_candidates = sorted(csv_groups[key], key=lambda row: row.id)
+            matched_csv_ids: set[int] = set()
+
+            for gmail_row in gmail_candidates:
+                matching = [
+                    csv_row
+                    for csv_row in csv_candidates
+                    if csv_row.id not in matched_csv_ids
+                    and _normalized_duplicate_description(csv_row.description)
+                    == _normalized_duplicate_description(gmail_row.description)
+                ]
+                if len(matching) == 1:
+                    matched_csv_ids.add(matching[0].id)
+
+            remaining_csv = [row for row in csv_candidates if row.id not in matched_csv_ids]
+            unmatched_gmail_count = len(gmail_candidates) - len(matched_csv_ids)
+            # Linked account, date, amount and equal multiplicity is a safe
+            # fallback when bank and Gmail merchant labels differ completely.
+            if remaining_csv and len(remaining_csv) == unmatched_gmail_count:
+                matched_csv_ids.update(row.id for row in remaining_csv)
+            duplicates_to_remove.extend(
+                row for row in csv_candidates if row.id in matched_csv_ids
+            )
+
+        payment_account = rule.payment_account
+        for csv_row in duplicates_to_remove:
+            if detach_csv_balance_effect(db, payment_account, csv_row):
+                corrected_accounts.add(payment_account.id)
+            else:
+                preserved_accounts.add(payment_account.id)
+            duplicate_amount += abs(decimal_value(csv_row.base_amount))
+            db.delete(csv_row)
+            removed += 1
+
+    if removed:
+        record_valuation(db)
+    db.commit()
+    return {
+        "removed": removed,
+        "duplicate_amount_twd": float(duplicate_amount),
+        "balance_corrected_accounts": len(corrected_accounts),
+        "newer_balance_preserved_accounts": len(preserved_accounts - corrected_accounts),
+    }
+
+
 def pending_csv_balance_status(db: Session, account: Account) -> dict[str, Any]:
     transactions = _pending_csv_balance_transactions(db, account)
     latest = get_latest_balance(db, account.id)
@@ -1212,6 +1559,7 @@ def import_csv(
             Transaction.transaction_kind == "transfer",
         )
     ).all()
+    matched_linked_gmail_ids: set[int] = set()
     balance_candidates: dict[str, Transaction] = {}
 
     for index, row in frame.iterrows():
@@ -1244,6 +1592,21 @@ def import_csv(
                     ),
                     None,
                 )
+            if existing_transaction is None:
+                linked_gmail_transaction = find_linked_gmail_transaction_for_csv(
+                    db,
+                    account.id,
+                    tx_date,
+                    amount,
+                    currency,
+                    description,
+                )
+                if (
+                    linked_gmail_transaction is not None
+                    and linked_gmail_transaction.id not in matched_linked_gmail_ids
+                ):
+                    existing_transaction = linked_gmail_transaction
+                    matched_linked_gmail_ids.add(linked_gmail_transaction.id)
             is_duplicate = existing_transaction is not None
             if is_duplicate:
                 duplicates += 1
@@ -2331,8 +2694,34 @@ def sync_binance_account(
         previous_ids = set()
     for position_id in previous_ids - seen_position_ids:
         position = db.get(Position, position_id)
-        if position and position.account_id == account.id:
-            position.archived = True
+        if not position or position.account_id != account.id:
+            continue
+        if position.market == "US" and decimal_value(position.quantity) > 0:
+            # Binance does not provide an authoritative positions endpoint for
+            # tokenized US stocks. A light sync can therefore omit MSTR even
+            # though it is still held. Keep (and repair) the last confirmed
+            # quantity; an explicit SELL fill is what archives a stock above.
+            position.archived = False
+            seen_position_ids.add(position.id)
+            continue
+        position.archived = True
+
+    # Versions before this guard could archive a positive US-stock position
+    # and then overwrite position_ids without it. Repair those rows even when
+    # the old managed-id checkpoint has already been lost. A completed SELL
+    # leaves quantity at zero, so it will not be reopened here.
+    archived_stock_positions = db.scalars(
+        select(Position).where(
+            Position.account_id == account.id,
+            Position.market == "US",
+            Position.archived.is_(True),
+        )
+    ).all()
+    for position in archived_stock_positions:
+        if decimal_value(position.quantity) <= 0:
+            continue
+        position.archived = False
+        seen_position_ids.add(position.id)
 
     if save_credentials:
         _set_setting_value(

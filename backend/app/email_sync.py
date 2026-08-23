@@ -32,11 +32,14 @@ from .services import (
     classify_transaction,
     create_balance_snapshot,
     decimal_value,
+    detach_csv_balance_effect,
     decrypt_credential,
     encrypt_credential,
+    find_linked_csv_transaction_for_gmail,
     get_latest_balance,
     latest_fx_rate,
     record_valuation,
+    repair_cross_source_card_duplicates,
     transaction_fingerprint,
 )
 
@@ -543,6 +546,28 @@ def _create_card_transaction(
     category_id, classified_kind = classify_transaction(db, description, amount)
     kind = item.get("kind") or classified_kind
     rate, estimated = latest_fx_rate(db, account.currency, transaction_date)
+    csv_copy = find_linked_csv_transaction_for_gmail(
+        db,
+        rule,
+        transaction_date,
+        amount,
+        account.currency,
+        description,
+    )
+    if csv_copy is not None:
+        detach_csv_balance_effect(db, rule.payment_account, csv_copy)
+        csv_copy.account_id = account.id
+        csv_copy.description = description
+        csv_copy.fx_rate = rate
+        csv_copy.base_amount = amount * rate
+        csv_copy.fx_estimated = estimated
+        csv_copy.transaction_kind = kind
+        csv_copy.category_id = category_id
+        csv_copy.fingerprint = fingerprint
+        csv_copy.source = "gmail"
+        csv_copy.note = f"Gmail 訊息 {source_message_id}（已合併原 CSV 明細）"
+        db.flush()
+        return True
     row = Transaction(
         account_id=account.id,
         transaction_date=transaction_date,
@@ -926,6 +951,15 @@ def sync_gmail(db: Session) -> dict[str, Any]:
                 ))
             db.commit()
             result["errors"].append(f"{subject or message_id}：{exc}")
+
+    duplicate_repair = repair_cross_source_card_duplicates(db)
+    result["cross_source_duplicates_removed"] = duplicate_repair["removed"]
+    result["cross_source_duplicate_amount_twd"] = duplicate_repair[
+        "duplicate_amount_twd"
+    ]
+    result["newer_balance_preserved_accounts"] = duplicate_repair[
+        "newer_balance_preserved_accounts"
+    ]
 
     payment_result = process_due_card_bills(db)
     result["payments_created"] = payment_result["paid"]
