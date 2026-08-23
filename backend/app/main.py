@@ -106,6 +106,7 @@ from .services import (
     refresh_fx_rates,
     refresh_market_prices,
     recurring_expense_signature,
+    repair_cross_source_card_duplicates,
     restore_backup,
     seed_defaults,
     seed_demo,
@@ -390,6 +391,16 @@ def run_automatic_updates() -> None:
             market_result = {"updated": 0, "skipped": 0, "warnings": [], "errors": []}
             errors.append(f"行情：{exc}")
 
+        duplicate_repair: dict[str, Any] | None = None
+        try:
+            # Existing CSV/Gmail duplicates must be repairable even after the
+            # user disconnects Gmail.  The operation is idempotent, so running
+            # it in the hourly automation cycle is safe.
+            duplicate_repair = repair_cross_source_card_duplicates(db)
+        except Exception as exc:
+            db.rollback()
+            errors.append(f"信用卡重複明細整理：{exc}")
+
         email_result: dict[str, Any] | None = None
         if gmail_status(db)["connected"]:
             try:
@@ -421,6 +432,9 @@ def run_automatic_updates() -> None:
             "email_bills_found": int((email_result or {}).get("bills_found", 0)),
             "email_payments_created": int(
                 (email_result or {}).get("payments_created", 0)
+            ),
+            "duplicate_card_transactions_removed": int(
+                (duplicate_repair or {}).get("removed", 0)
             ),
             "warnings": [
                 *[
