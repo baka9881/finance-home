@@ -7,7 +7,6 @@ import {
   ChevronLeft,
   Cloud,
   FileUp,
-  Goal,
   LayoutDashboard,
   LockKeyhole,
   LogOut,
@@ -29,7 +28,6 @@ const DashboardPage = lazy(() => import("./pages/DashboardPage"));
 const AccountsPage = lazy(() => import("./pages/AccountsPage"));
 const TransactionsPage = lazy(() => import("./pages/TransactionsPage"));
 const InvestmentsPage = lazy(() => import("./pages/InvestmentsPage"));
-const PlansPage = lazy(() => import("./pages/PlansPage"));
 const AnalysisPage = lazy(() => import("./pages/AnalysisPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 
@@ -38,12 +36,11 @@ const navigation = [
   { to: "/accounts", label: "帳戶", icon: WalletCards },
   { to: "/transactions", label: "交易", icon: ArrowLeftRight },
   { to: "/investments", label: "投資", icon: PieChart },
-  { to: "/plans", label: "財務目標", icon: Goal },
   { to: "/analysis", label: "財務分析", icon: BarChart3 },
   { to: "/settings", label: "設定", icon: Settings },
 ];
 
-const globalOwnerPaths = new Set(["/", "/accounts", "/transactions", "/investments", "/plans", "/analysis"]);
+const globalOwnerPaths = new Set(["/", "/accounts", "/transactions", "/investments", "/analysis"]);
 
 function useShowGlobalOwnerFilter() {
   const location = useLocation();
@@ -78,7 +75,7 @@ function GlobalOwnerBar() {
   return (
     <div className="sticky top-0 z-20 hidden h-14 items-center justify-between border-b border-slate-200/80 bg-canvas/90 px-10 backdrop-blur lg:flex">
       <GlobalOwnerSelect />
-      <p className="text-xs text-slate-400">會套用到總覽、帳戶、交易、投資持倉、財務目標與財務分析。</p>
+      <p className="text-xs text-slate-400">會套用到總覽、帳戶、交易、投資持倉與財務分析。</p>
     </div>
   );
 }
@@ -489,7 +486,7 @@ function FinanceApp() {
               <Route path="/accounts" element={<AccountsPage />} />
               <Route path="/transactions" element={<TransactionsPage />} />
               <Route path="/investments" element={<InvestmentsPage />} />
-              <Route path="/plans" element={<PlansPage />} />
+              <Route path="/plans" element={<Navigate to="/" replace />} />
               <Route path="/analysis" element={<AnalysisPage />} />
               <Route path="/settings" element={<SettingsPage />} />
               <Route path="*" element={<Navigate to="/" replace />} />

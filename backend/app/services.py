@@ -735,6 +735,9 @@ _STRONG_RECURRING_KEYWORDS = (
     "租金",
     "管理費",
     "健身房",
+    "健身",
+    "fitness",
+    "world gym",
     "保險",
     "電信",
     "網路費",
@@ -835,7 +838,7 @@ def _is_detected_recurring_group(group: dict[str, Any]) -> bool:
     normalized_name = _recurring_detection_signature(group["name"])
     strong_signal = (
         group["has_loan_principal"]
-        or category_name == "訂閱"
+        or group["categories"].get("訂閱", 0) > 0
         or any(
             _recurring_keyword_signature(keyword) in normalized_name
             for keyword in _STRONG_RECURRING_KEYWORDS
@@ -972,6 +975,10 @@ def calculate_spending_analysis(
         average = sum(amounts, ZERO) / Decimal(len(amounts))
         if group["has_loan_principal"]:
             category_name = "貸款"
+        elif group["categories"].get("訂閱", 0) > 0:
+            # A manual subscription classification is a stronger signal than
+            # an older generic statement classification such as "娛樂".
+            category_name = "訂閱"
         else:
             category_name = max(group["categories"], key=group["categories"].get)
         current_amount = monthly.get(month, {}).get("amount", ZERO)

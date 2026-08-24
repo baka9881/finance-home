@@ -105,23 +105,6 @@ export interface Budget {
   percentage: number;
 }
 
-export interface Goal {
-  id: number;
-  name: string;
-  owner: "me" | "partner" | "shared";
-  owner_label: string;
-  goal_type: "net_worth" | "liquid_assets" | "account_balance" | "investment_cost" | "debt_payoff";
-  account_id?: number | null;
-  account_name?: string | null;
-  target_amount: number;
-  current_amount: number;
-  target_date?: string;
-  currency: string;
-  completed: boolean;
-  note?: string;
-  progress: number;
-}
-
 export interface HealthScore {
   score: number | null;
   completeness: number;
@@ -171,6 +154,16 @@ export interface RecurringExpenseDefinition {
   category_name: string | null;
   active: boolean;
   note: string | null;
+}
+
+export interface IgnoredRecurringExpense {
+  id: number;
+  name: string;
+  owner: "me" | "partner" | "shared";
+  owner_label: string;
+  account_id: number;
+  account_name: string;
+  ignored_at: string | null;
 }
 
 export interface CsvInspection {

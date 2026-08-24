@@ -1326,6 +1326,22 @@ def test_spending_analysis_supports_months_and_recurring_expenses(client: TestCl
         json={"account_id": account, "name": "貸款還款"},
     )
     assert ignored_again.status_code == 201, ignored_again.text
+    ignored_id = ignored.json()["id"]
+    ignored_items = client.get("/api/recurring-expenses/ignored?owner=me")
+    assert ignored_items.status_code == 200, ignored_items.text
+    assert ignored_items.json() == [
+        {
+            "id": ignored_id,
+            "name": "貸款還款",
+            "owner": "me",
+            "owner_label": "我",
+            "account_id": account,
+            "account_name": "生活帳戶",
+            "ignored_at": ignored_items.json()[0]["ignored_at"],
+        }
+    ]
+    assert ignored_items.json()[0]["ignored_at"]
+    assert client.get("/api/recurring-expenses/ignored?owner=partner").json() == []
     after_ignore = client.get(
         f"/api/analysis/spending?month={month}&owner=me"
     ).json()
@@ -1335,7 +1351,59 @@ def test_spending_analysis_supports_months_and_recurring_expenses(client: TestCl
     )
     assert after_ignore["estimated_recurring_total"] == 1099
 
+    restored = client.delete(f"/api/recurring-expenses/ignored/{ignored_id}")
+    assert restored.status_code == 200, restored.text
+    assert client.get("/api/recurring-expenses/ignored?owner=me").json() == []
+    after_restore = client.get(
+        f"/api/analysis/spending?month={month}&owner=me"
+    ).json()
+    restored_names = {item["name"] for item in after_restore["recurring_expenses"]}
+    assert "貸款還款" in restored_names
+    assert after_restore["estimated_recurring_total"] == 6599
+    assert client.delete(f"/api/recurring-expenses/ignored/{ignored_id}").status_code == 404
+
     assert client.get("/api/analysis/spending?month=not-a-month").status_code == 422
+
+
+def test_spending_analysis_detects_gym_merchants_as_recurring(client: TestClient):
+    account = create_account(client, "信用卡")
+    categories = client.get("/api/categories").json()
+    entertainment = next(item for item in categories if item["name"] == "娛樂")
+    subscription = next(item for item in categories if item["name"] == "訂閱")
+    today = date.today()
+    month_start = today.replace(day=1)
+    previous_month_start = (month_start - timedelta(days=1)).replace(day=1)
+
+    transactions = (
+        (previous_month_start.replace(day=10), "健身工廠板橋廠", entertainment["id"]),
+        (month_start.replace(day=10), "健身工廠板橋廠", entertainment["id"]),
+        (previous_month_start.replace(day=28), "休閒用品", entertainment["id"]),
+        (month_start.replace(day=28), "休閒用品", subscription["id"]),
+    )
+    for transaction_date, description, category_id in transactions:
+        response = client.post(
+            "/api/transactions",
+            json={
+                "account_id": account,
+                "transaction_date": transaction_date.isoformat(),
+                "description": description,
+                "amount": -1088,
+                "transaction_kind": "expense",
+                "category_id": category_id,
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    payload = client.get(
+        f"/api/analysis/spending?month={today:%Y-%m}&owner=me"
+    ).json()
+    recurring = {item["name"]: item for item in payload["recurring_expenses"]}
+    assert recurring["健身工廠板橋廠"]["average_amount"] == 1088
+    assert recurring["健身工廠板橋廠"]["months_detected"] == 2
+    assert recurring["健身工廠板橋廠"]["category_name"] == "娛樂"
+    assert recurring["休閒用品"]["average_amount"] == 1088
+    assert recurring["休閒用品"]["months_detected"] == 2
+    assert recurring["休閒用品"]["category_name"] == "訂閱"
 
 
 def test_custom_recurring_expense_crud_and_analysis_override(client: TestClient):

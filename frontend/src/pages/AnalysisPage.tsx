@@ -6,6 +6,7 @@ import {
   CheckCircle2,
   CircleHelp,
   Gauge,
+  EyeOff,
   Lightbulb,
   Pencil,
   PieChart as PieChartIcon,
@@ -15,6 +16,7 @@ import {
   ShoppingBag,
   Trash2,
   TrendingUp,
+  Undo2,
 } from "lucide-react";
 import {
   Bar,
@@ -31,7 +33,7 @@ import {
 import { api } from "../api";
 import { taipeiMonthInputValue } from "../date";
 import { ownerFilterLabels, useOwnerFilter } from "../ownerFilter";
-import type { Account, Category, Dashboard, HealthScore, SpendingAnalysis } from "../types";
+import type { Account, Category, Dashboard, HealthScore, IgnoredRecurringExpense, SpendingAnalysis } from "../types";
 import { Badge, Button, Card, Dialog, EmptyState, Field, FormStep, Input, MonthInput, PageHeader, Select, Skeleton, money, number } from "../ui";
 
 const recurringPresets = ["房貸", "車貸", "信貸", "學貸", "房租", "保險", "健身房月費", "手機費", "網路費", "訂閱服務"];
@@ -103,6 +105,7 @@ export default function AnalysisPage() {
   const [ownerFilter] = useOwnerFilter();
   const [selectedMonth, setSelectedMonth] = useState(taipeiMonthInputValue);
   const [recurringOpen, setRecurringOpen] = useState(false);
+  const [ignoredRecurringOpen, setIgnoredRecurringOpen] = useState(false);
   const [editingRecurringId, setEditingRecurringId] = useState<number | null>(null);
   const [recurringDraft, setRecurringDraft] = useState<RecurringDraft>(() => emptyRecurringDraft("me"));
   const health = useQuery({
@@ -124,6 +127,10 @@ export default function AnalysisPage() {
   const categories = useQuery({
     queryKey: ["categories"],
     queryFn: () => api<Category[]>("/categories"),
+  });
+  const ignoredRecurring = useQuery({
+    queryKey: ["ignored-recurring-expenses", ownerFilter],
+    queryFn: () => api<IgnoredRecurringExpense[]>(`/recurring-expenses/ignored?owner=${ownerFilter}`),
   });
 
   const saveRecurring = useMutation({
@@ -156,7 +163,18 @@ export default function AnalysisPage() {
         method: "POST",
         body: JSON.stringify({ account_id: item.account_id, name: item.name }),
       }),
-    onSuccess: () => client.invalidateQueries({ queryKey: ["spending-analysis"] }),
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ["spending-analysis"] });
+      client.invalidateQueries({ queryKey: ["ignored-recurring-expenses"] });
+    },
+  });
+
+  const restoreIgnoredRecurring = useMutation({
+    mutationFn: (id: number) => api(`/recurring-expenses/ignored/${id}`, { method: "DELETE" }),
+    onSuccess: () => {
+      client.invalidateQueries({ queryKey: ["spending-analysis"] });
+      client.invalidateQueries({ queryKey: ["ignored-recurring-expenses"] });
+    },
   });
 
   function openNewRecurring() {
@@ -394,6 +412,10 @@ export default function AnalysisPage() {
                 </div>
               </div>
               <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
+                <Button variant="secondary" onClick={() => setIgnoredRecurringOpen(true)}>
+                  <EyeOff size={16} /> 已忽略項目
+                  {ignoredRecurring.data?.length ? ` ${ignoredRecurring.data.length}` : ""}
+                </Button>
                 <Button variant="secondary" onClick={openNewRecurring}>
                   <Plus size={16} /> 自訂固定花費
                 </Button>
@@ -500,6 +522,51 @@ export default function AnalysisPage() {
               自訂項目只用於每月預估與提醒，不會直接扣除帳戶餘額；實際交易匯入後會標記為「當月已發生」。訂閱、月費與貸款連續出現兩個月即可辨識；其他帳單需連續三個月，且扣款日與金額穩定。購物、餐飲、超商與車票不會自動列為固定花費。移除自動辨識項目只會隱藏固定花費，不會刪除原始交易。
             </p>
           </Card>
+
+          <Dialog
+            open={ignoredRecurringOpen}
+            onClose={() => setIgnoredRecurringOpen(false)}
+            title="已忽略的固定花費"
+            description="恢復後，只要交易仍符合重複條件，就會重新出現在每月固定花費。"
+          >
+            {ignoredRecurring.isPending ? (
+              <div className="space-y-3">
+                <Skeleton className="h-20 w-full rounded-2xl" />
+                <Skeleton className="h-20 w-full rounded-2xl" />
+              </div>
+            ) : ignoredRecurring.isError ? (
+              <EmptyState
+                icon={<AlertTriangle size={24} />}
+                title="無法載入已忽略項目"
+                description="請檢查連線後重新載入。"
+                action={<Button onClick={() => ignoredRecurring.refetch()}>重新載入</Button>}
+              />
+            ) : ignoredRecurring.data?.length ? (
+              <div className="space-y-3">
+                {ignoredRecurring.data.map((item) => (
+                  <div key={item.id} className="flex flex-col gap-3 rounded-2xl border border-slate-200/80 p-4 sm:flex-row sm:items-center sm:justify-between">
+                    <div className="min-w-0">
+                      <p className="truncate font-semibold text-slate-800">{item.name}</p>
+                      <p className="mt-1 text-xs text-slate-400">{item.account_name} · {item.owner_label}</p>
+                    </div>
+                    <Button
+                      variant="secondary"
+                      disabled={restoreIgnoredRecurring.isPending}
+                      onClick={() => restoreIgnoredRecurring.mutate(item.id)}
+                    >
+                      <Undo2 size={16} /> 恢復辨識
+                    </Button>
+                  </div>
+                ))}
+              </div>
+            ) : (
+              <EmptyState
+                icon={<EyeOff size={24} />}
+                title="沒有已忽略項目"
+                description="你移除的自動辨識固定花費會集中顯示在這裡。"
+              />
+            )}
+          </Dialog>
 
           <Dialog
             open={recurringOpen}

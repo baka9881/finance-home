@@ -1927,6 +1927,18 @@ def recurring_expense_payload(row: RecurringExpense) -> dict[str, Any]:
     }
 
 
+def ignored_recurring_expense_payload(row: IgnoredRecurringExpense) -> dict[str, Any]:
+    return {
+        "id": row.id,
+        "name": row.display_name,
+        "owner": row.owner,
+        "owner_label": OWNER_LABELS.get(row.owner, row.owner),
+        "account_id": row.account_id,
+        "account_name": row.account.name,
+        "ignored_at": row.created_at.isoformat() if row.created_at else None,
+    }
+
+
 def validate_recurring_expense_links(
     db: Session, account_id: int | None, category_id: int | None
 ) -> None:
@@ -1949,6 +1961,20 @@ def list_recurring_expenses(
     if not include_inactive:
         query = query.where(RecurringExpense.active.is_(True))
     return [recurring_expense_payload(row) for row in db.scalars(query).all()]
+
+
+@app.get("/api/recurring-expenses/ignored")
+def list_ignored_recurring_expenses(db: DB, owner: str = "all"):
+    owner = validate_owner_filter(owner)
+    query = select(IgnoredRecurringExpense).order_by(
+        IgnoredRecurringExpense.created_at.desc(), IgnoredRecurringExpense.id.desc()
+    )
+    if owner != "all":
+        query = query.where(IgnoredRecurringExpense.owner == owner)
+    return [
+        ignored_recurring_expense_payload(row)
+        for row in db.scalars(query).all()
+    ]
 
 
 @app.post("/api/recurring-expenses", status_code=201)
@@ -1995,6 +2021,16 @@ def delete_recurring_expense(expense_id: int, db: DB):
     row = db.get(RecurringExpense, expense_id)
     if not row:
         raise HTTPException(404, "找不到自訂固定花費")
+    db.delete(row)
+    db.commit()
+    return {"ok": True}
+
+
+@app.delete("/api/recurring-expenses/ignored/{ignored_id}")
+def restore_ignored_recurring_expense(ignored_id: int, db: DB):
+    row = db.get(IgnoredRecurringExpense, ignored_id)
+    if not row:
+        raise HTTPException(404, "找不到已忽略的固定花費")
     db.delete(row)
     db.commit()
     return {"ok": True}

@@ -1,7 +1,7 @@
 import type { QueryClient } from "@tanstack/react-query";
 import { api } from "./api";
 import { taipeiMonthInputValue } from "./date";
-import type { Account, Category, Dashboard, Goal, HealthScore, Position, Transaction } from "./types";
+import type { Account, Category, Dashboard, HealthScore, Position, Transaction } from "./types";
 
 export const APP_QUERY_STALE_TIME = 5 * 60_000;
 export const APP_QUERY_GC_TIME = 30 * 60_000;
@@ -11,7 +11,6 @@ export function preloadPageModules() {
     import("./pages/AccountsPage"),
     import("./pages/TransactionsPage"),
     import("./pages/InvestmentsPage"),
-    import("./pages/PlansPage"),
     import("./pages/AnalysisPage"),
     import("./pages/SettingsPage"),
   ]);
@@ -31,10 +30,6 @@ export function prefetchPrimaryData(client: QueryClient, owner: string) {
     client.prefetchQuery({
       queryKey: ["positions", owner],
       queryFn: () => api<Position[]>(`/positions?owner=${owner}`),
-    }),
-    client.prefetchQuery({
-      queryKey: ["goals", owner],
-      queryFn: () => api<Goal[]>(`/goals?owner=${owner}`),
     }),
     client.prefetchQuery({
       queryKey: ["transactions", month, "", owner],
