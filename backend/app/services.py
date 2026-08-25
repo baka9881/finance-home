@@ -721,26 +721,10 @@ def recurring_expense_signature(description: str) -> str:
     return _recurring_display_name(description).casefold()
 
 
-_STRONG_RECURRING_KEYWORDS = (
-    "月費",
-    "月租",
+_KNOWN_SUBSCRIPTION_KEYWORDS = (
     "訂閱",
     "subscription",
     "subscr",
-    "房貸",
-    "車貸",
-    "信貸",
-    "貸款",
-    "房租",
-    "租金",
-    "管理費",
-    "健身房",
-    "健身",
-    "fitness",
-    "world gym",
-    "保險",
-    "電信",
-    "網路費",
     "netflix",
     "spotify",
     "youtube premium",
@@ -759,6 +743,26 @@ _STRONG_RECURRING_KEYWORDS = (
     "disney plus",
     "disneyplus",
 )
+
+
+_STRONG_RECURRING_KEYWORDS = (
+    "月費",
+    "月租",
+    "房貸",
+    "車貸",
+    "信貸",
+    "貸款",
+    "房租",
+    "租金",
+    "管理費",
+    "健身房",
+    "健身",
+    "fitness",
+    "world gym",
+    "保險",
+    "電信",
+    "網路費",
+) + _KNOWN_SUBSCRIPTION_KEYWORDS
 
 _VARIABLE_SPENDING_KEYWORDS = (
     "蝦皮",
@@ -836,9 +840,16 @@ def _is_detected_recurring_group(group: dict[str, Any]) -> bool:
     monthly = group["months"]
     category_name = max(group["categories"], key=group["categories"].get)
     normalized_name = _recurring_detection_signature(group["name"])
+    known_subscription_signal = (
+        group["categories"].get("訂閱", 0) > 0
+        or any(
+            _recurring_keyword_signature(keyword) in normalized_name
+            for keyword in _KNOWN_SUBSCRIPTION_KEYWORDS
+        )
+    )
     strong_signal = (
         group["has_loan_principal"]
-        or group["categories"].get("訂閱", 0) > 0
+        or known_subscription_signal
         or any(
             _recurring_keyword_signature(keyword) in normalized_name
             for keyword in _STRONG_RECURRING_KEYWORDS
@@ -852,11 +863,20 @@ def _is_detected_recurring_group(group: dict[str, Any]) -> bool:
         return False
 
     observed_months = sorted(_month_number(value) for value in monthly)
-    if any(
-        current - previous != 1
+    month_gaps = [
+        current - previous
         for previous, current in zip(observed_months, observed_months[1:])
-    ):
-        return False
+    ]
+    if any(gap != 1 for gap in month_gaps):
+        # Explicit subscriptions may have one missing import/billing month. For
+        # example, two matching OPENAI charges in June and August still describe
+        # a monthly subscription, while a wider gap remains too uncertain.
+        one_missing_month = (
+            known_subscription_signal
+            and observed_months[-1] - observed_months[0] <= len(observed_months)
+        )
+        if not one_missing_month:
+            return False
 
     if not strong_signal:
         if category_name not in _GENERIC_RECURRING_CATEGORIES:

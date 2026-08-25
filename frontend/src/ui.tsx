@@ -1,4 +1,5 @@
 import {
+  type ChangeEvent,
   useEffect,
   useId,
   useRef,
@@ -9,7 +10,9 @@ import {
   type SelectHTMLAttributes,
 } from "react";
 import { CalendarDays, ChevronLeft, ChevronRight, X } from "lucide-react";
+import { createPortal } from "react-dom";
 import { twMerge } from "tailwind-merge";
+import { taipeiDateInputValue, taipeiMonthInputValue } from "./date";
 
 export const cn = (...values: (string | false | null | undefined)[]) =>
   twMerge(values.filter(Boolean).join(" "));
@@ -72,80 +75,341 @@ export function Input({
   );
 }
 
+type PickerInputProps = Omit<InputHTMLAttributes<HTMLInputElement>, "type">;
+
+const normalizePickerValue = (value: PickerInputProps["value"] | PickerInputProps["defaultValue"]) =>
+  typeof value === "string" ? value : "";
+
+const notifyPickerChange = (
+  onChange: PickerInputProps["onChange"],
+  nextValue: string,
+) => {
+  if (!onChange) return;
+  const target = { value: nextValue } as HTMLInputElement;
+  onChange({ target, currentTarget: target } as ChangeEvent<HTMLInputElement>);
+};
+
+function PickerPopover({
+  open,
+  anchorRef,
+  title,
+  estimatedHeight,
+  onClose,
+  children,
+}: {
+  open: boolean;
+  anchorRef: React.RefObject<HTMLButtonElement | null>;
+  title: string;
+  estimatedHeight: number;
+  onClose: () => void;
+  children: ReactNode;
+}) {
+  const [position, setPosition] = useState({ left: 12, top: 12, width: 320, compact: false });
+
+  useEffect(() => {
+    if (!open) return;
+    const place = () => {
+      const rect = anchorRef.current?.getBoundingClientRect();
+      const compact = window.innerWidth < 640;
+      if (!rect || compact) {
+        setPosition({ left: 12, top: 12, width: Math.max(280, window.innerWidth - 24), compact });
+        return;
+      }
+      const width = Math.min(320, window.innerWidth - 24);
+      const left = Math.max(12, Math.min(rect.left, window.innerWidth - width - 12));
+      const below = rect.bottom + 8;
+      const top = below + estimatedHeight <= window.innerHeight
+        ? below
+        : Math.max(12, rect.top - estimatedHeight - 8);
+      setPosition({ left, top, width, compact: false });
+    };
+    place();
+    window.addEventListener("resize", place);
+    window.addEventListener("scroll", place, true);
+    return () => {
+      window.removeEventListener("resize", place);
+      window.removeEventListener("scroll", place, true);
+    };
+  }, [anchorRef, estimatedHeight, open]);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeWithEscape = (event: KeyboardEvent) => {
+      if (event.key === "Escape") onClose();
+    };
+    document.addEventListener("keydown", closeWithEscape);
+    return () => document.removeEventListener("keydown", closeWithEscape);
+  }, [onClose, open]);
+
+  if (!open || typeof document === "undefined") return null;
+  return createPortal(
+    <div
+      className="fixed inset-0 z-[120] bg-slate-950/15 sm:bg-transparent"
+      onMouseDown={onClose}
+    >
+      <section
+        className={cn(
+          "fixed border border-slate-200 bg-white p-4 text-slate-800 shadow-2xl",
+          position.compact
+            ? "inset-x-3 bottom-[calc(.75rem+env(safe-area-inset-bottom,0px))] rounded-3xl"
+            : "rounded-2xl",
+        )}
+        style={position.compact ? undefined : { left: position.left, top: position.top, width: position.width }}
+        role="dialog"
+        aria-modal="true"
+        aria-label={title}
+        onMouseDown={(event) => event.stopPropagation()}
+      >
+        <div className="mb-3 flex items-center justify-between sm:hidden">
+          <p className="text-sm font-semibold">{title}</p>
+          <button
+            type="button"
+            className="flex size-9 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100"
+            aria-label="關閉日期選擇器"
+            onClick={onClose}
+          >
+            <X size={18} />
+          </button>
+        </div>
+        {children}
+      </section>
+    </div>,
+    document.body,
+  );
+}
+
+const pickerIconButton =
+  "flex size-9 shrink-0 items-center justify-center rounded-xl text-slate-600 transition hover:bg-slate-100 focus:outline-none focus:ring-4 focus:ring-emerald-500/10";
+
 export function DateInput({
   className,
   value,
   defaultValue,
   disabled,
+  min,
+  max,
   onChange,
+  name,
+  id,
+  required,
+  form,
   ...props
-}: Omit<InputHTMLAttributes<HTMLInputElement>, "type">) {
-  const initialValue = typeof defaultValue === "string" ? defaultValue : "";
-  const [uncontrolledValue, setUncontrolledValue] = useState(initialValue);
-  const rawValue = typeof value === "string" ? value : uncontrolledValue;
+}: PickerInputProps) {
+  const [uncontrolledValue, setUncontrolledValue] = useState(normalizePickerValue(defaultValue));
+  const rawValue = value === undefined ? uncontrolledValue : normalizePickerValue(value);
+  const fallback = rawValue || taipeiDateInputValue();
+  const parsed = fallback.split("-").map(Number);
+  const [viewYear, setViewYear] = useState(parsed[0]);
+  const [viewMonth, setViewMonth] = useState(parsed[1]);
+  const [open, setOpen] = useState(false);
+  const anchorRef = useRef<HTMLButtonElement>(null);
   const [year, month, day] = rawValue.split("-");
+  const today = taipeiDateInputValue();
+  const daysInMonth = new Date(viewYear, viewMonth, 0).getDate();
+  const leadingDays = (new Date(viewYear, viewMonth - 1, 1).getDay() + 6) % 7;
   const displayValue = year && month && day
     ? `${year}年${Number(month)}月${Number(day)}日`
     : "選擇日期";
 
+  useEffect(() => {
+    if (!rawValue) return;
+    const [nextYear, nextMonth] = rawValue.split("-").map(Number);
+    setViewYear(nextYear);
+    setViewMonth(nextMonth);
+  }, [rawValue]);
+
+  const commit = (nextValue: string) => {
+    if (value === undefined) setUncontrolledValue(nextValue);
+    notifyPickerChange(onChange, nextValue);
+    setOpen(false);
+  };
+  const changeMonth = (offset: number) => {
+    const next = new Date(viewYear, viewMonth - 1 + offset, 1);
+    setViewYear(next.getFullYear());
+    setViewMonth(next.getMonth() + 1);
+  };
+
   return (
-    <div
-      className={cn(
-        "relative flex h-11 min-w-0 w-full max-w-full cursor-pointer items-center overflow-hidden rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none transition focus-within:border-emerald-500 focus-within:ring-4 focus-within:ring-emerald-500/10",
-        disabled && "cursor-not-allowed opacity-50",
-        className,
-      )}
-    >
-      <span className="min-w-0 flex-1 truncate">{displayValue}</span>
-      <CalendarDays className="ml-3 shrink-0 text-slate-500" size={16} aria-hidden="true" />
-      <input
-        className="absolute inset-0 block h-full min-h-0 w-full min-w-0 max-w-full cursor-pointer opacity-0 disabled:cursor-not-allowed"
-        type="date"
-        value={value}
-        defaultValue={defaultValue}
+    <>
+      <button
+        ref={anchorRef}
+        id={id}
+        type="button"
+        className={cn(
+          "flex h-11 min-w-0 w-full max-w-full items-center rounded-xl border border-slate-200 bg-white px-3 text-left text-sm text-slate-800 outline-none transition hover:border-slate-300 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10",
+          disabled && "cursor-not-allowed opacity-50",
+          className,
+        )}
         disabled={disabled}
+        aria-haspopup="dialog"
+        aria-expanded={open}
         aria-label={props["aria-label"] || "選擇日期"}
-        onChange={(event) => {
-          if (value === undefined) setUncontrolledValue(event.target.value);
-          onChange?.(event);
-        }}
-        {...props}
-      />
-    </div>
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className={cn("min-w-0 flex-1 truncate", !rawValue && "text-slate-400")}>{displayValue}</span>
+        <CalendarDays className="ml-3 shrink-0 text-slate-500" size={16} aria-hidden="true" />
+      </button>
+      <input type="hidden" name={name} value={rawValue} required={required} form={form} />
+      <PickerPopover
+        open={open}
+        anchorRef={anchorRef}
+        title="選擇日期"
+        estimatedHeight={390}
+        onClose={() => setOpen(false)}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <button type="button" className={pickerIconButton} aria-label="上一個月" onClick={() => changeMonth(-1)}>
+            <ChevronLeft size={19} />
+          </button>
+          <p className="font-semibold tabular-nums">{viewYear}年 {viewMonth}月</p>
+          <button type="button" className={pickerIconButton} aria-label="下一個月" onClick={() => changeMonth(1)}>
+            <ChevronRight size={19} />
+          </button>
+        </div>
+        <div className="mt-3 grid grid-cols-7 gap-1 text-center text-xs font-medium text-slate-400">
+          {['一', '二', '三', '四', '五', '六', '日'].map((label) => <span key={label} className="py-1">{label}</span>)}
+        </div>
+        <div className="mt-1 grid grid-cols-7 gap-1">
+          {Array.from({ length: leadingDays }, (_, index) => <span key={`empty-${index}`} />)}
+          {Array.from({ length: daysInMonth }, (_, index) => {
+            const currentDay = index + 1;
+            const dateValue = `${viewYear}-${String(viewMonth).padStart(2, "0")}-${String(currentDay).padStart(2, "0")}`;
+            const selected = dateValue === rawValue;
+            const isToday = dateValue === today;
+            const unavailable = (typeof min === "string" && dateValue < min) || (typeof max === "string" && dateValue > max);
+            return (
+              <button
+                key={dateValue}
+                type="button"
+                disabled={unavailable}
+                className={cn(
+                  "relative flex aspect-square items-center justify-center rounded-xl text-sm tabular-nums transition hover:bg-emerald-50 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-25",
+                  selected && "bg-forest font-semibold text-white hover:bg-forest",
+                  !selected && isToday && "font-semibold text-emerald-700 ring-1 ring-inset ring-emerald-300",
+                )}
+                aria-label={`${viewYear}年${viewMonth}月${currentDay}日`}
+                aria-pressed={selected}
+                onClick={() => commit(dateValue)}
+              >
+                {currentDay}
+              </button>
+            );
+          })}
+        </div>
+        <div className="mt-4 flex items-center justify-between border-t border-slate-100 pt-3">
+          {!required ? (
+            <button type="button" className="rounded-lg px-2 py-1.5 text-sm font-medium text-slate-500 hover:bg-slate-100" onClick={() => commit("")}>清除</button>
+          ) : <span />}
+          <button type="button" className="rounded-lg px-3 py-1.5 text-sm font-semibold text-emerald-700 hover:bg-emerald-50" onClick={() => commit(today)}>今天</button>
+        </div>
+      </PickerPopover>
+    </>
   );
 }
 
 export function MonthInput({
   className,
   value,
+  defaultValue,
   disabled,
+  min,
+  max,
+  onChange,
+  name,
+  id,
+  required,
+  form,
   ...props
-}: Omit<InputHTMLAttributes<HTMLInputElement>, "type">) {
-  const rawValue = typeof value === "string" ? value : "";
+}: PickerInputProps) {
+  const [uncontrolledValue, setUncontrolledValue] = useState(normalizePickerValue(defaultValue));
+  const rawValue = value === undefined ? uncontrolledValue : normalizePickerValue(value);
   const [year, month] = rawValue.split("-");
-  const displayValue = year && month
-    ? `${year}年${Number(month)}月`
-    : "選擇月份";
+  const currentMonth = taipeiMonthInputValue();
+  const [viewYear, setViewYear] = useState(Number(year || currentMonth.slice(0, 4)));
+  const [open, setOpen] = useState(false);
+  const anchorRef = useRef<HTMLButtonElement>(null);
+  const displayValue = year && month ? `${year}年${Number(month)}月` : "選擇月份";
+
+  useEffect(() => {
+    if (year) setViewYear(Number(year));
+  }, [year]);
+
+  const commit = (nextValue: string) => {
+    if (value === undefined) setUncontrolledValue(nextValue);
+    notifyPickerChange(onChange, nextValue);
+    setOpen(false);
+  };
 
   return (
-    <div
-      className={cn(
-        "relative flex h-11 min-w-0 w-full max-w-full cursor-pointer items-center overflow-hidden rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none transition focus-within:border-emerald-500 focus-within:ring-4 focus-within:ring-emerald-500/10",
-        disabled && "cursor-not-allowed opacity-50",
-        className,
-      )}
-    >
-      <span className="min-w-0 flex-1 truncate">{displayValue}</span>
-      <CalendarDays className="ml-3 shrink-0 text-slate-500" size={16} aria-hidden="true" />
-      <input
-        className="absolute inset-0 h-full min-h-0 w-full min-w-0 max-w-full cursor-pointer opacity-0 disabled:cursor-not-allowed"
-        type="month"
-        value={value}
+    <>
+      <button
+        ref={anchorRef}
+        id={id}
+        type="button"
+        className={cn(
+          "flex h-11 min-w-0 w-full max-w-full items-center rounded-xl border border-slate-200 bg-white px-3 text-left text-sm text-slate-800 outline-none transition hover:border-slate-300 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10",
+          disabled && "cursor-not-allowed opacity-50",
+          className,
+        )}
         disabled={disabled}
+        aria-haspopup="dialog"
+        aria-expanded={open}
         aria-label={props["aria-label"] || "選擇月份"}
-        {...props}
-      />
-    </div>
+        onClick={() => setOpen((current) => !current)}
+      >
+        <span className={cn("min-w-0 flex-1 truncate", !rawValue && "text-slate-400")}>{displayValue}</span>
+        <CalendarDays className="ml-3 shrink-0 text-slate-500" size={16} aria-hidden="true" />
+      </button>
+      <input type="hidden" name={name} value={rawValue} required={required} form={form} />
+      <PickerPopover
+        open={open}
+        anchorRef={anchorRef}
+        title="選擇月份"
+        estimatedHeight={320}
+        onClose={() => setOpen(false)}
+      >
+        <div className="flex items-center justify-between gap-2">
+          <button type="button" className={pickerIconButton} aria-label="上一年" onClick={() => setViewYear((current) => current - 1)}>
+            <ChevronLeft size={19} />
+          </button>
+          <p className="font-semibold tabular-nums">{viewYear}年</p>
+          <button type="button" className={pickerIconButton} aria-label="下一年" onClick={() => setViewYear((current) => current + 1)}>
+            <ChevronRight size={19} />
+          </button>
+        </div>
+        <div className="mt-4 grid grid-cols-3 gap-2">
+          {Array.from({ length: 12 }, (_, index) => {
+            const current = index + 1;
+            const monthValue = `${viewYear}-${String(current).padStart(2, "0")}`;
+            const selected = monthValue === rawValue;
+            const isCurrent = monthValue === currentMonth;
+            const unavailable = (typeof min === "string" && monthValue < min) || (typeof max === "string" && monthValue > max);
+            return (
+              <button
+                key={monthValue}
+                type="button"
+                disabled={unavailable}
+                className={cn(
+                  "rounded-xl px-2 py-3 text-sm font-medium transition hover:bg-emerald-50 focus:outline-none focus:ring-2 focus:ring-emerald-500/30 disabled:cursor-not-allowed disabled:opacity-25",
+                  selected && "bg-forest text-white hover:bg-forest",
+                  !selected && isCurrent && "text-emerald-700 ring-1 ring-inset ring-emerald-300",
+                )}
+                aria-pressed={selected}
+                onClick={() => commit(monthValue)}
+              >
+                {current}月
+              </button>
+            );
+          })}
+        </div>
+        <div className="mt-4 flex items-center justify-between border-t border-slate-100 pt-3">
+          {!required ? (
+            <button type="button" className="rounded-lg px-2 py-1.5 text-sm font-medium text-slate-500 hover:bg-slate-100" onClick={() => commit("")}>清除</button>
+          ) : <span />}
+          <button type="button" className="rounded-lg px-3 py-1.5 text-sm font-semibold text-emerald-700 hover:bg-emerald-50" onClick={() => commit(currentMonth)}>本月</button>
+        </div>
+      </PickerPopover>
+    </>
   );
 }
 

@@ -40,6 +40,24 @@ def test_explicit_subscription_can_be_detected_after_two_months():
     assert _is_detected_recurring_group(group) is True
 
 
+def test_known_subscription_allows_one_missing_month():
+    group = recurring_group(
+        "OPENAI *CHATGPT SUBSCR",
+        "訂閱",
+        [(date(2026, 6, 15), "539"), (date(2026, 8, 15), "539")],
+    )
+    assert _is_detected_recurring_group(group) is True
+
+
+def test_known_subscription_does_not_allow_a_wider_gap():
+    group = recurring_group(
+        "OPENAI *CHATGPT SUBSCR",
+        "訂閱",
+        [(date(2026, 5, 15), "539"), (date(2026, 8, 15), "539")],
+    )
+    assert _is_detected_recurring_group(group) is False
+
+
 def test_variable_merchants_are_not_fixed_expenses_even_when_repeated():
     for name, category in (
         ("樂購蝦皮股份有限公司", "購物"),

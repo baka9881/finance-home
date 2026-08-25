@@ -1006,6 +1006,7 @@ export default function SettingsPage() {
                 <div className="mt-3 space-y-1 text-xs text-slate-500">
                   <p>寄件者：{rule.sender_pattern || "不限"}</p>
                   <p>主旨：{rule.subject_pattern || "不限"}</p>
+                  <p>繳款日：依每期電子帳單</p>
                   <p>PDF 密碼：{rule.statement_password_configured ? "已安全儲存" : "未設定"}</p>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2">
