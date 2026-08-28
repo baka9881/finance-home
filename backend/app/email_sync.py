@@ -8,7 +8,7 @@ import re
 import secrets
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
-from email.utils import parsedate_to_datetime
+from email.utils import parseaddr, parsedate_to_datetime
 from html import unescape
 from typing import Any
 from urllib.parse import urlencode
@@ -50,6 +50,53 @@ GMAIL_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GMAIL_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_API_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
 ZERO = Decimal("0")
+
+
+GMAIL_CARD_PROVIDERS: tuple[dict[str, Any], ...] = (
+    {
+        "key": "cathay",
+        "institution": "國泰世華銀行",
+        "account_name": "國泰世華銀行 信用卡",
+        "sender_pattern": "cathaybk.com.tw",
+    },
+    {
+        "key": "ctbc",
+        "institution": "中國信託銀行",
+        "account_name": "中國信託銀行 信用卡",
+        "sender_pattern": "ctbcbank.com",
+    },
+    {
+        "key": "esun",
+        "institution": "玉山銀行",
+        "account_name": "玉山銀行 信用卡",
+        "sender_pattern": "esunbank.com",
+    },
+    {
+        "key": "taishin",
+        "institution": "台新銀行",
+        "account_name": "台新銀行 信用卡",
+        "sender_pattern": "taishinbank.com.tw",
+    },
+    {
+        "key": "fubon",
+        "institution": "台北富邦銀行",
+        "account_name": "台北富邦銀行 信用卡",
+        "sender_pattern": "fubon.com",
+    },
+    {
+        "key": "sinopac",
+        "institution": "永豐銀行",
+        "account_name": "永豐銀行 信用卡",
+        "sender_pattern": "sinopac.com",
+    },
+)
+
+
+def gmail_card_provider(candidate_key: str) -> dict[str, Any] | None:
+    return next(
+        (item for item in GMAIL_CARD_PROVIDERS if item["key"] == candidate_key),
+        None,
+    )
 
 
 def _setting(db: Session, key: str) -> str | None:
@@ -247,6 +294,79 @@ def _gmail_get(token: str, path: str, params: dict[str, Any] | None = None) -> d
         detail = payload.get("error", {}).get("message") if isinstance(payload, dict) else None
         raise ValueError(detail or f"Gmail API 讀取失敗（{response.status_code}）")
     return payload
+
+
+def discover_gmail_card_candidates(
+    db: Session, lookback_days: int = 180
+) -> dict[str, Any]:
+    """Find supported card senders using Gmail metadata only.
+
+    Discovery deliberately requests only From, Subject and Date headers. Full
+    message bodies and attachments are read only after the user confirms a rule.
+    """
+    token = _gmail_access_token(db)
+    candidates: list[dict[str, Any]] = []
+    messages_scanned = 0
+    for provider in GMAIL_CARD_PROVIDERS:
+        listed = _gmail_get(
+            token,
+            "/messages",
+            {
+                "q": (
+                    f'newer_than:{lookback_days}d '
+                    f'from:"{provider["sender_pattern"]}"'
+                ),
+                "maxResults": 10,
+            },
+        )
+        messages = listed.get("messages") or []
+        if not messages:
+            continue
+        subjects: list[str] = []
+        senders: list[str] = []
+        latest_message_at: str | None = None
+        for item in messages:
+            message_id = str(item.get("id") or "")
+            if not message_id:
+                continue
+            metadata = _gmail_get(
+                token,
+                f"/messages/{message_id}",
+                {
+                    "format": "metadata",
+                    "metadataHeaders": ["From", "Subject", "Date"],
+                },
+            )
+            headers = _headers(metadata.get("payload") or {})
+            sender = parseaddr(headers.get("from", ""))[1] or headers.get("from", "")
+            subject = headers.get("subject", "").strip()
+            if sender:
+                senders.append(sender)
+            if subject:
+                subjects.append(subject)
+            message_date = _message_date(metadata, headers)
+            message_label = message_date.isoformat()
+            if not latest_message_at or message_label > latest_message_at:
+                latest_message_at = message_label
+            messages_scanned += 1
+        candidates.append(
+            {
+                "key": provider["key"],
+                "institution": provider["institution"],
+                "account_name": provider["account_name"],
+                "sender_pattern": provider["sender_pattern"],
+                "matched_messages": len(messages),
+                "latest_message_at": latest_message_at,
+                "sample_sender": senders[0] if senders else None,
+                "sample_subject": subjects[0] if subjects else None,
+            }
+        )
+    return {
+        "lookback_days": lookback_days,
+        "messages_scanned": messages_scanned,
+        "candidates": candidates,
+        "metadata_only": True,
+    }
 
 
 def _gmail_search_value(value: str) -> str:

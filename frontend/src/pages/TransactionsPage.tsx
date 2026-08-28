@@ -7,10 +7,12 @@ import {
   ArrowUpRight,
   Check,
   ChevronDown,
+  CircleAlert,
   FileSpreadsheet,
   Landmark,
   Link2,
   Plus,
+  RefreshCw,
   Search,
   Sparkles,
   Trash2,
@@ -37,6 +39,7 @@ import {
   MobileWizardStep,
   PageHeader,
   Select,
+  Skeleton,
   money,
   validateWizardStep,
 } from "../ui";
@@ -57,6 +60,10 @@ interface PendingCsvBalance {
 }
 
 const currentMonth = taipeiMonthInputValue();
+const monthLabel = (value: string) => {
+  const [year, month] = value.split("-");
+  return year && month ? `${year}年${Number(month)}月` : value;
+};
 const kindLabels: Record<string, string> = {
   income: "收入",
   expense: "支出",
@@ -608,11 +615,25 @@ export default function TransactionsPage() {
             ))}
           </Select>
         </div>
+        {transactions.isFetching && (
+          <div
+            className="mt-3 flex items-center gap-2 rounded-xl bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-700"
+            role="status"
+            aria-live="polite"
+          >
+            <RefreshCw className="animate-spin" size={15} />
+            正在載入 {monthLabel(month)}的交易…
+          </div>
+        )}
       </Card>
 
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm text-slate-500">
-          共 <strong className="text-slate-800">{filteredTransactions.length}</strong> 筆交易
+          {transactions.isPending ? (
+            "正在載入交易…"
+          ) : (
+            <>共 <strong className="text-slate-800">{filteredTransactions.length}</strong> 筆交易</>
+          )}
         </p>
         <div className="flex flex-wrap gap-2">
           {transferCount > 0 && (
@@ -665,8 +686,29 @@ export default function TransactionsPage() {
         </div>
       )}
 
-      <Card className="overflow-hidden">
-        {!filteredTransactions.length ? (
+      <Card className="overflow-hidden" aria-busy={transactions.isFetching}>
+        {transactions.isError ? (
+          <EmptyState
+            icon={<CircleAlert size={25} />}
+            title="交易資料載入失敗"
+            description={(transactions.error as Error).message || "目前無法取得這個月份的交易，請稍後再試。"}
+            action={<Button onClick={() => transactions.refetch()}>重新載入</Button>}
+          />
+        ) : transactions.isPending ? (
+          <div className="space-y-1 p-4" role="status" aria-live="polite">
+            <span className="sr-only">正在載入 {monthLabel(month)}的交易</span>
+            {[0, 1, 2, 3].map((row) => (
+              <div key={row} className="flex items-center gap-3 rounded-xl px-1 py-3">
+                <Skeleton className="size-10 shrink-0 rounded-xl" />
+                <div className="min-w-0 flex-1 space-y-2">
+                  <Skeleton className="h-4 w-1/2" />
+                  <Skeleton className="h-3 w-1/3" />
+                </div>
+                <Skeleton className="h-5 w-20 shrink-0" />
+              </div>
+            ))}
+          </div>
+        ) : !filteredTransactions.length ? (
           <EmptyState
             icon={<ArrowRightLeft size={25} />}
             title={

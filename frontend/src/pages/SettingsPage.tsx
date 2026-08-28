@@ -1,9 +1,10 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, ReactNode, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bitcoin,
   BookOpen,
   Check,
+  ChevronDown,
   Database,
   Download,
   Mail,
@@ -78,6 +79,37 @@ interface ExchangeSyncResult {
   errors: string[];
 }
 
+function MobileSettingsSection({
+  id,
+  icon,
+  title,
+  description,
+  status,
+  children,
+}: {
+  id: string;
+  icon: ReactNode;
+  title: string;
+  description: string;
+  status?: string;
+  children: ReactNode;
+}) {
+  return (
+    <details id={`settings-${id}`} className="settings-mobile-section">
+      <summary className="settings-mobile-section-summary md:hidden">
+        <span className="settings-mobile-section-icon">{icon}</span>
+        <span className="min-w-0 flex-1">
+          <span className="font-bold text-ink">{title}</span>
+          <span className="mt-1 block truncate text-xs text-slate-500">{description}</span>
+        </span>
+        {status && <span className="settings-mobile-section-status shrink-0 text-xs font-semibold text-emerald-700">{status}</span>}
+        <ChevronDown className="settings-mobile-section-chevron shrink-0 text-slate-400" size={18} />
+      </summary>
+      <div className="settings-mobile-section-content">{children}</div>
+    </details>
+  );
+}
+
 interface AutomationStatus {
   enabled: boolean;
   schedule: "hourly";
@@ -137,6 +169,30 @@ interface EmailCardRule {
   statement_password_configured: boolean;
 }
 
+interface GmailCardCandidate {
+  key: string;
+  institution: string;
+  account_name: string;
+  sender_pattern: string;
+  matched_messages: number;
+  latest_message_at?: string;
+  sample_sender?: string;
+  sample_subject?: string;
+}
+
+interface GmailCardDiscovery {
+  lookback_days: number;
+  messages_scanned: number;
+  metadata_only: boolean;
+  candidates: GmailCardCandidate[];
+}
+
+interface GmailQuickSetupResult {
+  account_created: boolean;
+  rule: EmailCardRule;
+  sync_result: EmailSyncResult;
+}
+
 interface CreditCardBill {
   id: number;
   rule_name: string;
@@ -181,6 +237,10 @@ export default function SettingsPage() {
   const [exchangeSettingsOpen, setExchangeSettingsOpen] = useState(false);
   const [emailSettingsOpen, setEmailSettingsOpen] = useState(false);
   const [editingEmailRule, setEditingEmailRule] = useState<EmailCardRule | null>(null);
+  const [manualEmailSetupOpen, setManualEmailSetupOpen] = useState(false);
+  const [gmailCandidates, setGmailCandidates] = useState<GmailCardCandidate[]>([]);
+  const [selectedGmailCandidate, setSelectedGmailCandidate] = useState("");
+  const [quickPaymentAccountId, setQuickPaymentAccountId] = useState("");
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [theme, setTheme] = useState<AppTheme>(() => getStoredTheme());
   const [lastBackupAt, setLastBackupAt] = useState(() => localStorage.getItem("finance:lastBackupAt") || "");
@@ -337,6 +397,45 @@ export default function SettingsPage() {
       );
     },
     onError: (error) => setMessage(`郵件同步失敗：${(error as Error).message}`),
+  });
+  const discoverGmailCards = useMutation({
+    mutationFn: () => api<GmailCardDiscovery>("/email/gmail/discover", { method: "POST" }),
+    onSuccess: (result) => {
+      setGmailCandidates(result.candidates);
+      setSelectedGmailCandidate(result.candidates[0]?.key || "");
+      if (result.candidates.length) {
+        setMessage(`已從郵件標頭找到 ${result.candidates.length} 家信用卡；請確認扣款帳戶。`);
+      } else {
+        setMessage("近六個月沒有找到支援的信用卡寄件者，可以改用進階手動設定。");
+      }
+    },
+    onError: (error) => setMessage(`自動偵測失敗：${(error as Error).message}`),
+  });
+  const quickSetupGmailCard = useMutation({
+    mutationFn: (payload: { candidate_key: string; payment_account_id: number }) =>
+      api<GmailQuickSetupResult>("/email/gmail/quick-setup", {
+        method: "POST",
+        body: JSON.stringify(payload),
+      }),
+    onSuccess: (result) => {
+      client.invalidateQueries({ queryKey: ["email-card-rules"] });
+      client.invalidateQueries({ queryKey: ["gmail-status"] });
+      client.invalidateQueries({ queryKey: ["credit-card-bills"] });
+      client.invalidateQueries({ queryKey: ["transactions"] });
+      client.invalidateQueries({ queryKey: ["accounts"] });
+      client.invalidateQueries({ queryKey: ["dashboard"] });
+      setEmailSettingsOpen(false);
+      setManualEmailSetupOpen(false);
+      setEditingEmailRule(null);
+      const imported = result.sync_result.transactions_imported || 0;
+      const syncWarning = result.sync_result.errors?.length
+        ? `；規則已建立，但首次同步需要確認：${result.sync_result.errors[0]}`
+        : `，首次同步新增 ${imported} 筆消費`;
+      setMessage(
+        `${result.rule.name}已完成自動設定${result.account_created ? "，並建立信用卡帳戶" : ""}${syncWarning}。`,
+      );
+    },
+    onError: (error) => setMessage(`自動設定失敗：${(error as Error).message}`),
   });
   const saveEmailRule = useMutation({
     mutationFn: ({ ruleId, payload }: { ruleId?: number; payload: Record<string, unknown> }) =>
@@ -498,13 +597,23 @@ export default function SettingsPage() {
 
   function startEditingEmailRule(rule: EmailCardRule) {
     setEditingEmailRule(rule);
+    setManualEmailSetupOpen(true);
     setEmailSettingsOpen(true);
   }
 
   function startCreatingEmailRule() {
     setEditingEmailRule(null);
+    setManualEmailSetupOpen(false);
     setEmailSettingsOpen(true);
   }
+
+  useEffect(() => {
+    if (quickPaymentAccountId || !paymentAccounts.length) return;
+    const preferred = paymentAccounts.find((account) => account.name.includes("生活費"))
+      || paymentAccounts.find((account) => account.is_liquid)
+      || paymentAccounts[0];
+    setQuickPaymentAccountId(String(preferred.id));
+  }, [accounts.data, paymentAccounts, quickPaymentAccountId]);
 
   useEffect(() => {
     const params = new URLSearchParams(window.location.search);
@@ -512,7 +621,7 @@ export default function SettingsPage() {
     if (!gmailResult) return;
     setMessage(
       gmailResult === "connected"
-        ? "Gmail 已安全連接。接著請建立信用卡郵件規則。"
+        ? "Gmail 已安全連接。接著按一下自動偵測，就能完成信用卡設定。"
         : "Gmail 連接沒有完成，請再試一次。",
     );
     if (gmailResult === "connected") setEmailSettingsOpen(true);
@@ -522,11 +631,13 @@ export default function SettingsPage() {
 
   return (
     <>
-      <PageHeader
-        eyebrow="Toolkit"
-        title="資料工具箱"
-        description="把常用的備份、行情匯率與自動分類集中在這裡。"
-      />
+      <div className="settings-page-header">
+        <PageHeader
+          eyebrow="Settings"
+          title="設定"
+          description="先看常用功能，需要時再展開詳細設定。"
+        />
+      </div>
 
       {message && (
         <div className="mb-6 flex items-center justify-between rounded-xl border border-emerald-200 bg-emerald-50 px-4 py-3 text-sm text-emerald-800">
@@ -535,7 +646,16 @@ export default function SettingsPage() {
         </div>
       )}
 
-      <Card className="mb-6 p-6">
+      <p className="mb-2 text-xs font-bold uppercase tracking-[.16em] text-slate-400 md:hidden">常用設定</p>
+
+      <MobileSettingsSection
+        id="appearance"
+        icon={theme === "dark" ? <Moon size={18} /> : <Sun size={18} />}
+        title="外觀模式"
+        description="切換淺色或深色畫面"
+        status={theme === "dark" ? "深色" : "淺色"}
+      >
+      <Card className="settings-detail-card mb-6 p-6">
         <div className="flex flex-col justify-between gap-5 sm:flex-row sm:items-center">
           <div>
             <h2 className="font-bold text-ink">外觀模式</h2>
@@ -571,9 +691,17 @@ export default function SettingsPage() {
           </div>
         </div>
       </Card>
+      </MobileSettingsSection>
 
-      <div className="grid gap-6 xl:grid-cols-[1.05fr_.95fr]">
-        <Card className="p-6">
+      <div className="settings-primary-grid grid gap-6 xl:grid-cols-[1.05fr_.95fr]">
+        <MobileSettingsSection
+          id="backup"
+          icon={<Database size={18} />}
+          title="資料備份"
+          description="匯出或還原全部財務資料"
+          status={lastBackupAt ? "已備份" : "尚未備份"}
+        >
+        <Card className="settings-detail-card p-6">
           <div className="flex flex-col justify-between gap-5 lg:flex-row lg:items-start">
             <div className="flex items-start gap-4">
               <div className="rounded-2xl bg-emerald-50 p-3 text-emerald-700"><Database size={20} /></div>
@@ -620,8 +748,16 @@ export default function SettingsPage() {
           </div>
           {restore.isError && <p className="mt-4 text-sm text-red-600">{(restore.error as Error).message}</p>}
         </Card>
+        </MobileSettingsSection>
 
-        <Card className="p-6">
+        <MobileSettingsSection
+          id="market"
+          icon={<RefreshCw size={18} />}
+          title="行情與匯率"
+          description="查看行情來源與更新外幣匯率"
+          status={latestFxDate || "尚未更新"}
+        >
+        <Card className="settings-detail-card p-6">
           <div className="flex items-start gap-4">
             <div className="rounded-2xl bg-blue-50 p-3 text-blue-700"><RefreshCw size={20} /></div>
             <div className="flex-1">
@@ -650,9 +786,17 @@ export default function SettingsPage() {
             </Button>
           </div>
         </Card>
+        </MobileSettingsSection>
       </div>
 
-      <Card className="mt-6 p-6">
+      <MobileSettingsSection
+        id="exchange"
+        icon={<Bitcoin size={18} />}
+        title="交易所同步"
+        description="管理幣安連線與背景更新"
+        status={binanceConnections.data?.some((item) => item.connected) ? "已連接" : "未連接"}
+      >
+      <Card className="settings-detail-card mt-6 p-6">
         <div className="flex flex-col justify-between gap-5 lg:flex-row lg:items-start">
           <div className="flex items-start gap-4">
             <div className="rounded-2xl bg-amber-50 p-3 text-amber-700"><Bitcoin size={20} /></div>
@@ -827,8 +971,16 @@ export default function SettingsPage() {
           </form>
         )}
       </Card>
+      </MobileSettingsSection>
 
-      <Card className="mt-6 p-6">
+      <MobileSettingsSection
+        id="email"
+        icon={<Mail size={18} />}
+        title="信用卡自動記帳"
+        description="管理 Gmail、信用卡與繳款規則"
+        status={gmail.data?.connected ? "已連接" : "未連接"}
+      >
+      <Card className="settings-detail-card mt-6 p-6">
         <div className="flex flex-col justify-between gap-5 lg:flex-row lg:items-start">
           <div className="flex items-start gap-4">
             <div className="rounded-2xl bg-blue-50 p-3 text-blue-700"><Mail size={20} /></div>
@@ -866,6 +1018,7 @@ export default function SettingsPage() {
                     if (emailSettingsOpen) {
                       setEmailSettingsOpen(false);
                       setEditingEmailRule(null);
+                      setManualEmailSetupOpen(false);
                     } else {
                       startCreatingEmailRule();
                     }
@@ -919,7 +1072,94 @@ export default function SettingsPage() {
           )}
         </div>
 
-        {gmail.data?.connected && emailSettingsOpen && (
+        {gmail.data?.connected && emailSettingsOpen && !editingEmailRule && !manualEmailSetupOpen && (
+          <div className="mt-5 rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50 to-emerald-50 p-5">
+            <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
+              <div>
+                <p className="font-bold text-slate-800">讓系統幫你找，不用逐欄填寫</p>
+                <p className="mt-1 text-sm leading-6 text-slate-500">
+                  只檢查近六個月郵件的寄件者、主旨與日期；確認後才會讀取相符信用卡郵件。
+                </p>
+              </div>
+              <Button
+                type="button"
+                onClick={() => discoverGmailCards.mutate()}
+                disabled={discoverGmailCards.isPending}
+              >
+                <Search size={16} className={discoverGmailCards.isPending ? "animate-pulse" : ""} />
+                {discoverGmailCards.isPending ? "正在安全偵測…" : gmailCandidates.length ? "重新偵測" : "自動偵測 Gmail 信用卡"}
+              </Button>
+            </div>
+
+            {discoverGmailCards.isPending && (
+              <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                {["檢查銀行寄件者", "比對信用卡郵件", "準備自動設定"].map((label) => (
+                  <div key={label} className="animate-pulse rounded-xl bg-white/80 px-4 py-3 text-sm text-slate-500">
+                    {label}…
+                  </div>
+                ))}
+              </div>
+            )}
+
+            {!discoverGmailCards.isPending && gmailCandidates.length > 0 && (
+              <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1fr_auto] lg:items-end">
+                <label className="block">
+                  <span className="mb-2 block text-sm font-semibold text-slate-700">偵測到的信用卡</span>
+                  <Select
+                    value={selectedGmailCandidate}
+                    onChange={(event) => setSelectedGmailCandidate(event.target.value)}
+                  >
+                    {gmailCandidates.map((candidate) => (
+                      <option key={candidate.key} value={candidate.key}>
+                        {candidate.account_name}（找到 {candidate.matched_messages} 封）
+                      </option>
+                    ))}
+                  </Select>
+                  <span className="mt-2 block truncate text-xs text-slate-400">
+                    {gmailCandidates.find((item) => item.key === selectedGmailCandidate)?.sample_subject || "已確認銀行寄件者"}
+                  </span>
+                </label>
+                <label className="block">
+                  <span className="mb-2 block text-sm font-semibold text-slate-700">帳單從哪個帳戶扣款？</span>
+                  <Select
+                    value={quickPaymentAccountId}
+                    onChange={(event) => setQuickPaymentAccountId(event.target.value)}
+                  >
+                    <option value="">選擇扣款帳戶</option>
+                    {paymentAccounts.map((account) => (
+                      <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
+                    ))}
+                  </Select>
+                  <span className="mt-2 block text-xs text-slate-400">信用卡負債帳戶會自動建立，不用先去帳戶頁。</span>
+                </label>
+                <Button
+                  type="button"
+                  disabled={quickSetupGmailCard.isPending || !selectedGmailCandidate || !quickPaymentAccountId}
+                  onClick={() => quickSetupGmailCard.mutate({
+                    candidate_key: selectedGmailCandidate,
+                    payment_account_id: Number(quickPaymentAccountId),
+                  })}
+                >
+                  <Check size={16} /> {quickSetupGmailCard.isPending ? "建立並同步中…" : "確認並開始同步"}
+                </Button>
+              </div>
+            )}
+
+            {!discoverGmailCards.isPending && discoverGmailCards.isSuccess && !gmailCandidates.length && (
+              <p className="mt-4 rounded-xl bg-white/80 px-4 py-3 text-sm text-amber-700">
+                沒有找到支援的銀行寄件者。你仍可使用下方進階設定自行輸入寄件者。
+              </p>
+            )}
+
+            <div className="mt-4 flex justify-end">
+              <Button type="button" variant="ghost" onClick={() => setManualEmailSetupOpen(true)}>
+                改用進階手動設定
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {gmail.data?.connected && emailSettingsOpen && (editingEmailRule || manualEmailSetupOpen) && (
           <form
             key={editingEmailRule?.id || "new-email-rule"}
             className="mt-5 space-y-4"
@@ -1069,8 +1309,18 @@ export default function SettingsPage() {
           </div>
         )}
       </Card>
+      </MobileSettingsSection>
 
-      <Card className="mt-6 overflow-hidden">
+      <p className="mb-2 mt-6 text-xs font-bold uppercase tracking-[.16em] text-slate-400 md:hidden">其他設定</p>
+
+      <MobileSettingsSection
+        id="categories"
+        icon={<BookOpen size={18} />}
+        title="自動分類"
+        description="管理店名與交易分類規則"
+        status={`${rules.data?.length || 0} 條`}
+      >
+      <Card className="settings-detail-card mt-6 overflow-hidden">
         <div className="border-b border-slate-100 px-6 py-5">
           <div className="flex flex-col justify-between gap-4 lg:flex-row lg:items-start">
             <div className="flex items-center gap-3">
@@ -1160,17 +1410,18 @@ export default function SettingsPage() {
           )}
         </div>
       </Card>
+      </MobileSettingsSection>
 
-      <Card className="mt-6 overflow-hidden">
+      <Card className="settings-advanced-card mt-6 overflow-hidden">
         <button
           className="flex w-full items-center justify-between px-6 py-5 text-left hover:bg-slate-50"
           onClick={() => setAdvancedOpen((value) => !value)}
         >
-          <div className="flex items-center gap-3">
+          <div className="flex min-w-0 items-center gap-3">
             <div className="rounded-xl bg-slate-100 p-2.5 text-slate-600"><Shield size={18} /></div>
-            <div>
+            <div className="min-w-0">
               <h2 className="font-bold text-ink">進階資料設定</h2>
-              <p className="mt-1 text-xs text-slate-400">平常不需要碰；需要設定備援行情、手動匯率或查看明細時再展開。</p>
+              <p className="mt-1 truncate text-xs text-slate-400 md:whitespace-normal">平常不需要碰；需要設定備援行情、手動匯率或查看明細時再展開。</p>
             </div>
           </div>
           <Badge>{advancedOpen ? "收起" : "展開"}</Badge>

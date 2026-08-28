@@ -431,42 +431,53 @@ export default function AnalysisPage() {
             ) : spending.isPending ? (
               <div className="mt-5 h-36 animate-pulse rounded-2xl bg-slate-100" />
             ) : recurringExpenses.length ? (
-              <div className="mt-5 grid gap-3 lg:grid-cols-2">
+              <div className="mt-5 grid min-w-0 gap-3 lg:grid-cols-2">
                 {recurringExpenses.map((item) => (
-                  <div key={`${item.source}-${item.id || `${item.account_name}-${item.name}`}`} className="rounded-2xl border border-slate-200/80 p-4 sm:p-5">
-                    <div className="flex items-start gap-3">
-                      <div className="grid size-10 shrink-0 place-items-center rounded-xl bg-blue-50 text-blue-700">
-                        <CalendarDays size={18} />
-                      </div>
-                      <div className="min-w-0 flex-1">
-                        <div className="flex flex-wrap items-center gap-2">
-                          <p className="min-w-0 truncate font-semibold text-slate-800">{item.name}</p>
-                          <Badge>{item.category_name}</Badge>
-                          <Badge tone={item.source === "custom" ? "blue" : "slate"}>
-                            {item.source === "custom" ? "自行設定" : "自動辨識"}
-                          </Badge>
-                          <Badge tone={item.status === "recorded" ? "green" : "amber"}>
-                            {item.status === "recorded" ? "當月已發生" : "當月尚未出現"}
-                          </Badge>
+                  <div
+                    key={`${item.source}-${item.id || `${item.account_name}-${item.name}`}`}
+                    className="min-w-0 overflow-hidden rounded-2xl border border-slate-200/80 p-4 sm:p-5"
+                  >
+                    <div className="flex min-w-0 flex-col gap-3 sm:flex-row sm:items-start">
+                      <div className="flex min-w-0 items-start gap-3 sm:flex-1">
+                        <div className="grid size-10 shrink-0 place-items-center rounded-xl bg-blue-50 text-blue-700">
+                          <CalendarDays size={18} />
                         </div>
-                        <p className="mt-1 text-xs text-slate-400">
-                          {item.account_name}
-                          {item.source === "custom"
-                            ? item.due_day
-                              ? ` · 每月 ${item.due_day} 日`
-                              : " · 未指定扣款日"
-                            : ` · 近六個月出現 ${item.months_detected} 個月`}
-                        </p>
+                        <div className="min-w-0 flex-1">
+                          <div className="flex min-w-0 flex-wrap items-center gap-2">
+                            <p className="w-full min-w-0 break-words font-semibold text-slate-800 [overflow-wrap:anywhere] sm:w-auto">
+                              {item.name}
+                            </p>
+                            <Badge>{item.category_name}</Badge>
+                            <Badge tone={item.source === "custom" ? "blue" : "slate"}>
+                              {item.source === "custom" ? "自行設定" : "自動辨識"}
+                            </Badge>
+                            <Badge tone={item.status === "recorded" ? "green" : "amber"}>
+                              {item.status === "recorded" ? "當月已發生" : "當月尚未出現"}
+                            </Badge>
+                          </div>
+                          <p className="mt-1 break-words text-xs text-slate-400 [overflow-wrap:anywhere]">
+                            {item.account_name}
+                            {item.source === "custom"
+                              ? item.due_day
+                                ? ` · 每月 ${item.due_day} 日`
+                                : " · 未指定扣款日"
+                              : ` · 近六個月出現 ${item.months_detected} 個月`}
+                          </p>
+                        </div>
                       </div>
-                      <div className="shrink-0 text-right">
-                        <p className="font-bold text-slate-800">
-                          {money(item.status === "recorded" ? item.current_month_amount : item.average_amount)}
-                        </p>
-                        <p className="mt-1 text-xs text-slate-400">
-                          {item.status === "recorded" ? "當月金額" : "過去平均"}
-                        </p>
+                      <div className="flex min-w-0 items-center justify-between gap-3 border-t border-slate-100 pt-3 sm:block sm:shrink-0 sm:border-0 sm:pt-0 sm:text-right">
+                        <div className="flex flex-wrap items-center gap-2">
+                          <div>
+                            <p className="whitespace-nowrap font-bold text-slate-800">
+                              {money(item.status === "recorded" ? item.current_month_amount : item.average_amount)}
+                            </p>
+                            <p className="mt-1 text-xs text-slate-400">
+                              {item.status === "recorded" ? "當月金額" : "過去平均"}
+                            </p>
+                          </div>
+                        </div>
                         {item.source === "custom" && item.id ? (
-                          <div className="mt-2 flex justify-end gap-1">
+                          <div className="flex justify-end gap-1 sm:mt-2">
                             <button
                               type="button"
                               className="rounded-lg p-2 text-slate-400 hover:bg-slate-100 hover:text-slate-700"
@@ -489,7 +500,7 @@ export default function AnalysisPage() {
                             </button>
                           </div>
                         ) : item.source === "detected" && item.account_id ? (
-                          <div className="mt-2 flex justify-end">
+                          <div className="flex justify-end sm:mt-2">
                             <button
                               type="button"
                               className="rounded-lg p-2 text-slate-400 hover:bg-red-50 hover:text-red-600"

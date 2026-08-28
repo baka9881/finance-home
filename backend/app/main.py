@@ -78,6 +78,7 @@ from .schemas import (
     SettingsUpdate,
     EmailCardRuleCreate,
     EmailCardRuleUpdate,
+    GmailCardQuickSetup,
     TransactionCreate,
     TransactionUpdate,
     TransferCreate,
@@ -123,9 +124,11 @@ from .email_sync import (
     _refresh_current_gmail_card_balance,
     complete_gmail_authorization,
     disconnect_gmail,
+    discover_gmail_card_candidates,
     frontend_settings_url,
     gmail_authorization_url,
     gmail_callback_url,
+    gmail_card_provider,
     gmail_status,
     process_due_card_bills,
     serialize_card_bill,
@@ -2198,6 +2201,104 @@ def synchronize_gmail(db: DB):
     except ValueError as exc:
         db.rollback()
         raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/email/gmail/discover")
+def discover_gmail_cards(db: DB):
+    try:
+        return discover_gmail_card_candidates(db)
+    except ValueError as exc:
+        db.rollback()
+        raise HTTPException(422, str(exc)) from exc
+
+
+@app.post("/api/email/gmail/quick-setup", status_code=201)
+def quick_setup_gmail_card(payload: GmailCardQuickSetup, db: DB):
+    provider = gmail_card_provider(payload.candidate_key)
+    if not provider:
+        raise HTTPException(422, "不支援這個信用卡寄件者，請改用進階手動設定")
+    payment_account = require_account(db, payload.payment_account_id)
+    if payment_account.archived or payment_account.nature != "asset":
+        raise HTTPException(422, "扣款帳戶必須是使用中的資產帳戶")
+
+    card_account = db.scalar(
+        select(Account)
+        .where(
+            Account.account_type == "credit_card",
+            Account.nature == "liability",
+            Account.owner == payment_account.owner,
+            Account.archived.is_(False),
+            (
+                (Account.institution == provider["institution"])
+                | (Account.name == provider["account_name"])
+            ),
+        )
+        .order_by(Account.id)
+    )
+    account_created = False
+    if not card_account:
+        card_account = Account(
+            name=provider["account_name"],
+            institution=provider["institution"],
+            account_type="credit_card",
+            nature="liability",
+            currency=payment_account.currency,
+            owner=payment_account.owner,
+            is_liquid=False,
+        )
+        db.add(card_account)
+        db.flush()
+        create_balance_snapshot(db, card_account, Decimal("0"), date.today())
+        account_created = True
+
+    rule = db.scalar(
+        select(EmailCardRule)
+        .where(
+            EmailCardRule.card_account_id == card_account.id,
+            EmailCardRule.sender_pattern == provider["sender_pattern"],
+        )
+        .order_by(EmailCardRule.id)
+    )
+    if rule:
+        rule.name = provider["account_name"]
+        rule.owner = card_account.owner
+        rule.payment_account_id = payment_account.id
+        rule.card_last4 = payload.card_last4
+        rule.lookback_days = 90
+        rule.auto_pay = payload.auto_pay
+        rule.active = True
+    else:
+        rule = EmailCardRule(
+            name=provider["account_name"],
+            owner=card_account.owner,
+            card_account_id=card_account.id,
+            payment_account_id=payment_account.id,
+            sender_pattern=provider["sender_pattern"],
+            subject_pattern=None,
+            card_last4=payload.card_last4,
+            lookback_days=90,
+            auto_pay=payload.auto_pay,
+            active=True,
+        )
+        db.add(rule)
+    db.commit()
+    db.refresh(rule)
+
+    try:
+        sync_result = sync_gmail(db)
+    except Exception as exc:
+        db.rollback()
+        sync_result = {
+            "errors": [str(exc)],
+            "transactions_imported": 0,
+            "bills_found": 0,
+        }
+    return {
+        "account_created": account_created,
+        "card_account": account_summary(db, card_account),
+        "rule": serialize_email_rule(rule),
+        "sync_result": sync_result,
+    }
 
 
 @app.get("/api/email/card-rules")

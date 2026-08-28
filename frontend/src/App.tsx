@@ -19,7 +19,7 @@ import {
   X,
 } from "lucide-react";
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { useQueryClient } from "@tanstack/react-query";
+import { useIsFetching, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError, AUTH_REQUIRED, clearAuthToken, getAuthToken, setAuthToken } from "./api";
 import { prefetchPrimaryData, prefetchSecondaryData, preloadPageModules } from "./appQueries";
 import { ownerFilterOptions, useOwnerFilter } from "./ownerFilter";
@@ -405,6 +405,23 @@ function AuthCheckingScreen() {
   );
 }
 
+function GlobalQueryProgress() {
+  const activeFetches = useIsFetching({ type: "active" });
+
+  if (!activeFetches) return null;
+
+  return (
+    <div
+      className="global-query-progress"
+      role="progressbar"
+      aria-label="正在載入最新資料"
+    >
+      <div className="global-query-progress-bar" />
+      <span className="sr-only">正在載入最新資料…</span>
+    </div>
+  );
+}
+
 function FinanceApp() {
   const [compact, setCompact] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
@@ -451,6 +468,7 @@ function FinanceApp() {
 
   return (
     <div className="min-h-screen bg-canvas">
+      <GlobalQueryProgress />
       <Sidebar
         compact={compact}
         mobileOpen={mobileOpen}

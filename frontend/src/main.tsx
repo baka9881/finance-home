@@ -18,7 +18,6 @@ const queryClient = new QueryClient({
       retry: (failureCount, error) =>
         !(error instanceof ApiError && error.status === 401) && failureCount < 1,
       refetchOnWindowFocus: false,
-      placeholderData: (previousData: unknown) => previousData,
     },
   },
 });

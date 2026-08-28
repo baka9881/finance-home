@@ -2,6 +2,7 @@ from datetime import date
 from decimal import Decimal
 from types import SimpleNamespace
 
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -20,9 +21,11 @@ from app.email_sync import (
     _refresh_current_gmail_card_balance,
     _gmail_rule_search_query,
     _plain_html,
+    discover_gmail_card_candidates,
     parse_card_email,
     process_due_card_bills,
 )
+from app import email_sync as email_sync_module
 from app.services import (
     calculate_dashboard,
     create_balance_snapshot,
@@ -781,6 +784,38 @@ def test_gmail_rule_search_query_escapes_quotes_and_supports_one_filter() -> Non
     assert _gmail_rule_search_query(rule) == (
         'newer_than:30d subject:"電子「帳單\\"通知"'
     )
+
+
+def test_gmail_card_discovery_reads_metadata_only(monkeypatch: pytest.MonkeyPatch) -> None:
+    db = make_session()
+    requests: list[tuple[str, dict | None]] = []
+    monkeypatch.setattr(email_sync_module, "_gmail_access_token", lambda _db: "token")
+
+    def fake_get(_token: str, path: str, params: dict | None = None):
+        requests.append((path, params))
+        if path == "/messages":
+            return {"messages": [{"id": "cathay-1"}]} if "cathaybk.com.tw" in str(params) else {}
+        return {
+            "internalDate": "1787760000000",
+            "payload": {
+                "headers": [
+                    {"name": "From", "value": "Cathay <notice@cathaybk.com.tw>"},
+                    {"name": "Subject", "value": "信用卡消費彙整通知"},
+                    {"name": "Date", "value": "Thu, 27 Aug 2026 01:00:00 +0800"},
+                ]
+            },
+        }
+
+    monkeypatch.setattr(email_sync_module, "_gmail_get", fake_get)
+    result = discover_gmail_card_candidates(db)
+
+    assert result["metadata_only"] is True
+    assert result["candidates"][0]["key"] == "cathay"
+    assert result["candidates"][0]["sample_subject"] == "信用卡消費彙整通知"
+    message_reads = [params for path, params in requests if path.startswith("/messages/")]
+    assert message_reads
+    assert all(params and params.get("format") == "metadata" for params in message_reads)
+    db.close()
 
 
 def decimal_amount(snapshot: BalanceSnapshot | None) -> Decimal:

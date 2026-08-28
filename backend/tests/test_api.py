@@ -1528,3 +1528,67 @@ def test_credit_card_email_rule_crud_is_scoped_and_hides_pdf_password(
     deactivated = client.delete(f"/api/email/card-rules/{rule['id']}")
     assert deactivated.status_code == 200
     assert client.get("/api/email/card-rules").json()[0]["active"] is False
+
+
+def test_gmail_quick_setup_creates_card_account_reuses_rule_and_syncs(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    payment_account = create_account(client, "生活費帳戶")
+    sync_calls = 0
+
+    def fake_sync(_db):
+        nonlocal sync_calls
+        sync_calls += 1
+        return {
+            "transactions_imported": 2,
+            "bills_found": 1,
+            "errors": [],
+        }
+
+    monkeypatch.setattr(main_module, "sync_gmail", fake_sync)
+    payload = {
+        "candidate_key": "cathay",
+        "payment_account_id": payment_account,
+        "auto_pay": True,
+    }
+    first = client.post("/api/email/gmail/quick-setup", json=payload)
+    assert first.status_code == 201, first.text
+    assert first.json()["account_created"] is True
+    assert first.json()["card_account"]["account_type"] == "credit_card"
+    assert first.json()["rule"]["sender_pattern"] == "cathaybk.com.tw"
+    assert first.json()["sync_result"]["transactions_imported"] == 2
+
+    second = client.post("/api/email/gmail/quick-setup", json=payload)
+    assert second.status_code == 201, second.text
+    assert second.json()["account_created"] is False
+    assert sync_calls == 2
+    accounts = client.get("/api/accounts").json()
+    assert len([item for item in accounts if item["account_type"] == "credit_card"]) == 1
+    assert len(client.get("/api/email/card-rules").json()) == 1
+
+
+def test_gmail_discovery_endpoint_returns_metadata_candidates(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setattr(
+        main_module,
+        "discover_gmail_card_candidates",
+        lambda _db: {
+            "lookback_days": 180,
+            "messages_scanned": 3,
+            "metadata_only": True,
+            "candidates": [
+                {
+                    "key": "cathay",
+                    "institution": "國泰世華銀行",
+                    "account_name": "國泰世華銀行 信用卡",
+                    "sender_pattern": "cathaybk.com.tw",
+                    "matched_messages": 3,
+                }
+            ],
+        },
+    )
+    response = client.post("/api/email/gmail/discover")
+    assert response.status_code == 200
+    assert response.json()["metadata_only"] is True
+    assert response.json()["candidates"][0]["key"] == "cathay"

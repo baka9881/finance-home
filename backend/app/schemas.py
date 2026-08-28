@@ -240,6 +240,13 @@ class EmailCardRuleUpdate(BaseModel):
     statement_password: str | None = Field(default=None, max_length=200)
 
 
+class GmailCardQuickSetup(BaseModel):
+    candidate_key: str = Field(min_length=1, max_length=50)
+    payment_account_id: int
+    card_last4: str | None = Field(default=None, pattern=r"^\d{4}$")
+    auto_pay: bool = True
+
+
 class BackupPayload(BaseModel):
     version: int = 1
     exported_at: datetime

@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bitcoin,
   ChevronDown,
+  CircleAlert,
   Clock3,
   LineChart,
   Pencil,
@@ -32,6 +33,7 @@ import {
   MobileWizardStep,
   PageHeader,
   Select,
+  Skeleton,
   money,
   number,
   validateWizardStep,
@@ -532,6 +534,41 @@ export default function InvestmentsPage() {
         </div>
       )}
 
+      {positions.isError ? (
+        <Card className="overflow-hidden">
+          <EmptyState
+            icon={<CircleAlert size={26} />}
+            title="持倉資料載入失敗"
+            description={(positions.error as Error).message || "目前無法取得持倉，請稍後再試。"}
+            action={<Button onClick={() => positions.refetch()}>重新載入</Button>}
+          />
+        </Card>
+      ) : positions.isPending ? (
+        <div role="status" aria-live="polite" aria-label="正在載入投資持倉">
+          <div className="mb-6 grid gap-4 sm:grid-cols-3">
+            {[0, 1, 2].map((item) => (
+              <Card key={item} className="space-y-3 p-5">
+                <Skeleton className="h-4 w-36" />
+                <Skeleton className="h-8 w-28" />
+                <Skeleton className="h-3 w-20" />
+              </Card>
+            ))}
+          </div>
+          <Card className="space-y-1 p-4">
+            {[0, 1, 2].map((row) => (
+              <div key={row} className="flex items-center gap-3 rounded-xl px-1 py-3">
+                <Skeleton className="size-10 shrink-0 rounded-xl" />
+                <div className="min-w-0 flex-1 space-y-2">
+                  <Skeleton className="h-4 w-1/3" />
+                  <Skeleton className="h-3 w-1/4" />
+                </div>
+                <Skeleton className="h-6 w-24 shrink-0" />
+              </div>
+            ))}
+          </Card>
+        </div>
+      ) : (
+        <>
       <div className="mb-6 grid gap-4 sm:grid-cols-3">
         <Card className="p-5">
           <p className="text-sm text-slate-500">投資總市值（折合 TWD）</p>
@@ -738,6 +775,8 @@ export default function InvestmentsPage() {
           </>
         )}
       </Card>
+        </>
+      )}
 
       <Dialog
         open={Boolean(adjustingPosition)}

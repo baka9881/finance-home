@@ -29,6 +29,42 @@ body {
   background: #f5f7f4;
 }
 
+@keyframes global-query-progress-slide {
+  0% {
+    transform: translateX(-120%);
+  }
+  60% {
+    transform: translateX(160%);
+  }
+  100% {
+    transform: translateX(280%);
+  }
+}
+
+.global-query-progress {
+  position: fixed;
+  inset: 0 0 auto;
+  z-index: 100;
+  height: 3px;
+  overflow: hidden;
+  background: rgb(167 243 208 / 55%);
+}
+
+.global-query-progress-bar {
+  height: 100%;
+  width: 42%;
+  border-radius: 9999px;
+  background: #10b981;
+  animation: global-query-progress-slide 1.05s ease-in-out infinite;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .global-query-progress-bar {
+    width: 100%;
+    animation: none;
+  }
+}
+
 .mobile-app-header {
   height: calc(4rem + env(safe-area-inset-top, 0px));
   padding-top: env(safe-area-inset-top, 0px);
@@ -59,6 +95,161 @@ input[type="time"]::-webkit-date-and-time-value {
 
 .mobile-quick-actions {
   bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
+}
+
+/* Settings stays complete on desktop, but becomes a calm accordion on phones. */
+@media (min-width: 768px) {
+  .settings-mobile-section,
+  .settings-mobile-section-content {
+    display: contents;
+  }
+
+  .settings-mobile-section:not([open]) > .settings-mobile-section-content {
+    display: contents !important;
+  }
+}
+
+@media (max-width: 767px) {
+  .settings-page-header header {
+    margin-bottom: 1rem;
+  }
+
+  .settings-page-header header p:first-child {
+    display: none;
+  }
+
+  .settings-page-header header h1 {
+    font-size: 1.65rem;
+    line-height: 1.2;
+  }
+
+  .settings-page-header header h1 + p {
+    margin-top: .35rem;
+    font-size: .8rem;
+  }
+
+  .settings-mobile-section {
+    display: block;
+    width: 100%;
+    min-width: 0;
+    max-width: 100%;
+    margin-bottom: .75rem;
+    overflow: hidden;
+    border: 1px solid #e2e8f0;
+    border-radius: 1.25rem;
+    background: #fff;
+    box-shadow: 0 10px 28px rgb(15 23 42 / 5%);
+  }
+
+  .settings-mobile-section-summary {
+    display: grid;
+    width: 100%;
+    min-width: 0;
+    min-height: 4.75rem;
+    cursor: pointer;
+    grid-template-columns: 2.5rem minmax(0, 1fr) auto auto;
+    list-style: none;
+    align-items: center;
+    gap: .75rem;
+    padding: .9rem 1rem;
+    -webkit-tap-highlight-color: transparent;
+    touch-action: manipulation;
+  }
+
+  .settings-mobile-section-summary::-webkit-details-marker {
+    display: none;
+  }
+
+  .settings-mobile-section-summary > .min-w-0 {
+    overflow: hidden;
+  }
+
+  .settings-mobile-section-icon {
+    display: grid;
+    width: 2.5rem;
+    height: 2.5rem;
+    flex: 0 0 auto;
+    place-items: center;
+    border-radius: .85rem;
+    color: #047857;
+    background: #ecfdf5;
+  }
+
+  .settings-mobile-section-chevron {
+    transition: transform 180ms ease;
+  }
+
+  .settings-mobile-section[open] > .settings-mobile-section-summary {
+    background: #f8fafc;
+  }
+
+  .settings-mobile-section[open] > .settings-mobile-section-summary .settings-mobile-section-chevron {
+    transform: rotate(180deg);
+  }
+
+  .settings-mobile-section-content {
+    border-top: 1px solid #e2e8f0;
+  }
+
+  .settings-mobile-section-content > .settings-detail-card {
+    margin: 0 !important;
+    border: 0;
+    border-radius: 0;
+    box-shadow: none;
+  }
+
+  .settings-mobile-section-content > .settings-detail-card.p-6 {
+    padding: 1rem;
+  }
+
+  .settings-mobile-section-content .px-6 {
+    padding-left: 1rem;
+    padding-right: 1rem;
+  }
+
+  .settings-mobile-section-content .py-5 {
+    padding-top: 1rem;
+    padding-bottom: 1rem;
+  }
+
+  .settings-primary-grid {
+    gap: 0;
+  }
+
+  .settings-advanced-card > button {
+    gap: .75rem;
+    padding: 1rem;
+  }
+
+  .settings-advanced-card > button > .inline-flex,
+  .settings-advanced-card > button > span {
+    flex: 0 0 auto;
+  }
+
+  @media (max-width: 420px) {
+    .settings-mobile-section-status {
+      display: none;
+    }
+  }
+
+  .dark .settings-mobile-section {
+    border-color: #31413a;
+    background: #151e1b;
+    box-shadow: 0 12px 30px rgb(0 0 0 / 18%);
+  }
+
+  .dark .settings-mobile-section[open] > .settings-mobile-section-summary {
+    background: #1b2722;
+  }
+
+  .dark .settings-mobile-section-icon {
+    color: #6ee7b7;
+    background: #123127;
+  }
+
+  .dark .settings-mobile-section-content {
+    border-color: #31413a;
+  }
 }
 
 button,
