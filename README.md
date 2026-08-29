@@ -1,7 +1,5 @@
 # Finance Home
 
-![Finance Home cover](frontend/public/finance-home-cover.png)
-
 Finance Home is a privacy-first personal finance dashboard designed for single-user use. It brings bank accounts, credit cards, investments, cryptocurrency, and liabilities into one place while keeping data on the local computer by default.
 
 ## Highlights
