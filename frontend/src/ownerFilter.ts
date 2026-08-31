@@ -3,27 +3,26 @@ import { useEffect, useState } from "react";
 export type OwnerFilter = "all" | "me" | "partner" | "shared";
 
 const storageKey = "finance:ownerFilter";
-const validOwners = new Set<OwnerFilter>(["all", "me", "partner", "shared"]);
+const selectableOwners = new Set<OwnerFilter>(["all", "me", "partner"]);
 const changeEventName = "finance:ownerFilterChanged";
 
 export const ownerFilterOptions = [
   { value: "all", label: "全部" },
   { value: "me", label: "我" },
-  { value: "partner", label: "女友" },
-  { value: "shared", label: "共同" },
+  { value: "partner", label: "小居" },
 ] as const;
 
 export const ownerFilterLabels: Record<OwnerFilter, string> = {
   all: "全部",
   me: "我",
-  partner: "女友",
+  partner: "小居",
   shared: "共同",
 };
 
 function readStoredOwnerFilter(fallback: OwnerFilter): OwnerFilter {
   try {
     const stored = window.localStorage.getItem(storageKey);
-    return validOwners.has(stored as OwnerFilter) ? (stored as OwnerFilter) : fallback;
+    return selectableOwners.has(stored as OwnerFilter) ? (stored as OwnerFilter) : fallback;
   } catch {
     return fallback;
   }
@@ -44,7 +43,7 @@ export function useOwnerFilter(fallback: OwnerFilter = "all") {
   useEffect(() => {
     function handleOwnerFilterChange(event: Event) {
       const next = (event as CustomEvent<OwnerFilter>).detail;
-      if (validOwners.has(next)) {
+      if (selectableOwners.has(next)) {
         setOwnerFilterState(next);
       }
     }
@@ -63,7 +62,7 @@ export function useOwnerFilter(fallback: OwnerFilter = "all") {
   }, [fallback]);
 
   function setOwnerFilter(value: string) {
-    const next = validOwners.has(value as OwnerFilter) ? (value as OwnerFilter) : fallback;
+    const next = selectableOwners.has(value as OwnerFilter) ? (value as OwnerFilter) : fallback;
     setOwnerFilterState(next);
     writeStoredOwnerFilter(next);
   }

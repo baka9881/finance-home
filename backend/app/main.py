@@ -28,7 +28,7 @@ from fastapi import (
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
-from sqlalchemy import delete, func, select, text
+from sqlalchemy import delete, func, inspect as sqlalchemy_inspect, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -78,6 +78,7 @@ from .schemas import (
     SettingsUpdate,
     EmailCardRuleCreate,
     EmailCardRuleUpdate,
+    EmailScreenshotAnalysisRequest,
     GmailCardQuickSetup,
     TransactionCreate,
     TransactionUpdate,
@@ -122,6 +123,7 @@ from .services import (
 )
 from .email_sync import (
     _refresh_current_gmail_card_balance,
+    analyze_card_email_screenshot_text,
     complete_gmail_authorization,
     disconnect_gmail,
     discover_gmail_card_candidates,
@@ -131,6 +133,9 @@ from .email_sync import (
     gmail_card_provider,
     gmail_status,
     process_due_card_bills,
+    repair_duplicate_card_bills,
+    rebuild_card_billing_periods,
+    serialize_card_cycle,
     serialize_card_bill,
     serialize_email_rule,
     sync_gmail,
@@ -138,46 +143,31 @@ from .email_sync import (
 
 
 def ensure_schema() -> None:
-    if engine.url.get_backend_name() != "sqlite":
-        return
     with engine.begin() as conn:
-        columns = {row[1] for row in conn.execute(text("PRAGMA table_info(accounts)"))}
-        if "balance_includes_positions" not in columns:
-            conn.execute(
-                text(
-                    "ALTER TABLE accounts "
-                    "ADD COLUMN balance_includes_positions BOOLEAN NOT NULL DEFAULT 0"
-                )
-            )
-        if "auto_balance_base_twd" not in columns:
-            conn.execute(
-                text("ALTER TABLE accounts ADD COLUMN auto_balance_base_twd NUMERIC(18, 4)")
-            )
-        if "owner" not in columns:
-            conn.execute(
-                text("ALTER TABLE accounts ADD COLUMN owner VARCHAR(20) NOT NULL DEFAULT 'me'")
-            )
-        goal_columns = {row[1] for row in conn.execute(text("PRAGMA table_info(goals)"))}
-        if goal_columns and "owner" not in goal_columns:
-            conn.execute(
-                text("ALTER TABLE goals ADD COLUMN owner VARCHAR(20) NOT NULL DEFAULT 'me'")
-            )
-        if goal_columns and "goal_type" not in goal_columns:
-            conn.execute(
-                text("ALTER TABLE goals ADD COLUMN goal_type VARCHAR(30) NOT NULL DEFAULT 'net_worth'")
-            )
-        if goal_columns and "account_id" not in goal_columns:
-            conn.execute(text("ALTER TABLE goals ADD COLUMN account_id INTEGER"))
-        valuation_columns = {
-            row[1] for row in conn.execute(text("PRAGMA table_info(valuation_snapshots)"))
-        }
-        if valuation_columns and "owner" not in valuation_columns:
-            conn.execute(
-                text(
-                    "ALTER TABLE valuation_snapshots "
-                    "ADD COLUMN owner VARCHAR(20) NOT NULL DEFAULT 'all'"
-                )
-            )
+        inspector = sqlalchemy_inspect(conn)
+
+        def columns(table: str) -> set[str]:
+            if table not in inspector.get_table_names():
+                return set()
+            return {str(item["name"]) for item in inspector.get_columns(table)}
+
+        def add_column(table: str, name: str, definition: str) -> None:
+            if name not in columns(table):
+                conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
+
+        if engine.url.get_backend_name() == "sqlite":
+            add_column("accounts", "balance_includes_positions", "BOOLEAN NOT NULL DEFAULT 0")
+            add_column("accounts", "auto_balance_base_twd", "NUMERIC(18, 4)")
+            add_column("accounts", "owner", "VARCHAR(20) NOT NULL DEFAULT 'me'")
+            add_column("goals", "owner", "VARCHAR(20) NOT NULL DEFAULT 'me'")
+            add_column("goals", "goal_type", "VARCHAR(30) NOT NULL DEFAULT 'net_worth'")
+            add_column("goals", "account_id", "INTEGER")
+            add_column("valuation_snapshots", "owner", "VARCHAR(20) NOT NULL DEFAULT 'all'")
+
+        add_column("email_card_rules", "closing_day", "INTEGER")
+        add_column("email_card_rules", "payment_due_day", "INTEGER NOT NULL DEFAULT 23")
+        add_column("credit_card_bills", "period_start", "DATE")
+        add_column("credit_card_bills", "period_end", "DATE")
 
 
 @asynccontextmanager
@@ -191,6 +181,7 @@ async def lifespan(_: FastAPI):
         # immediately instead of waiting for the next hourly automation run.
         repair_linked_transfer_kinds(db)
         repair_cross_source_card_duplicates(db)
+        repair_duplicate_card_bills(db)
         adjusted_email_balances = False
         for rule in db.scalars(
             select(EmailCardRule)
@@ -2212,6 +2203,11 @@ def discover_gmail_cards(db: DB):
         raise HTTPException(422, str(exc)) from exc
 
 
+@app.post("/api/email/gmail/screenshot/analyze")
+def analyze_gmail_card_screenshot(payload: EmailScreenshotAnalysisRequest):
+    return analyze_card_email_screenshot_text(payload.extracted_text)
+
+
 @app.post("/api/email/gmail/quick-setup", status_code=201)
 def quick_setup_gmail_card(payload: GmailCardQuickSetup, db: DB):
     provider = gmail_card_provider(payload.candidate_key)
@@ -2265,6 +2261,8 @@ def quick_setup_gmail_card(payload: GmailCardQuickSetup, db: DB):
         rule.payment_account_id = payment_account.id
         rule.card_last4 = payload.card_last4
         rule.lookback_days = 90
+        rule.closing_day = payload.closing_day
+        rule.payment_due_day = payload.payment_due_day
         rule.auto_pay = payload.auto_pay
         rule.active = True
     else:
@@ -2277,6 +2275,8 @@ def quick_setup_gmail_card(payload: GmailCardQuickSetup, db: DB):
             subject_pattern=None,
             card_last4=payload.card_last4,
             lookback_days=90,
+            closing_day=payload.closing_day,
+            payment_due_day=payload.payment_due_day,
             auto_pay=payload.auto_pay,
             active=True,
         )
@@ -2373,7 +2373,9 @@ def deactivate_email_card_rule(rule_id: int, db: DB):
 
 @app.get("/api/email/card-bills")
 def list_credit_card_bills(db: DB, limit: int = Query(12, ge=1, le=100)):
-    return [
+    for rule in db.scalars(select(EmailCardRule).order_by(EmailCardRule.id)).all():
+        rebuild_card_billing_periods(db, rule)
+    result = [
         serialize_card_bill(item)
         for item in db.scalars(
             select(CreditCardBill)
@@ -2381,6 +2383,20 @@ def list_credit_card_bills(db: DB, limit: int = Query(12, ge=1, le=100)):
             .limit(limit)
         ).all()
     ]
+    db.commit()
+    return result
+
+
+@app.get("/api/email/card-cycles")
+def list_credit_card_cycles(db: DB):
+    rules = db.scalars(
+        select(EmailCardRule)
+        .where(EmailCardRule.active.is_(True))
+        .order_by(EmailCardRule.id)
+    ).all()
+    result = [serialize_card_cycle(db, item) for item in rules]
+    db.commit()
+    return result
 
 
 @app.post("/api/email/card-bills/process")

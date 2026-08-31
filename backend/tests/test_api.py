@@ -1406,6 +1406,43 @@ def test_spending_analysis_detects_gym_merchants_as_recurring(client: TestClient
     assert recurring["休閒用品"]["category_name"] == "訂閱"
 
 
+def test_spending_analysis_keeps_subscription_visible_after_one_missed_month(
+    client: TestClient,
+):
+    account = create_account(client, "信用卡")
+    categories = client.get("/api/categories").json()
+    subscription = next(item for item in categories if item["name"] == "訂閱")
+
+    for transaction_date in (date(2026, 6, 30), date(2026, 7, 30)):
+        response = client.post(
+            "/api/transactions",
+            json={
+                "account_id": account,
+                "transaction_date": transaction_date.isoformat(),
+                "description": "GOOGLE*YOUTUBEPREMIUM",
+                "amount": -119,
+                "transaction_kind": "expense",
+                "category_id": subscription["id"],
+            },
+        )
+        assert response.status_code == 201, response.text
+
+    september = client.get("/api/analysis/spending?month=2026-09&owner=me")
+    assert september.status_code == 200, september.text
+    recurring = {
+        item["name"]: item for item in september.json()["recurring_expenses"]
+    }
+    assert recurring["GOOGLE*YOUTUBEPREMIUM"]["status"] == "expected"
+    assert recurring["GOOGLE*YOUTUBEPREMIUM"]["average_amount"] == 119
+
+    october = client.get("/api/analysis/spending?month=2026-10&owner=me")
+    assert october.status_code == 200, october.text
+    assert all(
+        item["name"] != "GOOGLE*YOUTUBEPREMIUM"
+        for item in october.json()["recurring_expenses"]
+    )
+
+
 def test_custom_recurring_expense_crud_and_analysis_override(client: TestClient):
     account = create_account(client, "房貸扣款帳戶")
     categories = client.get("/api/categories").json()
@@ -1511,6 +1548,8 @@ def test_credit_card_email_rule_crud_is_scoped_and_hides_pdf_password(
             "sender_pattern": "cathaybk.com.tw",
             "subject_pattern": "信用卡",
             "card_last4": "1234",
+            "closing_day": 2,
+            "payment_due_day": 23,
             "auto_pay": True,
             "statement_password": "A123456789",
         },
@@ -1519,11 +1558,19 @@ def test_credit_card_email_rule_crud_is_scoped_and_hides_pdf_password(
     rule = created.json()
     assert rule["owner"] == "me"
     assert rule["statement_password_configured"] is True
+    assert rule["closing_day"] == 2
+    assert rule["payment_due_day"] == 23
     assert "statement_password" not in rule
 
     listed = client.get("/api/email/card-rules")
     assert listed.status_code == 200
     assert listed.json()[0]["sender_pattern"] == "cathaybk.com.tw"
+
+    cycles = client.get("/api/email/card-cycles")
+    assert cycles.status_code == 200
+    assert cycles.json()[0]["closing_day"] == 2
+    assert cycles.json()[0]["payment_due_day"] == 23
+    assert cycles.json()[0]["current_bill"] is None
 
     deactivated = client.delete(f"/api/email/card-rules/{rule['id']}")
     assert deactivated.status_code == 200
@@ -1556,6 +1603,7 @@ def test_gmail_quick_setup_creates_card_account_reuses_rule_and_syncs(
     assert first.json()["account_created"] is True
     assert first.json()["card_account"]["account_type"] == "credit_card"
     assert first.json()["rule"]["sender_pattern"] == "cathaybk.com.tw"
+    assert first.json()["rule"]["payment_due_day"] == 23
     assert first.json()["sync_result"]["transactions_imported"] == 2
 
     second = client.post("/api/email/gmail/quick-setup", json=payload)
@@ -1592,3 +1640,37 @@ def test_gmail_discovery_endpoint_returns_metadata_candidates(
     assert response.status_code == 200
     assert response.json()["metadata_only"] is True
     assert response.json()["candidates"][0]["key"] == "cathay"
+
+
+def test_email_screenshot_analysis_detects_bank_and_card_last4(client: TestClient):
+    response = client.post(
+        "/api/email/gmail/screenshot/analyze",
+        json={
+            "extracted_text": (
+                "寄件者：國泰世華銀行 <service@cathaybk.com.tw>\n"
+                "主旨：信用卡消費通知\n"
+                "卡號末四碼 4321 本次消費新臺幣 599 元"
+            )
+        },
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["detected"] is True
+    assert result["candidate_key"] == "cathay"
+    assert result["card_last4"] == "4321"
+    assert result["confidence"] == "high"
+    assert "extracted_text" not in result
+
+
+def test_email_screenshot_analysis_requires_manual_choice_when_bank_is_unknown(
+    client: TestClient,
+):
+    response = client.post(
+        "/api/email/gmail/screenshot/analyze",
+        json={"extracted_text": "信用卡消費通知 金額 300 元 卡號末四碼 9876"},
+    )
+    assert response.status_code == 200, response.text
+    result = response.json()
+    assert result["detected"] is False
+    assert result["candidate_key"] is None
+    assert result["card_last4"] == "9876"

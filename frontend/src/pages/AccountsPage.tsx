@@ -53,7 +53,7 @@ const currencies = ["TWD", "USD", "JPY", "EUR", "GBP", "CNY", "HKD", "AUD", "CAD
 const ownerOptions = [
   { value: "all", label: "全部" },
   { value: "me", label: "我" },
-  { value: "partner", label: "女友" },
+  { value: "partner", label: "小居" },
   { value: "shared", label: "共同" },
 ];
 const accountOwnerOptions = ownerOptions.filter((option) => option.value !== "all");

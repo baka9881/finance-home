@@ -6,6 +6,7 @@ import json
 import os
 import re
 import secrets
+from calendar import monthrange
 from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from email.utils import parseaddr, parsedate_to_datetime
@@ -91,12 +92,98 @@ GMAIL_CARD_PROVIDERS: tuple[dict[str, Any], ...] = (
     },
 )
 
+SCREENSHOT_PROVIDER_HINTS: dict[str, tuple[str, ...]] = {
+    "cathay": ("國泰世華", "國泰信用卡", "cathay", "cathaybk"),
+    "ctbc": ("中國信託", "中信信用卡", "ctbc", "chinatrust"),
+    "esun": ("玉山銀行", "玉山信用卡", "esun", "e.sun"),
+    "taishin": ("台新銀行", "台新信用卡", "taishin"),
+    "fubon": ("台北富邦", "富邦銀行", "富邦信用卡", "fubon"),
+    "sinopac": ("永豐銀行", "永豐信用卡", "sinopac"),
+}
+
 
 def gmail_card_provider(candidate_key: str) -> dict[str, Any] | None:
     return next(
         (item for item in GMAIL_CARD_PROVIDERS if item["key"] == candidate_key),
         None,
     )
+
+
+def analyze_card_email_screenshot_text(text: str) -> dict[str, Any]:
+    """Identify a supported card issuer from locally extracted screenshot text.
+
+    The screenshot itself never reaches the API.  The browser performs OCR and
+    sends only extracted text; this function deliberately returns no raw text.
+    """
+    normalized = unescape(text).lower()
+    compact = re.sub(r"\s+", "", normalized)
+    ranked: list[tuple[int, dict[str, Any], list[str]]] = []
+
+    for provider in GMAIL_CARD_PROVIDERS:
+        score = 0
+        evidence: list[str] = []
+        sender = str(provider["sender_pattern"]).lower()
+        if sender in normalized or sender.replace(".", "") in compact.replace(".", ""):
+            score += 10
+            evidence.append(f"辨識到寄件網域 {provider['sender_pattern']}")
+        for hint in SCREENSHOT_PROVIDER_HINTS.get(str(provider["key"]), ()):
+            hint_normalized = hint.lower()
+            if hint_normalized in normalized or hint_normalized.replace(" ", "") in compact:
+                score += 3
+                evidence.append(f"辨識到 {hint}")
+        if score:
+            ranked.append((score, provider, evidence))
+
+    ranked.sort(key=lambda item: item[0], reverse=True)
+    best = ranked[0] if ranked else None
+    ambiguous = bool(best and len(ranked) > 1 and ranked[1][0] == best[0])
+
+    card_last4: str | None = None
+    last4_patterns = (
+        r"(?:卡號|末四碼|末4碼|末四碼為|ending\s+in|last\s*4)[^0-9]{0,20}(\d{4})(?!\d)",
+        r"(?:[*xX•·-]\s*){2,}(\d{4})(?!\d)",
+    )
+    for pattern in last4_patterns:
+        match = re.search(pattern, text, re.IGNORECASE)
+        if match:
+            card_last4 = match.group(1)
+            break
+
+    subject_hint = next(
+        (
+            line.strip()
+            for line in text.splitlines()
+            if 2 <= len(line.strip()) <= 120
+            and any(keyword in line.lower() for keyword in ("信用卡", "消費", "帳單", "刷卡", "通知", "statement"))
+        ),
+        None,
+    )
+
+    if not best or ambiguous:
+        return {
+            "detected": False,
+            "candidate_key": None,
+            "institution": None,
+            "account_name": None,
+            "sender_pattern": None,
+            "card_last4": card_last4,
+            "subject_hint": subject_hint,
+            "confidence": "unknown",
+            "evidence": [],
+        }
+
+    score, provider, evidence = best
+    return {
+        "detected": True,
+        "candidate_key": provider["key"],
+        "institution": provider["institution"],
+        "account_name": provider["account_name"],
+        "sender_pattern": provider["sender_pattern"],
+        "card_last4": card_last4,
+        "subject_hint": subject_hint,
+        "confidence": "high" if score >= 10 else "medium",
+        "evidence": list(dict.fromkeys(evidence))[:3],
+    }
 
 
 def _setting(db: Session, key: str) -> str | None:
@@ -535,7 +622,21 @@ def _cathay_digest_transactions(compact: str, message_date: date) -> list[dict[s
     return transactions
 
 
-def parse_card_email(text: str, message_date: date) -> dict[str, Any]:
+def _month_day(reference: date, month_delta: int, day: int) -> date:
+    month_index = reference.year * 12 + reference.month - 1 + month_delta
+    year, zero_based_month = divmod(month_index, 12)
+    month = zero_based_month + 1
+    return date(year, month, min(day, monthrange(year, month)[1]))
+
+
+def _due_date_after(statement_date: date, due_day: int) -> date:
+    candidate = _month_day(statement_date, 0, due_day)
+    return candidate if candidate > statement_date else _month_day(statement_date, 1, due_day)
+
+
+def parse_card_email(
+    text: str, message_date: date, default_due_day: int | None = None
+) -> dict[str, Any]:
     cathay_transactions = _cathay_digest_transactions(text, message_date)
     compact = re.sub(r"[\u3000\t]+", " ", text)
     result: dict[str, Any] = {"transactions": [], "bill": None}
@@ -550,21 +651,28 @@ def parse_card_email(text: str, message_date: date) -> dict[str, Any]:
         compact,
         re.I,
     )
-    if bill_amount_match and due_match:
-        due_date = _parse_date(due_match.group(1), message_date)
+    if bill_amount_match and (due_match or default_due_day):
+        statement_match = re.search(
+            rf"(?:帳單結帳日|結帳日|statement\s+date)\s*[:：]?\s*{DATE_VALUE}",
+            compact,
+            re.I,
+        )
+        statement_date = (
+            _parse_date(statement_match.group(1), message_date)
+            if statement_match
+            else message_date
+        )
+        due_date = (
+            _parse_date(due_match.group(1), message_date)
+            if due_match
+            else _due_date_after(statement_date, int(default_due_day))
+        )
         amount_due = _money(bill_amount_match.group(1))
         if due_date and amount_due and amount_due > 0:
-            statement_match = re.search(
-                rf"(?:帳單結帳日|結帳日|statement\s+date)\s*[:：]?\s*{DATE_VALUE}",
-                compact,
-                re.I,
-            )
             result["bill"] = {
                 "amount_due": amount_due,
                 "due_date": due_date,
-                "statement_date": _parse_date(statement_match.group(1), message_date)
-                if statement_match
-                else message_date,
+                "statement_date": statement_date,
             }
 
     transaction_amount_match = re.search(
@@ -711,37 +819,51 @@ def _create_card_transaction(
 def _refresh_current_gmail_card_balance(
     db: Session, rule: EmailCardRule, as_of: date | None = None
 ) -> Decimal | None:
-    """Rebuild the current card liability from this month's Gmail activity.
-
-    Gmail synchronization may backfill several months of purchase notices.  Those
-    historical transactions belong in cash-flow analysis, but adding every one of
-    them to the latest balance makes already-paid statements become current debt.
-    The balance shown for an email-managed card is therefore rebuilt from the
-    current calendar month's Gmail purchases, refunds and recorded repayments.
-    """
+    """Rebuild liability from unpaid statements plus the still-open billing cycle."""
     as_of = as_of or date.today()
-    month_start = as_of.replace(day=1)
+    bills = db.scalars(
+        select(CreditCardBill)
+        .where(CreditCardBill.rule_id == rule.id)
+        .order_by(CreditCardBill.statement_date, CreditCardBill.due_date, CreditCardBill.id)
+    ).all()
+    unpaid_total = sum(
+        (
+            decimal_value(item.amount_due)
+            for item in bills
+            if item.status in {"pending", "insufficient_funds", "needs_review"}
+        ),
+        ZERO,
+    )
+    statement_dates = [item.statement_date for item in bills if item.statement_date]
+    latest_statement = max(statement_dates) if statement_dates else None
+    if latest_statement:
+        open_cycle_start = latest_statement + timedelta(days=1)
+    elif rule.closing_day:
+        current_close = _month_day(as_of, 0, rule.closing_day)
+        open_cycle_start = _month_day(current_close, -1, rule.closing_day) + timedelta(days=1)
+    else:
+        open_cycle_start = as_of.replace(day=1)
     rows = db.scalars(
         select(Transaction).where(
             Transaction.account_id == rule.card_account_id,
-            Transaction.transaction_date >= month_start,
+            Transaction.transaction_date >= open_cycle_start,
             Transaction.transaction_date <= as_of,
-            Transaction.source.in_(["gmail", "gmail_autopay"]),
+            Transaction.source == "gmail",
         )
     ).all()
-    if not rows:
+    if not rows and not bills:
         return None
 
-    balance = max(
-        ZERO,
-        -sum((decimal_value(item.amount) for item in rows), ZERO),
+    open_cycle_amount = max(
+        ZERO, -sum((decimal_value(item.amount) for item in rows), ZERO)
     )
+    balance = max(ZERO, unpaid_total + open_cycle_amount)
     latest = get_latest_balance(db, rule.card_account_id)
     if (
         latest
         and latest.snapshot_date == as_of
         and decimal_value(latest.amount) == balance
-        and latest.source == "gmail_current_month"
+        and latest.source == "gmail_billing_cycle"
     ):
         return balance
 
@@ -750,9 +872,64 @@ def _refresh_current_gmail_card_balance(
         rule.card_account,
         balance,
         as_of,
-        source="gmail_current_month",
+        source="gmail_billing_cycle",
     )
     return balance
+
+
+def rebuild_card_billing_periods(db: Session, rule: EmailCardRule) -> None:
+    bills = db.scalars(
+        select(CreditCardBill)
+        .where(CreditCardBill.rule_id == rule.id)
+        .order_by(CreditCardBill.statement_date, CreditCardBill.due_date, CreditCardBill.id)
+    ).all()
+    previous_end: date | None = None
+    for bill in bills:
+        period_end = bill.statement_date or bill.period_end
+        if not period_end:
+            continue
+        expected_previous = _month_day(
+            period_end, -1, rule.closing_day or period_end.day
+        )
+        if previous_end and 20 <= (period_end - previous_end).days <= 40:
+            period_start = previous_end + timedelta(days=1)
+        else:
+            period_start = expected_previous + timedelta(days=1)
+        bill.period_start = period_start
+        bill.period_end = period_end
+        previous_end = period_end
+
+
+def repair_duplicate_card_bills(db: Session) -> dict[str, int]:
+    """Keep one bill per card and due date so historical imports cannot pay twice."""
+    groups = db.execute(
+        select(
+            CreditCardBill.rule_id,
+            CreditCardBill.due_date,
+            func.count(CreditCardBill.id),
+        )
+        .group_by(CreditCardBill.rule_id, CreditCardBill.due_date)
+        .having(func.count(CreditCardBill.id) > 1)
+    ).all()
+    merged = 0
+    for rule_id, due_date, _ in groups:
+        bills = db.scalars(
+            select(CreditCardBill)
+            .where(
+                CreditCardBill.rule_id == rule_id,
+                CreditCardBill.due_date == due_date,
+            )
+            .order_by(CreditCardBill.id.desc())
+        ).all()
+        canonical = next((item for item in bills if item.status == "paid"), bills[0])
+        for bill in bills:
+            if bill.id == canonical.id or bill.status == "duplicate":
+                continue
+            bill.status = "duplicate"
+            bill.last_error = "同一繳款日的重複帳單已合併，不會再次扣款"
+            merged += 1
+    db.flush()
+    return {"merged": merged}
 
 
 def _create_or_update_bill(
@@ -765,7 +942,6 @@ def _create_or_update_bill(
         select(CreditCardBill).where(
             CreditCardBill.rule_id == rule.id,
             CreditCardBill.due_date == parsed["due_date"],
-            CreditCardBill.amount_due == parsed["amount_due"],
         )
     )
     created = bill is None
@@ -786,18 +962,17 @@ def _create_or_update_bill(
         bill.statement_date = parsed.get("statement_date") or bill.statement_date
         bill.payment_account_id = rule.payment_account_id
         bill.source_message_id = source_message_id
-
-    latest = get_latest_balance(db, rule.card_account_id)
-    current = decimal_value(latest.amount) if latest else ZERO
-    if current < decimal_value(parsed["amount_due"]):
-        snapshot_date = max(date.today(), latest.snapshot_date) if latest else date.today()
-        create_balance_snapshot(
-            db,
-            rule.card_account,
-            decimal_value(parsed["amount_due"]),
-            snapshot_date,
-            source="gmail_statement",
-        )
+        if bill.status == "paid" and decimal_value(bill.amount_due) != decimal_value(parsed["amount_due"]):
+            bill.last_error = "已繳帳單收到不同金額，為避免再次扣款已保留原紀錄"
+        elif bill.status != "paid":
+            bill.amount_due = parsed["amount_due"]
+            if bill.status == "needs_review" and bill.last_error == "已存在相同扣款紀錄，未重複建立":
+                bill.status = "pending"
+                bill.last_error = None
+    if bill.statement_date:
+        rule.closing_day = bill.statement_date.day
+    rule.payment_due_day = bill.due_date.day
+    rebuild_card_billing_periods(db, rule)
     return created
 
 
@@ -840,6 +1015,24 @@ def process_due_card_bills(db: Session, today: date | None = None) -> dict[str, 
         payment_balance = decimal_value(payment_latest.amount) if payment_latest else ZERO
         card_balance = decimal_value(card_latest.amount) if card_latest else ZERO
         amount = decimal_value(bill.amount_due)
+        description = f"信用卡自動繳款（{bill.rule.name}）"
+        out_description = f"{description} → {card_account.name}"
+        in_description = f"{description} ← {payment_account.name}"
+        out_fingerprint = transaction_fingerprint(
+            payment_account.id, bill.due_date, -amount, out_description
+        )
+        in_fingerprint = transaction_fingerprint(
+            card_account.id, bill.due_date, amount, in_description
+        )
+        existing_payment = db.scalar(
+            select(Transaction).where(
+                Transaction.fingerprint.in_([out_fingerprint, in_fingerprint])
+            )
+        )
+        if existing_payment:
+            bill.status = "paid"
+            bill.last_error = None
+            continue
         if payment_balance < amount:
             bill.status = "insufficient_funds"
             bill.last_error = "付款帳戶餘額不足，尚未在財務居記帳"
@@ -851,24 +1044,6 @@ def process_due_card_bills(db: Session, today: date | None = None) -> dict[str, 
             needs_review += 1
             continue
 
-        description = f"信用卡自動繳款（{bill.rule.name}）"
-        out_description = f"{description} → {card_account.name}"
-        in_description = f"{description} ← {payment_account.name}"
-        out_fingerprint = transaction_fingerprint(
-            payment_account.id, bill.due_date, -amount, out_description
-        )
-        in_fingerprint = transaction_fingerprint(
-            card_account.id, bill.due_date, amount, in_description
-        )
-        if db.scalar(
-            select(Transaction).where(
-                Transaction.fingerprint.in_([out_fingerprint, in_fingerprint])
-            )
-        ):
-            bill.status = "needs_review"
-            bill.last_error = "已存在相同扣款紀錄，未重複建立"
-            needs_review += 1
-            continue
         rate, estimated = latest_fx_rate(db, bill.currency, bill.due_date)
         out_row = Transaction(
             account_id=payment_account.id,
@@ -1021,7 +1196,11 @@ def sync_gmail(db: Session) -> dict[str, Any]:
             if not _rule_matches(rule, sender, subject, content):
                 result["ignored"] += 1
                 continue
-            parsed = parse_card_email(content, message_datetime.date())
+            parsed = parse_card_email(
+                content,
+                message_datetime.date(),
+                default_due_day=rule.payment_due_day,
+            )
             imported = sum(
                 1 for item in parsed["transactions"] if _create_card_transaction(db, rule, item, message_id)
             )
@@ -1080,14 +1259,21 @@ def sync_gmail(db: Session) -> dict[str, Any]:
     result["newer_balance_preserved_accounts"] = duplicate_repair[
         "newer_balance_preserved_accounts"
     ]
+    result["duplicate_bills_merged"] = repair_duplicate_card_bills(db)["merged"]
 
-    payment_result = process_due_card_bills(db)
-    result["payments_created"] = payment_result["paid"]
     adjusted_balances: dict[str, float] = {}
     for rule in rules:
         rebuilt = _refresh_current_gmail_card_balance(db, rule)
         if rebuilt is not None:
             adjusted_balances[rule.card_account.name] = float(rebuilt)
+    db.commit()
+    payment_result = process_due_card_bills(db)
+    result["payments_created"] = payment_result["paid"]
+    if payment_result["paid"]:
+        for rule in rules:
+            rebuilt = _refresh_current_gmail_card_balance(db, rule)
+            if rebuilt is not None:
+                adjusted_balances[rule.card_account.name] = float(rebuilt)
     result["adjusted_card_balances"] = adjusted_balances
     if adjusted_balances:
         record_valuation(db)
@@ -1111,6 +1297,8 @@ def serialize_email_rule(rule: EmailCardRule) -> dict[str, Any]:
         "subject_pattern": rule.subject_pattern,
         "card_last4": rule.card_last4,
         "lookback_days": rule.lookback_days,
+        "closing_day": rule.closing_day,
+        "payment_due_day": rule.payment_due_day,
         "auto_pay": rule.auto_pay,
         "active": rule.active,
         "statement_password_configured": bool(rule.statement_password),
@@ -1125,9 +1313,83 @@ def serialize_card_bill(bill: CreditCardBill) -> dict[str, Any]:
         "card_account_name": bill.card_account.name,
         "payment_account_name": bill.payment_account.name,
         "statement_date": bill.statement_date,
+        "period_start": bill.period_start,
+        "period_end": bill.period_end,
         "due_date": bill.due_date,
         "amount_due": float(bill.amount_due),
         "currency": bill.currency,
         "status": bill.status,
         "last_error": bill.last_error,
+    }
+
+
+def serialize_card_cycle(
+    db: Session, rule: EmailCardRule, as_of: date | None = None
+) -> dict[str, Any]:
+    as_of = as_of or date.today()
+    rebuild_card_billing_periods(db, rule)
+    bills = db.scalars(
+        select(CreditCardBill)
+        .where(CreditCardBill.rule_id == rule.id)
+        .order_by(CreditCardBill.due_date.desc(), CreditCardBill.id.desc())
+    ).all()
+    current_bill = next(
+        (
+            item
+            for item in bills
+            if item.status in {"pending", "insufficient_funds", "needs_review"}
+        ),
+        None,
+    )
+    last_paid = next((item for item in bills if item.status == "paid"), None)
+    statement_dates = [item.statement_date for item in bills if item.statement_date]
+    latest_statement = max(statement_dates) if statement_dates else None
+    if latest_statement:
+        open_start = latest_statement + timedelta(days=1)
+    elif rule.closing_day:
+        current_close = _month_day(as_of, 0, rule.closing_day)
+        open_start = _month_day(current_close, -1, rule.closing_day) + timedelta(days=1)
+    else:
+        open_start = as_of.replace(day=1)
+    if rule.closing_day:
+        open_end = _month_day(open_start, 0, rule.closing_day)
+        if open_end < open_start:
+            open_end = _month_day(open_start, 1, rule.closing_day)
+    else:
+        open_end = None
+    activity_end = min(as_of, open_end) if open_end else as_of
+    open_rows = db.scalars(
+        select(Transaction).where(
+            Transaction.account_id == rule.card_account_id,
+            Transaction.transaction_date >= open_start,
+            Transaction.transaction_date <= activity_end,
+            Transaction.source == "gmail",
+        )
+    ).all()
+    open_amount = max(
+        ZERO, -sum((decimal_value(item.amount) for item in open_rows), ZERO)
+    )
+    open_cycle = {
+        "amount": float(open_amount),
+        "period_start": open_start,
+        "period_end": open_end,
+        "transaction_count": len(open_rows),
+    }
+    empty_cycle = {
+        "amount": 0.0,
+        "period_start": None,
+        "period_end": None,
+        "transaction_count": 0,
+    }
+    return {
+        "rule_id": rule.id,
+        "rule_name": rule.name,
+        "card_account_name": rule.card_account.name,
+        "currency": rule.card_account.currency,
+        "closing_day": rule.closing_day,
+        "payment_due_day": rule.payment_due_day,
+        "unbilled": empty_cycle if current_bill else open_cycle,
+        "current_bill": serialize_card_bill(current_bill) if current_bill else None,
+        "last_paid_bill": serialize_card_bill(last_paid) if last_paid else None,
+        "next_cycle": open_cycle if current_bill else empty_cycle,
     }

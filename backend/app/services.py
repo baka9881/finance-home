@@ -52,7 +52,7 @@ from .database import (
 
 ZERO = Decimal("0")
 ONE = Decimal("1")
-OWNER_LABELS = {"me": "我", "partner": "女友", "shared": "共同"}
+OWNER_LABELS = {"me": "我", "partner": "小居", "shared": "共同"}
 
 DEFAULT_CATEGORIES = [
     ("薪資", "income", False, "#22c55e", "briefcase"),
@@ -979,11 +979,18 @@ def calculate_spending_analysis(
         group["has_loan_principal"] = group["has_loan_principal"] or row.transaction_kind == "debt_principal"
         group["latest_date"] = max(group["latest_date"], row.transaction_date)
 
-    previous_month = _shift_month_start(month_start, -1).strftime("%Y-%m")
+    # Keep a recurring item visible through one missed billing/import cycle.
+    # The selected month is often still incomplete (especially on the first
+    # few days), so requiring an occurrence in only that month or the previous
+    # one makes valid subscriptions disappear at every month boundary.
+    visible_recurring_months = {
+        _shift_month_start(month_start, offset).strftime("%Y-%m")
+        for offset in (0, -1, -2)
+    }
     recurring_expenses: list[dict[str, Any]] = []
     for group in groups.values():
         monthly = group["months"]
-        if month not in monthly and previous_month not in monthly:
+        if not visible_recurring_months.intersection(monthly):
             continue
         group["name"] = max(
             group["names"],

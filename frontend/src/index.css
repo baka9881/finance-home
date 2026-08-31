@@ -103,10 +103,6 @@ input[type="time"]::-webkit-date-and-time-value {
   .settings-mobile-section-content {
     display: contents;
   }
-
-  .settings-mobile-section:not([open]) > .settings-mobile-section-content {
-    display: contents !important;
-  }
 }
 
 @media (max-width: 767px) {
@@ -156,10 +152,6 @@ input[type="time"]::-webkit-date-and-time-value {
     touch-action: manipulation;
   }
 
-  .settings-mobile-section-summary::-webkit-details-marker {
-    display: none;
-  }
-
   .settings-mobile-section-summary > .min-w-0 {
     overflow: hidden;
   }
@@ -179,11 +171,11 @@ input[type="time"]::-webkit-date-and-time-value {
     transition: transform 180ms ease;
   }
 
-  .settings-mobile-section[open] > .settings-mobile-section-summary {
+  .settings-mobile-section.is-open > .settings-mobile-section-summary {
     background: #f8fafc;
   }
 
-  .settings-mobile-section[open] > .settings-mobile-section-summary .settings-mobile-section-chevron {
+  .settings-mobile-section.is-open > .settings-mobile-section-summary .settings-mobile-section-chevron {
     transform: rotate(180deg);
   }
 
@@ -238,7 +230,7 @@ input[type="time"]::-webkit-date-and-time-value {
     box-shadow: 0 12px 30px rgb(0 0 0 / 18%);
   }
 
-  .dark .settings-mobile-section[open] > .settings-mobile-section-summary {
+  .dark .settings-mobile-section.is-open > .settings-mobile-section-summary {
     background: #1b2722;
   }
 

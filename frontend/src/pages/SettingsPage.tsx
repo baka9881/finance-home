@@ -7,6 +7,7 @@ import {
   ChevronDown,
   Database,
   Download,
+  ImageUp,
   Mail,
   KeyRound,
   Moon,
@@ -94,9 +95,16 @@ function MobileSettingsSection({
   status?: string;
   children: ReactNode;
 }) {
+  const [open, setOpen] = useState(false);
   return (
-    <details id={`settings-${id}`} className="settings-mobile-section">
-      <summary className="settings-mobile-section-summary md:hidden">
+    <section id={`settings-${id}`} className={cn("settings-mobile-section", open && "is-open")}>
+      <button
+        type="button"
+        className="settings-mobile-section-summary md:hidden"
+        aria-expanded={open}
+        aria-controls={`settings-${id}-content`}
+        onClick={() => setOpen((value) => !value)}
+      >
         <span className="settings-mobile-section-icon">{icon}</span>
         <span className="min-w-0 flex-1">
           <span className="font-bold text-ink">{title}</span>
@@ -104,9 +112,14 @@ function MobileSettingsSection({
         </span>
         {status && <span className="settings-mobile-section-status shrink-0 text-xs font-semibold text-emerald-700">{status}</span>}
         <ChevronDown className="settings-mobile-section-chevron shrink-0 text-slate-400" size={18} />
-      </summary>
-      <div className="settings-mobile-section-content">{children}</div>
-    </details>
+      </button>
+      <div
+        id={`settings-${id}-content`}
+        className={cn("settings-mobile-section-content", open ? "block" : "hidden", "md:contents")}
+      >
+        {children}
+      </div>
+    </section>
   );
 }
 
@@ -164,6 +177,8 @@ interface EmailCardRule {
   subject_pattern?: string;
   card_last4?: string;
   lookback_days: number;
+  closing_day?: number;
+  payment_due_day: number;
   auto_pay: boolean;
   active: boolean;
   statement_password_configured: boolean;
@@ -193,17 +208,60 @@ interface GmailQuickSetupResult {
   sync_result: EmailSyncResult;
 }
 
+interface EmailScreenshotAnalysis {
+  detected: boolean;
+  candidate_key?: string;
+  institution?: string;
+  account_name?: string;
+  sender_pattern?: string;
+  card_last4?: string;
+  subject_hint?: string;
+  confidence: "high" | "medium" | "unknown";
+  evidence: string[];
+}
+
+const SUPPORTED_CARD_PROVIDERS = [
+  { key: "cathay", label: "國泰世華銀行信用卡" },
+  { key: "ctbc", label: "中國信託銀行信用卡" },
+  { key: "esun", label: "玉山銀行信用卡" },
+  { key: "taishin", label: "台新銀行信用卡" },
+  { key: "fubon", label: "台北富邦銀行信用卡" },
+  { key: "sinopac", label: "永豐銀行信用卡" },
+] as const;
+
 interface CreditCardBill {
   id: number;
   rule_name: string;
   card_account_name: string;
   payment_account_name: string;
   statement_date?: string;
+  period_start?: string;
+  period_end?: string;
   due_date: string;
   amount_due: number;
   currency: string;
-  status: "pending" | "paid" | "insufficient_funds" | "needs_review";
+  status: "pending" | "paid" | "insufficient_funds" | "needs_review" | "duplicate";
   last_error?: string;
+}
+
+interface CardCycleAmount {
+  amount: number;
+  period_start?: string;
+  period_end?: string;
+  transaction_count: number;
+}
+
+interface CreditCardCycle {
+  rule_id: number;
+  rule_name: string;
+  card_account_name: string;
+  currency: string;
+  closing_day?: number;
+  payment_due_day: number;
+  unbilled: CardCycleAmount;
+  current_bill?: CreditCardBill;
+  last_paid_bill?: CreditCardBill;
+  next_cycle: CardCycleAmount;
 }
 
 function utcDate(value?: string) {
@@ -232,6 +290,7 @@ export function friendlyExchangeMessage(message?: string) {
 export default function SettingsPage() {
   const client = useQueryClient();
   const restoreInput = useRef<HTMLInputElement>(null);
+  const emailScreenshotInput = useRef<HTMLInputElement>(null);
   const [message, setMessage] = useState("");
   const [marketSettingsOpen, setMarketSettingsOpen] = useState(false);
   const [exchangeSettingsOpen, setExchangeSettingsOpen] = useState(false);
@@ -241,6 +300,10 @@ export default function SettingsPage() {
   const [gmailCandidates, setGmailCandidates] = useState<GmailCardCandidate[]>([]);
   const [selectedGmailCandidate, setSelectedGmailCandidate] = useState("");
   const [quickPaymentAccountId, setQuickPaymentAccountId] = useState("");
+  const [emailScreenshotName, setEmailScreenshotName] = useState("");
+  const [emailScreenshotProgress, setEmailScreenshotProgress] = useState(0);
+  const [emailScreenshotBusy, setEmailScreenshotBusy] = useState(false);
+  const [emailScreenshotAnalysis, setEmailScreenshotAnalysis] = useState<EmailScreenshotAnalysis | null>(null);
   const [advancedOpen, setAdvancedOpen] = useState(false);
   const [theme, setTheme] = useState<AppTheme>(() => getStoredTheme());
   const [lastBackupAt, setLastBackupAt] = useState(() => localStorage.getItem("finance:lastBackupAt") || "");
@@ -281,6 +344,10 @@ export default function SettingsPage() {
   const cardBills = useQuery({
     queryKey: ["credit-card-bills"],
     queryFn: () => api<CreditCardBill[]>("/email/card-bills"),
+  });
+  const cardCycles = useQuery({
+    queryKey: ["credit-card-cycles"],
+    queryFn: () => api<CreditCardCycle[]>("/email/card-cycles"),
   });
   const cardAccounts = (accounts.data || []).filter(
     (account) => account.account_type === "credit_card" && account.nature === "liability",
@@ -389,6 +456,7 @@ export default function SettingsPage() {
     onSuccess: (result) => {
       client.invalidateQueries({ queryKey: ["gmail-status"] });
       client.invalidateQueries({ queryKey: ["credit-card-bills"] });
+      client.invalidateQueries({ queryKey: ["credit-card-cycles"] });
       client.invalidateQueries({ queryKey: ["transactions"] });
       client.invalidateQueries({ queryKey: ["accounts"] });
       client.invalidateQueries({ queryKey: ["dashboard"] });
@@ -412,7 +480,7 @@ export default function SettingsPage() {
     onError: (error) => setMessage(`自動偵測失敗：${(error as Error).message}`),
   });
   const quickSetupGmailCard = useMutation({
-    mutationFn: (payload: { candidate_key: string; payment_account_id: number }) =>
+    mutationFn: (payload: { candidate_key: string; payment_account_id: number; card_last4?: string }) =>
       api<GmailQuickSetupResult>("/email/gmail/quick-setup", {
         method: "POST",
         body: JSON.stringify(payload),
@@ -421,12 +489,16 @@ export default function SettingsPage() {
       client.invalidateQueries({ queryKey: ["email-card-rules"] });
       client.invalidateQueries({ queryKey: ["gmail-status"] });
       client.invalidateQueries({ queryKey: ["credit-card-bills"] });
+      client.invalidateQueries({ queryKey: ["credit-card-cycles"] });
       client.invalidateQueries({ queryKey: ["transactions"] });
       client.invalidateQueries({ queryKey: ["accounts"] });
       client.invalidateQueries({ queryKey: ["dashboard"] });
       setEmailSettingsOpen(false);
       setManualEmailSetupOpen(false);
       setEditingEmailRule(null);
+      setEmailScreenshotAnalysis(null);
+      setEmailScreenshotName("");
+      setEmailScreenshotProgress(0);
       const imported = result.sync_result.transactions_imported || 0;
       const syncWarning = result.sync_result.errors?.length
         ? `；規則已建立，但首次同步需要確認：${result.sync_result.errors[0]}`
@@ -446,6 +518,7 @@ export default function SettingsPage() {
     onSuccess: () => {
       client.invalidateQueries({ queryKey: ["email-card-rules"] });
       client.invalidateQueries({ queryKey: ["gmail-status"] });
+      client.invalidateQueries({ queryKey: ["credit-card-cycles"] });
       setEmailSettingsOpen(false);
       setEditingEmailRule(null);
       setMessage("信用卡郵件規則已儲存；可以立即同步測試。");
@@ -457,6 +530,7 @@ export default function SettingsPage() {
     onSuccess: () => {
       client.invalidateQueries({ queryKey: ["email-card-rules"] });
       client.invalidateQueries({ queryKey: ["gmail-status"] });
+      client.invalidateQueries({ queryKey: ["credit-card-cycles"] });
       setMessage("已停用這張信用卡的郵件同步規則。");
     },
   });
@@ -587,6 +661,8 @@ export default function SettingsPage() {
         subject_pattern: String(form.get("subject_pattern") || "").trim() || null,
         card_last4: String(form.get("card_last4") || "").trim() || null,
         lookback_days: Number(form.get("lookback_days") || 30),
+        closing_day: String(form.get("closing_day") || "").trim() ? Number(form.get("closing_day")) : null,
+        payment_due_day: Number(form.get("payment_due_day") || 23),
         auto_pay: form.get("auto_pay") === "on",
         ...(String(form.get("statement_password") || "")
           ? { statement_password: String(form.get("statement_password")) }
@@ -605,6 +681,53 @@ export default function SettingsPage() {
     setEditingEmailRule(null);
     setManualEmailSetupOpen(false);
     setEmailSettingsOpen(true);
+  }
+
+  async function readEmailScreenshot(file: File) {
+    if (!file.type.startsWith("image/")) {
+      setMessage("請選擇 PNG、JPG 或手機截圖圖片。");
+      return;
+    }
+    if (file.size > 15 * 1024 * 1024) {
+      setMessage("圖片超過 15 MB，請先裁切到郵件寄件者與主旨所在區域再上傳。");
+      return;
+    }
+
+    setEmailScreenshotBusy(true);
+    setEmailScreenshotName(file.name);
+    setEmailScreenshotAnalysis(null);
+    setEmailScreenshotProgress(1);
+    setMessage("");
+    let worker: Awaited<ReturnType<(typeof import("tesseract.js"))["createWorker"]>> | null = null;
+    try {
+      const { createWorker, OEM } = await import("tesseract.js");
+      worker = await createWorker(["eng", "chi_tra"], OEM.LSTM_ONLY, {
+        logger: ({ progress }) => setEmailScreenshotProgress(Math.max(1, Math.round(progress * 90))),
+      });
+      const result = await worker.recognize(file, { rotateAuto: true });
+      const extractedText = result.data.text.trim();
+      if (extractedText.length < 5) throw new Error("圖片中的文字太少，請上傳包含寄件者、主旨與銀行名稱的完整郵件截圖。");
+      setEmailScreenshotProgress(94);
+      const analysis = await api<EmailScreenshotAnalysis>("/email/gmail/screenshot/analyze", {
+        method: "POST",
+        body: JSON.stringify({ extracted_text: extractedText }),
+      });
+      setEmailScreenshotAnalysis(analysis);
+      setSelectedGmailCandidate(analysis.candidate_key || "");
+      setEmailScreenshotProgress(100);
+      setMessage(
+        analysis.detected
+          ? `已從截圖辨識為${analysis.account_name}，確認扣款帳戶後即可建立。`
+          : "已讀取截圖，但無法確定銀行；請從清單確認，或換一張有顯示寄件者的截圖。",
+      );
+    } catch (error) {
+      setEmailScreenshotProgress(0);
+      setMessage(`截圖辨識失敗：${(error as Error).message}`);
+    } finally {
+      await worker?.terminate();
+      setEmailScreenshotBusy(false);
+      if (emailScreenshotInput.current) emailScreenshotInput.current.value = "";
+    }
   }
 
   useEffect(() => {
@@ -1076,47 +1199,61 @@ export default function SettingsPage() {
           <div className="mt-5 rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50 to-emerald-50 p-5">
             <div className="flex flex-col justify-between gap-4 md:flex-row md:items-center">
               <div>
-                <p className="font-bold text-slate-800">讓系統幫你找，不用逐欄填寫</p>
+                <p className="font-bold text-slate-800">上傳郵件截圖，快速建立信用卡</p>
                 <p className="mt-1 text-sm leading-6 text-slate-500">
-                  只檢查近六個月郵件的寄件者、主旨與日期；確認後才會讀取相符信用卡郵件。
+                  截圖只在這台裝置辨識文字，不會上傳圖片；辨識完成後確認一次即可建立帳戶與同步規則。
                 </p>
               </div>
+              <input
+                ref={emailScreenshotInput}
+                type="file"
+                accept="image/png,image/jpeg,image/webp,image/heic,image/heif"
+                className="hidden"
+                onChange={(event) => {
+                  const file = event.target.files?.[0];
+                  if (file) void readEmailScreenshot(file);
+                }}
+              />
               <Button
                 type="button"
-                onClick={() => discoverGmailCards.mutate()}
-                disabled={discoverGmailCards.isPending}
+                onClick={() => emailScreenshotInput.current?.click()}
+                disabled={emailScreenshotBusy || quickSetupGmailCard.isPending}
               >
-                <Search size={16} className={discoverGmailCards.isPending ? "animate-pulse" : ""} />
-                {discoverGmailCards.isPending ? "正在安全偵測…" : gmailCandidates.length ? "重新偵測" : "自動偵測 Gmail 信用卡"}
+                <ImageUp size={16} className={emailScreenshotBusy ? "animate-pulse" : ""} />
+                {emailScreenshotBusy ? "正在讀取截圖…" : "選擇郵件截圖"}
               </Button>
             </div>
 
-            {discoverGmailCards.isPending && (
-              <div className="mt-4 grid gap-3 sm:grid-cols-3">
-                {["檢查銀行寄件者", "比對信用卡郵件", "準備自動設定"].map((label) => (
-                  <div key={label} className="animate-pulse rounded-xl bg-white/80 px-4 py-3 text-sm text-slate-500">
-                    {label}…
-                  </div>
-                ))}
+            {emailScreenshotBusy && (
+              <div className="mt-4 rounded-xl bg-white/80 p-4">
+                <div className="flex items-center justify-between gap-3 text-sm text-slate-600">
+                  <span>{emailScreenshotName || "郵件截圖"}</span>
+                  <span className="font-semibold text-blue-700">{emailScreenshotProgress}%</span>
+                </div>
+                <div className="mt-3 h-2 overflow-hidden rounded-full bg-slate-100">
+                  <div className="h-full rounded-full bg-blue-500 transition-all" style={{ width: `${emailScreenshotProgress}%` }} />
+                </div>
+                <p className="mt-2 text-xs text-slate-400">第一次使用需要下載繁體中文字庫，之後會使用瀏覽器快取。</p>
               </div>
             )}
 
-            {!discoverGmailCards.isPending && gmailCandidates.length > 0 && (
+            {!emailScreenshotBusy && emailScreenshotAnalysis && (
               <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1fr_auto] lg:items-end">
                 <label className="block">
-                  <span className="mb-2 block text-sm font-semibold text-slate-700">偵測到的信用卡</span>
+                  <span className="mb-2 block text-sm font-semibold text-slate-700">辨識到哪張信用卡？</span>
                   <Select
                     value={selectedGmailCandidate}
                     onChange={(event) => setSelectedGmailCandidate(event.target.value)}
                   >
-                    {gmailCandidates.map((candidate) => (
-                      <option key={candidate.key} value={candidate.key}>
-                        {candidate.account_name}（找到 {candidate.matched_messages} 封）
-                      </option>
+                    <option value="">請確認銀行</option>
+                    {SUPPORTED_CARD_PROVIDERS.map((provider) => (
+                      <option key={provider.key} value={provider.key}>{provider.label}</option>
                     ))}
                   </Select>
-                  <span className="mt-2 block truncate text-xs text-slate-400">
-                    {gmailCandidates.find((item) => item.key === selectedGmailCandidate)?.sample_subject || "已確認銀行寄件者"}
+                  <span className={cn("mt-2 block truncate text-xs", emailScreenshotAnalysis.detected ? "text-emerald-700" : "text-amber-700")}>
+                    {emailScreenshotAnalysis.detected
+                      ? `${emailScreenshotAnalysis.confidence === "high" ? "高可信度" : "請再確認"}${emailScreenshotAnalysis.card_last4 ? ` · 卡號末四碼 ${emailScreenshotAnalysis.card_last4}` : ""}`
+                      : "圖片未顯示清楚的銀行名稱，請手動確認"}
                   </span>
                 </label>
                 <label className="block">
@@ -1138,6 +1275,70 @@ export default function SettingsPage() {
                   onClick={() => quickSetupGmailCard.mutate({
                     candidate_key: selectedGmailCandidate,
                     payment_account_id: Number(quickPaymentAccountId),
+                    ...(emailScreenshotAnalysis.card_last4 ? { card_last4: emailScreenshotAnalysis.card_last4 } : {}),
+                  })}
+                >
+                  <Check size={16} /> {quickSetupGmailCard.isPending ? "建立並同步中…" : "確認並建立"}
+                </Button>
+              </div>
+            )}
+
+            <div className="my-5 flex items-center gap-3 text-xs text-slate-400">
+              <span className="h-px flex-1 bg-white" />或<span className="h-px flex-1 bg-white" />
+            </div>
+
+            <div className="flex flex-col justify-between gap-3 sm:flex-row sm:items-center">
+              <div>
+                <p className="text-sm font-semibold text-slate-700">直接從已連接的 Gmail 尋找</p>
+                <p className="mt-1 text-xs text-slate-400">只檢查近六個月郵件的寄件者、主旨與日期。</p>
+              </div>
+              <Button
+                type="button"
+                variant="secondary"
+                onClick={() => discoverGmailCards.mutate()}
+                disabled={discoverGmailCards.isPending}
+              >
+                <Search size={16} className={discoverGmailCards.isPending ? "animate-pulse" : ""} />
+                {discoverGmailCards.isPending ? "正在安全偵測…" : gmailCandidates.length ? "重新偵測 Gmail" : "自動偵測 Gmail"}
+              </Button>
+            </div>
+
+            {discoverGmailCards.isPending && (
+              <div className="mt-4 grid gap-3 sm:grid-cols-3">
+                {["檢查銀行寄件者", "比對信用卡郵件", "準備自動設定"].map((label) => (
+                  <div key={label} className="animate-pulse rounded-xl bg-white/80 px-4 py-3 text-sm text-slate-500">{label}…</div>
+                ))}
+              </div>
+            )}
+
+            {!discoverGmailCards.isPending && gmailCandidates.length > 0 && !emailScreenshotAnalysis && (
+              <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1fr_auto] lg:items-end">
+                <label className="block">
+                  <span className="mb-2 block text-sm font-semibold text-slate-700">偵測到的信用卡</span>
+                  <Select value={selectedGmailCandidate} onChange={(event) => setSelectedGmailCandidate(event.target.value)}>
+                    {gmailCandidates.map((candidate) => (
+                      <option key={candidate.key} value={candidate.key}>{candidate.account_name}（找到 {candidate.matched_messages} 封）</option>
+                    ))}
+                  </Select>
+                  <span className="mt-2 block truncate text-xs text-slate-400">
+                    {gmailCandidates.find((item) => item.key === selectedGmailCandidate)?.sample_subject || "已確認銀行寄件者"}
+                  </span>
+                </label>
+                <label className="block">
+                  <span className="mb-2 block text-sm font-semibold text-slate-700">帳單從哪個帳戶扣款？</span>
+                  <Select value={quickPaymentAccountId} onChange={(event) => setQuickPaymentAccountId(event.target.value)}>
+                    <option value="">選擇扣款帳戶</option>
+                    {paymentAccounts.map((account) => (
+                      <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
+                    ))}
+                  </Select>
+                </label>
+                <Button
+                  type="button"
+                  disabled={quickSetupGmailCard.isPending || !selectedGmailCandidate || !quickPaymentAccountId}
+                  onClick={() => quickSetupGmailCard.mutate({
+                    candidate_key: selectedGmailCandidate,
+                    payment_account_id: Number(quickPaymentAccountId),
                   })}
                 >
                   <Check size={16} /> {quickSetupGmailCard.isPending ? "建立並同步中…" : "確認並開始同步"}
@@ -1147,7 +1348,7 @@ export default function SettingsPage() {
 
             {!discoverGmailCards.isPending && discoverGmailCards.isSuccess && !gmailCandidates.length && (
               <p className="mt-4 rounded-xl bg-white/80 px-4 py-3 text-sm text-amber-700">
-                沒有找到支援的銀行寄件者。你仍可使用下方進階設定自行輸入寄件者。
+                沒有找到支援的銀行寄件者。可以改用郵件截圖，或使用進階手動設定。
               </p>
             )}
 
@@ -1211,6 +1412,25 @@ export default function SettingsPage() {
                       <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
                     ))}
                   </Select>
+                  <div className="grid grid-cols-2 gap-3">
+                    <Input
+                      name="closing_day"
+                      type="number"
+                      min={1}
+                      max={31}
+                      defaultValue={editingEmailRule?.closing_day || ""}
+                      placeholder="結帳日（可留空）"
+                    />
+                    <Input
+                      name="payment_due_day"
+                      type="number"
+                      min={1}
+                      max={31}
+                      defaultValue={editingEmailRule?.payment_due_day || 23}
+                      placeholder="繳款日"
+                    />
+                  </div>
+                  <p className="text-xs leading-5 text-slate-400">繳款日預設每月 23 日；結帳日會在讀到電子帳單後自動校正。</p>
                   <Input name="statement_password" type="password" autoComplete="off" placeholder="電子帳單 PDF 密碼（選填）" />
                   <label className="flex items-start gap-3 rounded-xl bg-slate-50 p-3 text-sm text-slate-600">
                     <input name="auto_pay" type="checkbox" defaultChecked={editingEmailRule?.auto_pay ?? true} className="mt-1" />
@@ -1246,7 +1466,8 @@ export default function SettingsPage() {
                 <div className="mt-3 space-y-1 text-xs text-slate-500">
                   <p>寄件者：{rule.sender_pattern || "不限"}</p>
                   <p>主旨：{rule.subject_pattern || "不限"}</p>
-                  <p>繳款日：依每期電子帳單</p>
+                  <p>帳期：{rule.closing_day ? `每月 ${rule.closing_day} 日結帳` : "等待第一份帳單自動確認"}</p>
+                  <p>繳款日：每月 {rule.payment_due_day || 23} 日（以帳單日期優先）</p>
                   <p>PDF 密碼：{rule.statement_password_configured ? "已安全儲存" : "未設定"}</p>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2">
@@ -1269,6 +1490,50 @@ export default function SettingsPage() {
           </div>
         )}
 
+        {cardCycles.data?.length ? (
+          <div className="mt-5 space-y-3">
+            <div>
+              <p className="text-sm font-semibold text-slate-800">信用卡帳期</p>
+              <p className="mt-1 text-xs text-slate-400">消費依結帳日分期，帳單只會在同一個繳款日記錄一次。</p>
+            </div>
+            {cardCycles.data.map((cycle) => {
+              const money = (amount: number) => `${cycle.currency} ${amount.toLocaleString("zh-TW")}`;
+              return (
+                <div key={cycle.rule_id} className="rounded-2xl border border-slate-100 p-4">
+                  <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
+                    <p className="font-semibold text-slate-800">{cycle.rule_name}</p>
+                    <p className="text-xs text-slate-400">
+                      {cycle.closing_day ? `每月 ${cycle.closing_day} 日結帳` : "結帳日待帳單確認"} · 每月 {cycle.payment_due_day || 23} 日繳款
+                    </p>
+                  </div>
+                  <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                    <div className="rounded-xl bg-slate-50 p-3">
+                      <p className="text-xs text-slate-400">未出帳消費</p>
+                      <p className="mt-1 font-semibold text-slate-800">{money(cycle.unbilled.amount)}</p>
+                      <p className="mt-1 text-xs text-slate-400">{cycle.unbilled.transaction_count} 筆</p>
+                    </div>
+                    <div className="rounded-xl bg-blue-50 p-3">
+                      <p className="text-xs text-blue-500">本期帳單</p>
+                      <p className="mt-1 font-semibold text-blue-900">{cycle.current_bill ? money(cycle.current_bill.amount_due) : "尚未出帳"}</p>
+                      <p className="mt-1 text-xs text-blue-500">{cycle.current_bill ? `繳款日 ${cycle.current_bill.due_date}` : "等待電子帳單"}</p>
+                    </div>
+                    <div className="rounded-xl bg-emerald-50 p-3">
+                      <p className="text-xs text-emerald-600">已繳款</p>
+                      <p className="mt-1 font-semibold text-emerald-900">{cycle.last_paid_bill ? money(cycle.last_paid_bill.amount_due) : "尚無紀錄"}</p>
+                      <p className="mt-1 text-xs text-emerald-600">{cycle.last_paid_bill ? cycle.last_paid_bill.due_date : "—"}</p>
+                    </div>
+                    <div className="rounded-xl bg-violet-50 p-3">
+                      <p className="text-xs text-violet-500">下期消費</p>
+                      <p className="mt-1 font-semibold text-violet-900">{money(cycle.next_cycle.amount)}</p>
+                      <p className="mt-1 text-xs text-violet-500">{cycle.next_cycle.transaction_count} 筆</p>
+                    </div>
+                  </div>
+                </div>
+              );
+            })}
+          </div>
+        ) : null}
+
         {cardBills.data?.length ? (
           <div className="mt-5 overflow-hidden rounded-2xl border border-slate-100">
             <div className="border-b border-slate-100 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-700">最近信用卡帳單</div>
@@ -1277,17 +1542,21 @@ export default function SettingsPage() {
                 <div key={bill.id} className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
                     <p className="text-sm font-semibold text-slate-800">{bill.rule_name} · {bill.currency} {bill.amount_due.toLocaleString()}</p>
-                    <p className="mt-1 text-xs text-slate-400">繳款日 {bill.due_date} · {bill.payment_account_name}</p>
+                    <p className="mt-1 text-xs text-slate-400">
+                      {bill.period_start && bill.period_end ? `帳期 ${bill.period_start}～${bill.period_end} · ` : ""}繳款日 {bill.due_date} · {bill.payment_account_name}
+                    </p>
                     {bill.last_error && <p className="mt-1 text-xs text-amber-700">{bill.last_error}</p>}
                   </div>
-                  <Badge tone={bill.status === "paid" ? "green" : bill.status === "pending" ? "blue" : "amber"}>
+                  <Badge tone={bill.status === "paid" ? "green" : bill.status === "pending" ? "blue" : bill.status === "duplicate" ? "slate" : "amber"}>
                     {bill.status === "paid"
                       ? "已記錄扣款"
                       : bill.status === "pending"
                         ? "等待繳款日"
                         : bill.status === "insufficient_funds"
                           ? "餘額不足"
-                          : "需要確認"}
+                          : bill.status === "duplicate"
+                            ? "已合併"
+                            : "需要確認"}
                   </Badge>
                 </div>
               ))}

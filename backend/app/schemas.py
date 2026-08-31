@@ -221,6 +221,8 @@ class EmailCardRuleCreate(BaseModel):
     subject_pattern: str | None = Field(default=None, max_length=200)
     card_last4: str | None = Field(default=None, pattern=r"^\d{4}$")
     lookback_days: int = Field(default=30, ge=1, le=365)
+    closing_day: int | None = Field(default=None, ge=1, le=31)
+    payment_due_day: int = Field(default=23, ge=1, le=31)
     auto_pay: bool = True
     active: bool = True
     statement_password: str | None = Field(default=None, max_length=200)
@@ -235,6 +237,8 @@ class EmailCardRuleUpdate(BaseModel):
     subject_pattern: str | None = Field(default=None, max_length=200)
     card_last4: str | None = Field(default=None, pattern=r"^\d{4}$")
     lookback_days: int | None = Field(default=None, ge=1, le=365)
+    closing_day: int | None = Field(default=None, ge=1, le=31)
+    payment_due_day: int | None = Field(default=None, ge=1, le=31)
     auto_pay: bool | None = None
     active: bool | None = None
     statement_password: str | None = Field(default=None, max_length=200)
@@ -244,7 +248,13 @@ class GmailCardQuickSetup(BaseModel):
     candidate_key: str = Field(min_length=1, max_length=50)
     payment_account_id: int
     card_last4: str | None = Field(default=None, pattern=r"^\d{4}$")
+    closing_day: int | None = Field(default=None, ge=1, le=31)
+    payment_due_day: int = Field(default=23, ge=1, le=31)
     auto_pay: bool = True
+
+
+class EmailScreenshotAnalysisRequest(BaseModel):
+    extracted_text: str = Field(min_length=5, max_length=50_000)
 
 
 class BackupPayload(BaseModel):

@@ -18,12 +18,15 @@ from app.database import (
 )
 from app.email_sync import (
     _create_card_transaction,
+    _create_or_update_bill,
     _refresh_current_gmail_card_balance,
     _gmail_rule_search_query,
     _plain_html,
     discover_gmail_card_candidates,
     parse_card_email,
     process_due_card_bills,
+    repair_duplicate_card_bills,
+    serialize_card_cycle,
 )
 from app import email_sync as email_sync_module
 from app.services import (
@@ -78,6 +81,21 @@ def test_parse_purchase_notification_and_statement() -> None:
         "due_date": date(2026, 9, 9),
         "statement_date": date(2026, 8, 23),
     }
+
+
+def test_statement_without_due_date_uses_configured_payment_day() -> None:
+    parsed = parse_card_email(
+        """
+        國泰世華信用卡電子帳單
+        結帳日：2026/08/02
+        本期應繳金額：NT$ 13,797
+        """,
+        date(2026, 8, 3),
+        default_due_day=23,
+    )
+
+    assert parsed["bill"]["statement_date"] == date(2026, 8, 2)
+    assert parsed["bill"]["due_date"] == date(2026, 8, 23)
 
 
 def test_parse_cathay_consumption_digest_table() -> None:
@@ -184,7 +202,7 @@ def test_gmail_card_balance_uses_current_month_without_old_statements() -> None:
     assert rebuilt == Decimal("6458")
     latest = get_latest_balance(db, card.id)
     assert decimal_amount(latest) == Decimal("6458")
-    assert latest.source == "gmail_current_month"
+    assert latest.source == "gmail_billing_cycle"
     db.close()
 
 
@@ -754,11 +772,201 @@ def test_due_bill_does_not_create_the_same_payment_twice() -> None:
 
     assert first["paid"] == 1
     assert second["paid"] == 0
-    assert second["needs_review"] == 1
+    assert second["needs_review"] == 0
+    assert db.get(CreditCardBill, bill.id).status == "paid"
     rows = db.scalars(
         select(Transaction).where(Transaction.source == "gmail_autopay")
     ).all()
     assert len(rows) == 2
+    db.close()
+
+
+def test_card_cycle_separates_current_bill_next_cycle_and_paid_history() -> None:
+    db = make_session()
+    payment = Account(
+        name="生活費帳戶", account_type="bank", nature="asset", currency="TWD", owner="me"
+    )
+    card = Account(
+        name="國泰信用卡",
+        account_type="credit_card",
+        nature="liability",
+        currency="TWD",
+        owner="me",
+    )
+    db.add_all([payment, card])
+    db.flush()
+    rule = EmailCardRule(
+        name="國泰信用卡",
+        owner="me",
+        card_account_id=card.id,
+        payment_account_id=payment.id,
+        sender_pattern="cathaybk.com.tw",
+        closing_day=2,
+        payment_due_day=23,
+        auto_pay=True,
+        active=True,
+    )
+    db.add(rule)
+    db.flush()
+    paid_bill = CreditCardBill(
+        rule_id=rule.id,
+        card_account_id=card.id,
+        payment_account_id=payment.id,
+        statement_date=date(2026, 7, 2),
+        due_date=date(2026, 7, 23),
+        amount_due=Decimal("800"),
+        currency="TWD",
+        status="paid",
+    )
+    current_bill = CreditCardBill(
+        rule_id=rule.id,
+        card_account_id=card.id,
+        payment_account_id=payment.id,
+        statement_date=date(2026, 8, 2),
+        due_date=date(2026, 8, 23),
+        amount_due=Decimal("1000"),
+        currency="TWD",
+        status="pending",
+    )
+    db.add_all([paid_bill, current_bill])
+    db.add_all(
+        [
+            Transaction(
+                account_id=card.id,
+                transaction_date=date(2026, 7, 15),
+                description="已出帳消費",
+                amount=Decimal("-300"),
+                currency="TWD",
+                fx_rate=Decimal("1"),
+                base_amount=Decimal("-300"),
+                transaction_kind="expense",
+                fingerprint="cycle-old",
+                source="gmail",
+            ),
+            Transaction(
+                account_id=card.id,
+                transaction_date=date(2026, 8, 10),
+                description="下期消費",
+                amount=Decimal("-200"),
+                currency="TWD",
+                fx_rate=Decimal("1"),
+                base_amount=Decimal("-200"),
+                transaction_kind="expense",
+                fingerprint="cycle-next",
+                source="gmail",
+            ),
+        ]
+    )
+    db.commit()
+
+    balance = _refresh_current_gmail_card_balance(db, rule, date(2026, 8, 20))
+    cycle = serialize_card_cycle(db, rule, date(2026, 8, 20))
+
+    assert balance == Decimal("1200")
+    assert cycle["current_bill"]["amount_due"] == 1000.0
+    assert cycle["last_paid_bill"]["amount_due"] == 800.0
+    assert cycle["unbilled"]["amount"] == 0.0
+    assert cycle["next_cycle"]["amount"] == 200.0
+    assert cycle["current_bill"]["period_start"] == date(2026, 7, 3)
+    assert cycle["current_bill"]["period_end"] == date(2026, 8, 2)
+    db.close()
+
+
+def test_same_due_date_updates_unpaid_bill_instead_of_creating_duplicate() -> None:
+    db = make_session()
+    payment = Account(name="生活費", account_type="bank", nature="asset", currency="TWD")
+    card = Account(
+        name="信用卡", account_type="credit_card", nature="liability", currency="TWD"
+    )
+    db.add_all([payment, card])
+    db.flush()
+    rule = EmailCardRule(
+        name="信用卡",
+        owner="me",
+        card_account_id=card.id,
+        payment_account_id=payment.id,
+        sender_pattern="bank.example",
+        payment_due_day=23,
+    )
+    db.add(rule)
+    db.flush()
+
+    first = _create_or_update_bill(
+        db,
+        rule,
+        {
+            "statement_date": date(2026, 8, 2),
+            "due_date": date(2026, 8, 23),
+            "amount_due": Decimal("1000"),
+        },
+        "message-1",
+    )
+    second = _create_or_update_bill(
+        db,
+        rule,
+        {
+            "statement_date": date(2026, 8, 2),
+            "due_date": date(2026, 8, 23),
+            "amount_due": Decimal("1200"),
+        },
+        "message-2",
+    )
+    db.commit()
+
+    bills = db.scalars(select(CreditCardBill)).all()
+    assert first is True
+    assert second is False
+    assert len(bills) == 1
+    assert Decimal(str(bills[0].amount_due)) == Decimal("1200")
+    db.close()
+
+
+def test_existing_duplicate_bills_are_merged_before_processing() -> None:
+    db = make_session()
+    payment = Account(name="生活費", account_type="bank", nature="asset", currency="TWD")
+    card = Account(
+        name="信用卡", account_type="credit_card", nature="liability", currency="TWD"
+    )
+    db.add_all([payment, card])
+    db.flush()
+    rule = EmailCardRule(
+        name="信用卡",
+        owner="me",
+        card_account_id=card.id,
+        payment_account_id=payment.id,
+        sender_pattern="bank.example",
+    )
+    db.add(rule)
+    db.flush()
+    db.add_all(
+        [
+            CreditCardBill(
+                rule_id=rule.id,
+                card_account_id=card.id,
+                payment_account_id=payment.id,
+                due_date=date(2026, 8, 23),
+                amount_due=Decimal("1000"),
+                currency="TWD",
+                status="paid",
+            ),
+            CreditCardBill(
+                rule_id=rule.id,
+                card_account_id=card.id,
+                payment_account_id=payment.id,
+                due_date=date(2026, 8, 23),
+                amount_due=Decimal("1200"),
+                currency="TWD",
+                status="pending",
+            ),
+        ]
+    )
+    db.commit()
+
+    result = repair_duplicate_card_bills(db)
+    rows = db.scalars(select(CreditCardBill).order_by(CreditCardBill.id)).all()
+
+    assert result == {"merged": 1}
+    assert [item.status for item in rows] == ["paid", "duplicate"]
     db.close()
 
 

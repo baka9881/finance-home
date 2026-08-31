@@ -39,7 +39,7 @@ import { Badge, Button, Card, Dialog, EmptyState, Field, FormStep, Input, MonthI
 const recurringPresets = ["房貸", "車貸", "信貸", "學貸", "房租", "保險", "健身房月費", "手機費", "網路費", "訂閱服務"];
 const recurringOwnerOptions = [
   { value: "me", label: "我" },
-  { value: "partner", label: "女友" },
+  { value: "partner", label: "小居" },
   { value: "shared", label: "共同" },
 ];
 
@@ -530,7 +530,7 @@ export default function AnalysisPage() {
               />
             )}
             <p className="mt-4 text-xs leading-5 text-slate-400">
-              自訂項目只用於每月預估與提醒，不會直接扣除帳戶餘額；實際交易匯入後會標記為「當月已發生」。已知訂閱近三個月出現兩次即可辨識；月費與貸款需連續出現兩個月，其他帳單需連續三個月，且扣款日與金額穩定。購物、餐飲、超商與車票不會自動列為固定花費。移除自動辨識項目只會隱藏固定花費，不會刪除原始交易。
+              自訂項目只用於每月預估與提醒，不會直接扣除帳戶餘額；實際交易匯入後會標記為「當月已發生」。已知訂閱近三個月出現兩次即可辨識；月費與貸款需連續出現兩個月，其他帳單需連續三個月，且扣款日與金額穩定。自動辨識項目漏抓一期時仍會保留，避免換月就消失。購物、餐飲、超商與車票不會自動列為固定花費。移除自動辨識項目只會隱藏固定花費，不會刪除原始交易。
             </p>
           </Card>
 
