@@ -100,7 +100,7 @@ function MobileSettingsSection({
     <section id={`settings-${id}`} className={cn("settings-mobile-section", open && "is-open")}>
       <button
         type="button"
-        className="settings-mobile-section-summary md:hidden"
+        className="settings-mobile-section-summary"
         aria-expanded={open}
         aria-controls={`settings-${id}-content`}
         onClick={() => setOpen((value) => !value)}
@@ -115,7 +115,7 @@ function MobileSettingsSection({
       </button>
       <div
         id={`settings-${id}-content`}
-        className={cn("settings-mobile-section-content", open ? "block" : "hidden", "md:contents")}
+        className={cn("settings-mobile-section-content", open ? "block" : "hidden")}
       >
         {children}
       </div>
@@ -158,9 +158,14 @@ interface GmailStatus {
 interface EmailSyncResult {
   messages_scanned: number;
   matched: number;
+  transactions_recognized?: number;
   transactions_imported: number;
   bills_found: number;
   payments_created: number;
+  already_processed?: number;
+  no_finance_data?: number;
+  retries_attempted?: number;
+  retries_recovered?: number;
   ignored: number;
   errors: string[];
 }
@@ -219,6 +224,8 @@ interface EmailScreenshotAnalysis {
   confidence: "high" | "medium" | "unknown";
   evidence: string[];
 }
+
+const SHOW_ENGINEERING_SETTINGS = false;
 
 const SUPPORTED_CARD_PROVIDERS = [
   { key: "cathay", label: "國泰世華銀行信用卡" },
@@ -281,10 +288,21 @@ export function friendlyExchangeMessage(message?: string) {
       : "稍後";
     return `幣安請求過於頻繁，已暫停同步至 ${retryLabel}；系統會自動重試。`;
   }
-  if (/signature.*not valid/i.test(message)) return "API Secret 驗證失敗，請重新貼上建立 API 時顯示的完整 Secret Key。";
-  if (/restricted location|eligibility/i.test(message)) return "目前的伺服器所在地無法連線幣安，系統會保留上次成功資料。";
-  if (/invalid api-key|api-key format|permissions/i.test(message)) return "API Key 無效或缺少讀取權限，請檢查幣安 API 設定。";
-  return message;
+  if (/signature.*not valid/i.test(message)) return "連線驗證失敗，請重新複製幣安顯示的完整安全密鑰。";
+  if (/restricted location|eligibility/i.test(message)) return "目前無法連線幣安，系統會保留上次成功更新的資料。";
+  if (/invalid api-key|api-key format|permissions/i.test(message)) return "連線金鑰無效或缺少讀取權限，請回到幣安檢查設定。";
+  return "同步遇到問題，系統會稍後重試。";
+}
+
+function friendlySettingsMessage(message?: string, fallback = "目前無法完成操作，請稍後再試。") {
+  if (!message) return fallback;
+  if (/401|403|unauthor|forbidden|登入|login|session|token/i.test(message)) {
+    return "登入狀態已失效，請重新登入後再試。";
+  }
+  if (/network|failed to fetch|timeout|timed out|連線/i.test(message)) {
+    return "目前連線不穩定，請確認網路後再試。";
+  }
+  return fallback;
 }
 
 export default function SettingsPage() {
@@ -309,14 +327,21 @@ export default function SettingsPage() {
   const [lastBackupAt, setLastBackupAt] = useState(() => localStorage.getItem("finance:lastBackupAt") || "");
   const [ruleSearch, setRuleSearch] = useState("");
   const [ruleKindFilter, setRuleKindFilter] = useState("all");
-  const [ruleSourceFilter, setRuleSourceFilter] = useState("all");
   const [editingRuleId, setEditingRuleId] = useState<number | null>(null);
   const [ruleKeyword, setRuleKeyword] = useState("");
   const [ruleCategoryId, setRuleCategoryId] = useState("");
   const [ruleTransactionKind, setRuleTransactionKind] = useState("expense");
 
-  const settings = useQuery({ queryKey: ["settings"], queryFn: () => api<SettingsData>("/settings") });
-  const fx = useQuery({ queryKey: ["fx"], queryFn: () => api<FxRate[]>("/fx") });
+  const settings = useQuery({
+    queryKey: ["settings"],
+    queryFn: () => api<SettingsData>("/settings"),
+    enabled: SHOW_ENGINEERING_SETTINGS,
+  });
+  const fx = useQuery({
+    queryKey: ["fx"],
+    queryFn: () => api<FxRate[]>("/fx"),
+    enabled: SHOW_ENGINEERING_SETTINGS,
+  });
   const rules = useQuery({ queryKey: ["rules"], queryFn: () => api<Rule[]>("/rules") });
   const categories = useQuery({ queryKey: ["categories"], queryFn: () => api<Category[]>("/categories") });
   const binanceConnections = useQuery({
@@ -364,13 +389,12 @@ export default function SettingsPage() {
     .sort((left, right) => left.getTime() - right.getTime())[0];
   const filteredRules = (rules.data || []).filter((rule) => {
     const query = ruleSearch.trim().toLocaleLowerCase("zh-TW");
-    return (!query || rule.keyword.toLocaleLowerCase("zh-TW").includes(query) || rule.category_name.toLocaleLowerCase("zh-TW").includes(query))
-      && (ruleKindFilter === "all" || rule.transaction_kind === ruleKindFilter)
-      && (ruleSourceFilter === "all" || (ruleSourceFilter === "default" ? rule.is_default : !rule.is_default));
+    return !rule.is_default
+      && (!query || rule.keyword.toLocaleLowerCase("zh-TW").includes(query) || rule.category_name.toLocaleLowerCase("zh-TW").includes(query))
+      && (ruleKindFilter === "all" || rule.transaction_kind === ruleKindFilter);
   });
   const ruleGroups = [
-    { key: "custom", label: "我的規則", items: filteredRules.filter((rule) => !rule.is_default) },
-    { key: "default", label: "系統預設", items: filteredRules.filter((rule) => rule.is_default) },
+    { key: "custom", label: "我的自動分類", items: filteredRules },
   ].filter((group) => group.items.length > 0);
 
   const saveSettings = useMutation({
@@ -381,7 +405,7 @@ export default function SettingsPage() {
       }),
     onSuccess: () => {
       client.invalidateQueries({ queryKey: ["settings"] });
-      setMessage("API 設定已儲存。");
+      setMessage("行情備援設定已儲存。");
     },
   });
   const refreshFx = useMutation({
@@ -442,7 +466,7 @@ export default function SettingsPage() {
   const authorizeGmail = useMutation({
     mutationFn: () => api<{ authorization_url: string }>("/email/gmail/authorize", { method: "POST" }),
     onSuccess: ({ authorization_url }) => window.location.assign(authorization_url),
-    onError: (error) => setMessage((error as Error).message),
+    onError: (error) => setMessage(friendlySettingsMessage((error as Error).message, "目前無法連接 Gmail，請稍後再試。")),
   });
   const disconnectGmail = useMutation({
     mutationFn: () => api("/email/gmail", { method: "DELETE" }),
@@ -461,10 +485,10 @@ export default function SettingsPage() {
       client.invalidateQueries({ queryKey: ["accounts"] });
       client.invalidateQueries({ queryKey: ["dashboard"] });
       setMessage(
-        `郵件同步完成：新增 ${result.transactions_imported} 筆消費、找到 ${result.bills_found} 份帳單、建立 ${result.payments_created} 筆到期扣款紀錄。`,
+        `郵件同步完成：掃描 ${result.messages_scanned} 封、辨識 ${result.transactions_recognized ?? 0} 筆、新增 ${result.transactions_imported} 筆消費${result.errors.length ? `；${result.errors.length} 封處理失敗` : ""}。`,
       );
     },
-    onError: (error) => setMessage(`郵件同步失敗：${(error as Error).message}`),
+    onError: (error) => setMessage(friendlySettingsMessage((error as Error).message, "郵件同步暫時未完成，系統會在下一次自動更新時重試。")),
   });
   const discoverGmailCards = useMutation({
     mutationFn: () => api<GmailCardDiscovery>("/email/gmail/discover", { method: "POST" }),
@@ -474,10 +498,10 @@ export default function SettingsPage() {
       if (result.candidates.length) {
         setMessage(`已從郵件標頭找到 ${result.candidates.length} 家信用卡；請確認扣款帳戶。`);
       } else {
-        setMessage("近六個月沒有找到支援的信用卡寄件者，可以改用進階手動設定。");
+        setMessage("近六個月沒有找到支援的信用卡郵件，可以改用郵件截圖快速建立。");
       }
     },
-    onError: (error) => setMessage(`自動偵測失敗：${(error as Error).message}`),
+    onError: (error) => setMessage(friendlySettingsMessage((error as Error).message, "目前無法自動尋找信用卡郵件，請稍後再試或上傳郵件截圖。")),
   });
   const quickSetupGmailCard = useMutation({
     mutationFn: (payload: { candidate_key: string; payment_account_id: number; card_last4?: string }) =>
@@ -501,13 +525,13 @@ export default function SettingsPage() {
       setEmailScreenshotProgress(0);
       const imported = result.sync_result.transactions_imported || 0;
       const syncWarning = result.sync_result.errors?.length
-        ? `；規則已建立，但首次同步需要確認：${result.sync_result.errors[0]}`
+        ? "；設定已完成，首次同步尚未成功，系統稍後會自動重試"
         : `，首次同步新增 ${imported} 筆消費`;
       setMessage(
         `${result.rule.name}已完成自動設定${result.account_created ? "，並建立信用卡帳戶" : ""}${syncWarning}。`,
       );
     },
-    onError: (error) => setMessage(`自動設定失敗：${(error as Error).message}`),
+    onError: (error) => setMessage(friendlySettingsMessage((error as Error).message, "目前無法完成信用卡自動記帳設定，請稍後再試。")),
   });
   const saveEmailRule = useMutation({
     mutationFn: ({ ruleId, payload }: { ruleId?: number; payload: Record<string, unknown> }) =>
@@ -521,9 +545,9 @@ export default function SettingsPage() {
       client.invalidateQueries({ queryKey: ["credit-card-cycles"] });
       setEmailSettingsOpen(false);
       setEditingEmailRule(null);
-      setMessage("信用卡郵件規則已儲存；可以立即同步測試。");
+      setMessage("信用卡自動記帳設定已儲存；可以立即同步測試。");
     },
-    onError: (error) => setMessage((error as Error).message),
+    onError: (error) => setMessage(friendlySettingsMessage((error as Error).message, "目前無法儲存信用卡設定，請檢查必填欄位後再試。")),
   });
   const deactivateEmailRule = useMutation({
     mutationFn: (id: number) => api(`/email/card-rules/${id}`, { method: "DELETE" }),
@@ -531,7 +555,7 @@ export default function SettingsPage() {
       client.invalidateQueries({ queryKey: ["email-card-rules"] });
       client.invalidateQueries({ queryKey: ["gmail-status"] });
       client.invalidateQueries({ queryKey: ["credit-card-cycles"] });
-      setMessage("已停用這張信用卡的郵件同步規則。");
+      setMessage("已停止這張信用卡的郵件自動記帳。");
     },
   });
   const manualFx = useMutation({
@@ -756,9 +780,9 @@ export default function SettingsPage() {
     <>
       <div className="settings-page-header">
         <PageHeader
-          eyebrow="Settings"
+          eyebrow="偏好與自動化"
           title="設定"
-          description="先看常用功能，需要時再展開詳細設定。"
+          description="選擇想調整的功能，其他內容會保持收起。"
         />
       </div>
 
@@ -821,7 +845,7 @@ export default function SettingsPage() {
           id="backup"
           icon={<Database size={18} />}
           title="資料備份"
-          description="匯出或還原全部財務資料"
+          description="保存或還原你的財務資料"
           status={lastBackupAt ? "已備份" : "尚未備份"}
         >
         <Card className="settings-detail-card p-6">
@@ -834,7 +858,7 @@ export default function SettingsPage() {
                   <Badge tone="green">最重要</Badge>
                 </div>
                 <p className="mt-2 max-w-2xl text-sm leading-6 text-slate-500">
-                  匯出帳戶、交易、持倉、預算與目標。還原會以備份內容取代目前資料。
+                  匯出帳戶、交易、投資與分類。還原時會先請你再次確認。
                 </p>
                 <p className="mt-3 text-xs text-slate-400">
                   上次匯出：{lastBackupAt || "尚未在這台瀏覽器匯出"}
@@ -867,9 +891,13 @@ export default function SettingsPage() {
           <div className="mt-5 grid gap-3 text-xs text-slate-500 sm:grid-cols-3">
             <div className="rounded-xl bg-slate-50 p-3">包含帳戶與餘額</div>
             <div className="rounded-xl bg-slate-50 p-3">包含交易與分類</div>
-            <div className="rounded-xl bg-slate-50 p-3">不包含美股 API Key</div>
+            <div className="rounded-xl bg-slate-50 p-3">連線密碼不會匯出</div>
           </div>
-          {restore.isError && <p className="mt-4 text-sm text-red-600">{(restore.error as Error).message}</p>}
+          {restore.isError && (
+            <p className="mt-4 text-sm text-red-600">
+              {friendlySettingsMessage((restore.error as Error).message, "無法還原這份備份，請確認檔案是否由財務居匯出。")}
+            </p>
+          )}
         </Card>
         </MobileSettingsSection>
 
@@ -877,7 +905,7 @@ export default function SettingsPage() {
           id="market"
           icon={<RefreshCw size={18} />}
           title="行情與匯率"
-          description="查看行情來源與更新外幣匯率"
+          description="更新投資價格與外幣換算"
           status={latestFxDate || "尚未更新"}
         >
         <Card className="settings-detail-card p-6">
@@ -886,7 +914,7 @@ export default function SettingsPage() {
             <div className="flex-1">
               <h2 className="font-bold text-ink">行情與匯率</h2>
               <p className="mt-2 text-sm leading-6 text-slate-500">
-                美股行情會自動從公開來源更新；匯率用來把外幣資產換算成新台幣。
+                系統會自動更新投資價格與匯率，讓外幣資產正確換算成新台幣。
               </p>
             </div>
           </div>
@@ -894,7 +922,7 @@ export default function SettingsPage() {
             <div className="rounded-2xl border border-slate-100 p-4">
               <p className="text-xs text-slate-400">美股行情</p>
               <div className="mt-2"><Badge tone="green">自動更新</Badge></div>
-              <p className="mt-2 text-xs leading-5 text-slate-400">Nasdaq 優先，失敗時自動改用備援來源。</p>
+              <p className="mt-2 text-xs leading-5 text-slate-400">主要來源暫時無法使用時會自動切換。</p>
             </div>
             <div className="rounded-2xl border border-slate-100 p-4">
               <p className="text-xs text-slate-400">匯率資料</p>
@@ -916,7 +944,7 @@ export default function SettingsPage() {
         id="exchange"
         icon={<Bitcoin size={18} />}
         title="交易所同步"
-        description="管理幣安連線與背景更新"
+        description="連接投資帳戶並自動更新持倉"
         status={binanceConnections.data?.some((item) => item.connected) ? "已連接" : "未連接"}
       >
       <Card className="settings-detail-card mt-6 p-6">
@@ -927,19 +955,19 @@ export default function SettingsPage() {
               <div className="flex flex-wrap items-center gap-2">
                 <h2 className="font-bold text-ink">交易所自動同步</h2>
                 <Badge tone={binanceConnections.data?.some((item) => item.connected) ? "green" : "amber"}>
-                  {binanceConnections.data?.some((item) => item.connected) ? "已連接幣安" : "尚未連接"}
+                  {binanceConnections.data?.some((item) => item.connected) ? "已連接" : "尚未連接"}
                 </Badge>
                 <Badge tone={automationStatus.data?.enabled ? "green" : "amber"}>
-                  {automationStatus.data?.enabled ? "背景排程已啟用" : "背景排程未啟用"}
+                  {automationStatus.data?.enabled ? "自動更新中" : "只在開啟時更新"}
                 </Badge>
               </div>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-500">
                 {automationStatus.data?.enabled
-                  ? "帳戶餘額與持倉每小時完整同步；行情每 15 分鐘更新，成交成本每天更新一次。不需要持續開著財務居。"
-                  : "開啟財務居時每 15 分鐘更新行情；部署背景排程後，帳戶與持倉會每小時自動同步。"}
+                  ? "帳戶餘額與持倉會定期更新，不需要持續開著財務居。"
+                  : "目前會在你開啟財務居時更新資料。"}
               </p>
               <p className="mt-2 text-xs leading-5 text-amber-700">
-                請建立只有讀取權限的 API Key，務必關閉現貨交易、合約交易與提領權限。
+                連接時請使用唯讀金鑰，並關閉交易與提領權限。
               </p>
             </div>
           </div>
@@ -956,24 +984,24 @@ export default function SettingsPage() {
               </Button>
             )}
             <Button variant="ghost" onClick={() => setExchangeSettingsOpen((value) => !value)}>
-              <KeyRound size={15} /> {exchangeSettingsOpen ? "收起設定" : "連接交易所"}
+              <KeyRound size={15} /> {exchangeSettingsOpen ? "收起" : "連接帳戶"}
             </Button>
           </div>
         </div>
 
         <div className="mt-5 grid gap-3 rounded-2xl border border-slate-100 bg-slate-50 p-4 text-sm sm:grid-cols-3">
           <div>
-            <p className="text-xs text-slate-400">伺服器排程</p>
+            <p className="text-xs text-slate-400">自動更新</p>
             <p className="mt-1 font-semibold text-slate-800">
               {automationStatus.data?.running
                 ? "正在更新"
                 : automationStatus.data?.enabled
-                  ? "每小時自動執行"
-                  : "尚未啟用"}
+                  ? "已啟用"
+                  : "僅開啟時更新"}
             </p>
           </div>
           <div>
-            <p className="text-xs text-slate-400">上次背景更新</p>
+            <p className="text-xs text-slate-400">最近更新</p>
             <p className="mt-1 font-semibold text-slate-800">
               {automationStatus.data?.last_run_at
                 ? new Date(`${automationStatus.data.last_run_at}Z`).toLocaleString("zh-TW", { hour12: false })
@@ -1070,11 +1098,11 @@ export default function SettingsPage() {
                   ))}
                 </Select>
               </FormStep>
-              <FormStep number={2} title="貼上 API Key" tone="blue">
-                <Input name="api_key" type="password" autoComplete="off" placeholder="Binance API Key" required />
+              <FormStep number={2} title="貼上唯讀金鑰" tone="blue">
+                <Input name="api_key" type="password" autoComplete="off" placeholder="從幣安複製第一組金鑰" required />
               </FormStep>
-              <FormStep number={3} title="貼上 Secret Key" tone="purple">
-                <Input name="api_secret" type="password" autoComplete="off" placeholder="Binance Secret Key" required />
+              <FormStep number={3} title="貼上安全密鑰" tone="purple">
+                <Input name="api_secret" type="password" autoComplete="off" placeholder="從幣安複製安全密鑰" required />
               </FormStep>
             </div>
             <div className="flex justify-end">
@@ -1083,13 +1111,15 @@ export default function SettingsPage() {
               </Button>
             </div>
             {connectBinance.isError && (
-              <p className="text-sm text-red-600">{(connectBinance.error as Error).message}</p>
+              <p className="text-sm text-red-600">
+                {friendlySettingsMessage((connectBinance.error as Error).message, "目前無法連接投資帳戶，請確認唯讀金鑰後再試。")}
+              </p>
             )}
             {!binanceConnections.data?.length && (
               <p className="text-sm text-amber-700">請先到帳戶頁新增「加密貨幣交易所」帳戶。</p>
             )}
             <p className="text-xs leading-5 text-slate-400">
-              系統會比對 Binance 可讀取的 USDT 現貨成交紀錄與目前餘額，自動計算能確認的平均成本；如果有外部轉入、理財收益或歷史缺漏，就會保留原值並標示「成本待確認」。
+              系統會根據可讀取的成交紀錄估算平均成本；資料不足時會標示「成本待確認」。
             </p>
           </form>
         )}
@@ -1100,27 +1130,26 @@ export default function SettingsPage() {
         id="email"
         icon={<Mail size={18} />}
         title="信用卡自動記帳"
-        description="管理 Gmail、信用卡與繳款規則"
+        description="自動匯入刷卡消費與帳單"
         status={gmail.data?.connected ? "已連接" : "未連接"}
       >
       <Card className="settings-detail-card mt-6 p-6">
         <div className="flex flex-col justify-between gap-5 lg:flex-row lg:items-start">
           <div className="flex items-start gap-4">
             <div className="rounded-2xl bg-blue-50 p-3 text-blue-700"><Mail size={20} /></div>
-            <div>
+            <div className="min-w-0">
               <div className="flex flex-wrap items-center gap-2">
                 <h2 className="font-bold text-ink">信用卡郵件自動記帳</h2>
                 <Badge tone={gmail.data?.connected ? "green" : "amber"}>
-                  {gmail.data?.connected ? `已連接 ${gmail.data.email || "Gmail"}` : "尚未連接 Gmail"}
+                  {gmail.data?.connected ? "已連接" : "尚未連接 Gmail"}
                 </Badge>
-                {gmail.data?.connected && <Badge tone="green">只讀郵件</Badge>}
-                {gmail.data?.connected && automationStatus.data?.enabled && <Badge tone="green">每小時背景同步</Badge>}
+                {gmail.data?.connected && automationStatus.data?.enabled && <Badge tone="green">每小時同步</Badge>}
               </div>
-              <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-500">
-                只讀取符合你設定的銀行寄件者或主旨，辨識刷卡消費、帳單金額與繳款日；重複郵件會自動跳過。
+              <p className="mt-1 truncate text-sm text-slate-500">
+                {gmail.data?.connected ? gmail.data.email || "Gmail" : "連接 Gmail 後自動辨識信用卡消費與帳單"}
               </p>
-              <p className="mt-2 text-xs leading-5 text-amber-700">
-                到期「扣款」只會在財務居建立帳戶轉帳並更新餘額，不會登入銀行，也不會真的從銀行發動付款。
+              <p className="mt-1 text-xs leading-5 text-slate-400">
+                唯讀取信；到期只在財務居記帳，不會向銀行發動付款。
               </p>
             </div>
           </div>
@@ -1163,35 +1192,35 @@ export default function SettingsPage() {
 
         {!gmail.isLoading && !gmail.data?.configured && (
           <p className="mt-5 rounded-xl bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-800">
-            伺服器尚未設定 Google OAuth。需要先在 Google Cloud 建立 OAuth 用戶端，並設定 Gmail 唯讀權限。
+            目前無法連接 Gmail，請稍後再試。
           </p>
         )}
 
         {gmail.data?.connected && !automationStatus.data?.enabled && (
           <p className="mt-5 rounded-xl bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-800">
-            目前沒有背景排程，系統只會在你按「立即同步」時讀取郵件；設定伺服器自動更新密鑰後，才會每小時檢查新消費與到期帳單。
+            目前會在你開啟財務居或按「立即同步」時更新信用卡資料。
           </p>
         )}
 
-        <div className="mt-5 grid gap-3 rounded-2xl border border-slate-100 bg-slate-50 p-4 text-sm sm:grid-cols-3">
-          <div>
-            <p className="text-xs text-slate-400">上次同步</p>
-            <p className="mt-1 font-semibold text-slate-800">
+        <div className="mt-4 flex flex-wrap items-center gap-x-6 gap-y-2 rounded-xl bg-slate-50 px-4 py-3 text-sm">
+          <p className="text-slate-500">
+            最近同步 <span className="ml-1 font-semibold text-slate-800">
               {gmail.data?.last_sync_at
                 ? new Date(`${gmail.data.last_sync_at}Z`).toLocaleString("zh-TW", { hour12: false })
                 : "尚未執行"}
+            </span>
+          </p>
+          <p className="text-slate-500"><span className="font-semibold text-slate-800">{gmail.data?.active_rules || 0}</span> 張卡</p>
+          <p className="text-slate-500"><span className="font-semibold text-slate-800">{gmail.data?.pending_bills || 0}</span> 份待處理帳單</p>
+          {gmail.data?.last_result && (
+            <p className="w-full border-t border-slate-200 pt-2 text-xs text-slate-500">
+              最近結果：新增 <span className="font-semibold text-slate-800">{gmail.data.last_result.transactions_imported}</span> 筆消費
+              {gmail.data.last_result.bills_found ? `，更新 ${gmail.data.last_result.bills_found} 份帳單` : ""}
+              {gmail.data.last_result.errors.length ? "；部分郵件需要稍後重試" : "，已完成"}。
             </p>
-          </div>
-          <div>
-            <p className="text-xs text-slate-400">使用中規則</p>
-            <p className="mt-1 font-semibold text-slate-800">{gmail.data?.active_rules || 0} 張信用卡</p>
-          </div>
-          <div>
-            <p className="text-xs text-slate-400">待處理帳單</p>
-            <p className="mt-1 font-semibold text-slate-800">{gmail.data?.pending_bills || 0} 份</p>
-          </div>
+          )}
           {gmail.data?.last_error && (
-            <p className="text-xs leading-5 text-red-600 sm:col-span-3">{gmail.data.last_error}</p>
+            <p className="w-full text-xs leading-5 text-amber-700">最近一次同步遇到問題，系統會在下次更新時自動重試。</p>
           )}
         </div>
 
@@ -1201,7 +1230,7 @@ export default function SettingsPage() {
               <div>
                 <p className="font-bold text-slate-800">上傳郵件截圖，快速建立信用卡</p>
                 <p className="mt-1 text-sm leading-6 text-slate-500">
-                  截圖只在這台裝置辨識文字，不會上傳圖片；辨識完成後確認一次即可建立帳戶與同步規則。
+                  截圖只在這台裝置辨識文字，不會上傳圖片；辨識完成後確認一次即可建立帳戶並開始自動記帳。
                 </p>
               </div>
               <input
@@ -1348,15 +1377,9 @@ export default function SettingsPage() {
 
             {!discoverGmailCards.isPending && discoverGmailCards.isSuccess && !gmailCandidates.length && (
               <p className="mt-4 rounded-xl bg-white/80 px-4 py-3 text-sm text-amber-700">
-                沒有找到支援的銀行寄件者。可以改用郵件截圖，或使用進階手動設定。
+                尚未找到信用卡通知，可以改用上方的郵件截圖建立。
               </p>
             )}
-
-            <div className="mt-4 flex justify-end">
-              <Button type="button" variant="ghost" onClick={() => setManualEmailSetupOpen(true)}>
-                改用進階手動設定
-              </Button>
-            </div>
           </div>
         )}
 
@@ -1374,12 +1397,17 @@ export default function SettingsPage() {
                   className="font-semibold"
                   onClick={startCreatingEmailRule}
                 >
-                  改為新增
+                  取消
                 </button>
               </div>
             )}
-            <div className="grid gap-3 lg:grid-cols-3">
-              <FormStep number={1} title="是哪張信用卡？">
+            <input type="hidden" name="sender_pattern" value={editingEmailRule?.sender_pattern || ""} />
+            <input type="hidden" name="subject_pattern" value={editingEmailRule?.subject_pattern || ""} />
+            <input type="hidden" name="card_last4" value={editingEmailRule?.card_last4 || ""} />
+            <input type="hidden" name="lookback_days" value={editingEmailRule?.lookback_days || 90} />
+            <input type="hidden" name="closing_day" value={editingEmailRule?.closing_day || ""} />
+            <div className="grid gap-3 lg:grid-cols-2">
+              <FormStep number={1} title="信用卡">
                 <div className="space-y-3">
                   <Input name="name" defaultValue={editingEmailRule?.name || ""} placeholder="例如：國泰信用卡" required />
                   <Select name="card_account_id" defaultValue={editingEmailRule ? String(editingEmailRule.card_account_id) : ""} required>
@@ -1388,23 +1416,10 @@ export default function SettingsPage() {
                       <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
                     ))}
                   </Select>
-                  <Input name="card_last4" defaultValue={editingEmailRule?.card_last4 || ""} inputMode="numeric" pattern="[0-9]{4}" maxLength={4} placeholder="卡號末四碼（選填）" />
+                  <p className="text-xs leading-5 text-slate-400">郵件來源與辨識方式會沿用目前設定，不需要另外調整。</p>
                 </div>
               </FormStep>
-              <FormStep number={2} title="只看哪些郵件？" tone="blue">
-                <div className="space-y-3">
-                  <Input name="sender_pattern" defaultValue={editingEmailRule?.sender_pattern || ""} placeholder="寄件者，例如 cathaybk.com.tw" />
-                  <Input name="subject_pattern" defaultValue={editingEmailRule?.subject_pattern || ""} placeholder="主旨關鍵字，例如 消費彙整通知" />
-                  <Select name="lookback_days" defaultValue={String(editingEmailRule?.lookback_days || 30)}>
-                    <option value="14">第一次回看 14 天</option>
-                    <option value="30">第一次回看 30 天</option>
-                    <option value="60">第一次回看 60 天</option>
-                    <option value="90">第一次回看 90 天</option>
-                  </Select>
-                  <p className="text-xs leading-5 text-slate-400">寄件者或主旨至少填一項，避免讀到不相關郵件。</p>
-                </div>
-              </FormStep>
-              <FormStep number={3} title="繳款怎麼記錄？" tone="purple">
+              <FormStep number={2} title="繳款設定" tone="blue">
                 <div className="space-y-3">
                   <Select name="payment_account_id" defaultValue={editingEmailRule ? String(editingEmailRule.payment_account_id) : ""} required>
                     <option value="">選擇扣款帳戶</option>
@@ -1412,36 +1427,28 @@ export default function SettingsPage() {
                       <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
                     ))}
                   </Select>
-                  <div className="grid grid-cols-2 gap-3">
-                    <Input
-                      name="closing_day"
-                      type="number"
-                      min={1}
-                      max={31}
-                      defaultValue={editingEmailRule?.closing_day || ""}
-                      placeholder="結帳日（可留空）"
-                    />
-                    <Input
-                      name="payment_due_day"
-                      type="number"
-                      min={1}
-                      max={31}
-                      defaultValue={editingEmailRule?.payment_due_day || 23}
-                      placeholder="繳款日"
-                    />
-                  </div>
-                  <p className="text-xs leading-5 text-slate-400">繳款日預設每月 23 日；結帳日會在讀到電子帳單後自動校正。</p>
-                  <Input name="statement_password" type="password" autoComplete="off" placeholder="電子帳單 PDF 密碼（選填）" />
+                  <Input
+                    name="payment_due_day"
+                    type="number"
+                    min={1}
+                    max={31}
+                    defaultValue={editingEmailRule?.payment_due_day || 23}
+                    placeholder="每月繳款日"
+                  />
                   <label className="flex items-start gap-3 rounded-xl bg-slate-50 p-3 text-sm text-slate-600">
                     <input name="auto_pay" type="checkbox" defaultChecked={editingEmailRule?.auto_pay ?? true} className="mt-1" />
                     <span>到繳款日自動在財務居記錄扣款；餘額不足或金額不合理時先暫停並提醒。</span>
                   </label>
+                  <details className="rounded-xl border border-slate-100 px-3 py-2">
+                    <summary className="cursor-pointer list-none text-xs font-semibold text-slate-500">電子帳單需要密碼？</summary>
+                    <Input name="statement_password" type="password" autoComplete="off" className="mt-3" placeholder="輸入電子帳單 PDF 密碼" />
+                  </details>
                 </div>
               </FormStep>
             </div>
             <div className="flex justify-end">
               <Button type="submit" disabled={saveEmailRule.isPending || !cardAccounts.length || !paymentAccounts.length}>
-                <Save size={15} /> {saveEmailRule.isPending ? "儲存中…" : editingEmailRule ? "儲存規則變更" : "儲存自動記帳規則"}
+                <Save size={15} /> {saveEmailRule.isPending ? "儲存中…" : editingEmailRule ? "儲存變更" : "開始自動記帳"}
               </Button>
             </div>
             {!cardAccounts.length && (
@@ -1451,28 +1458,27 @@ export default function SettingsPage() {
         )}
 
         {emailRules.data?.some((rule) => rule.active) && (
-          <div className="mt-5 grid gap-3 md:grid-cols-2 xl:grid-cols-3">
+          <div className="mt-4 space-y-2">
             {emailRules.data.filter((rule) => rule.active).map((rule) => (
-              <div key={rule.id} className="rounded-2xl border border-slate-100 p-4">
-                <div className="flex items-start justify-between gap-3">
-                  <div>
+              <details key={rule.id} className="group rounded-xl border border-slate-100 px-4 py-3">
+                <summary className="flex cursor-pointer list-none items-center justify-between gap-3">
+                  <div className="min-w-0">
                     <p className="font-semibold text-slate-800">{rule.name}</p>
-                    <p className="mt-1 text-xs text-slate-400">
-                      {rule.card_account_name} ← {rule.payment_account_name}
+                    <p className="mt-1 truncate text-xs text-slate-400">
+                      {rule.payment_account_name}扣款 · 每月 {rule.payment_due_day || 23} 日
                     </p>
                   </div>
-                  <Badge tone={rule.auto_pay ? "green" : "slate"}>{rule.auto_pay ? "到期自動記帳" : "只匯入"}</Badge>
-                </div>
-                <div className="mt-3 space-y-1 text-xs text-slate-500">
-                  <p>寄件者：{rule.sender_pattern || "不限"}</p>
-                  <p>主旨：{rule.subject_pattern || "不限"}</p>
-                  <p>帳期：{rule.closing_day ? `每月 ${rule.closing_day} 日結帳` : "等待第一份帳單自動確認"}</p>
-                  <p>繳款日：每月 {rule.payment_due_day || 23} 日（以帳單日期優先）</p>
-                  <p>PDF 密碼：{rule.statement_password_configured ? "已安全儲存" : "未設定"}</p>
+                  <span className="flex shrink-0 items-center gap-2">
+                    <Badge tone={rule.auto_pay ? "green" : "slate"}>{rule.auto_pay ? "自動記帳" : "只匯入"}</Badge>
+                    <ChevronDown size={16} className="text-slate-400 transition group-open:rotate-180" />
+                  </span>
+                </summary>
+                <div className="mt-3 border-t border-slate-100 pt-3 text-xs text-slate-500">
+                  <p>{rule.closing_day ? `每月 ${rule.closing_day} 日結帳` : "結帳日會從第一份帳單自動確認"}</p>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <Button variant="secondary" onClick={() => startEditingEmailRule(rule)}>
-                    編輯規則
+                    編輯設定
                   </Button>
                   <Button
                     variant="ghost"
@@ -1482,20 +1488,24 @@ export default function SettingsPage() {
                       }
                     }}
                   >
-                    停止規則
+                    停止自動記帳
                   </Button>
                 </div>
-              </div>
+              </details>
             ))}
           </div>
         )}
 
         {cardCycles.data?.length ? (
-          <div className="mt-5 space-y-3">
-            <div>
-              <p className="text-sm font-semibold text-slate-800">信用卡帳期</p>
-              <p className="mt-1 text-xs text-slate-400">消費依結帳日分期，帳單只會在同一個繳款日記錄一次。</p>
-            </div>
+          <details className="group mt-4 rounded-xl border border-slate-100">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3">
+              <span>
+                <span className="block text-sm font-semibold text-slate-800">帳期與繳款</span>
+                <span className="mt-1 block text-xs text-slate-400">{cardCycles.data.length} 張信用卡 · 點擊查看未出帳與繳款紀錄</span>
+              </span>
+              <ChevronDown size={16} className="shrink-0 text-slate-400 transition group-open:rotate-180" />
+            </summary>
+            <div className="space-y-3 border-t border-slate-100 p-4">
             {cardCycles.data.map((cycle) => {
               const money = (amount: number) => `${cycle.currency} ${amount.toLocaleString("zh-TW")}`;
               return (
@@ -1531,13 +1541,17 @@ export default function SettingsPage() {
                 </div>
               );
             })}
-          </div>
+            </div>
+          </details>
         ) : null}
 
         {cardBills.data?.length ? (
-          <div className="mt-5 overflow-hidden rounded-2xl border border-slate-100">
-            <div className="border-b border-slate-100 bg-slate-50 px-4 py-3 text-sm font-semibold text-slate-700">最近信用卡帳單</div>
-            <div className="divide-y divide-slate-100">
+          <details className="group mt-3 overflow-hidden rounded-xl border border-slate-100">
+            <summary className="flex cursor-pointer list-none items-center justify-between gap-3 px-4 py-3 text-sm font-semibold text-slate-700">
+              最近信用卡帳單（{cardBills.data.length}）
+              <ChevronDown size={16} className="shrink-0 text-slate-400 transition group-open:rotate-180" />
+            </summary>
+            <div className="divide-y divide-slate-100 border-t border-slate-100">
               {cardBills.data.slice(0, 6).map((bill) => (
                 <div key={bill.id} className="flex flex-col gap-2 px-4 py-3 sm:flex-row sm:items-center sm:justify-between">
                   <div>
@@ -1545,7 +1559,7 @@ export default function SettingsPage() {
                     <p className="mt-1 text-xs text-slate-400">
                       {bill.period_start && bill.period_end ? `帳期 ${bill.period_start}～${bill.period_end} · ` : ""}繳款日 {bill.due_date} · {bill.payment_account_name}
                     </p>
-                    {bill.last_error && <p className="mt-1 text-xs text-amber-700">{bill.last_error}</p>}
+                    {bill.last_error && <p className="mt-1 text-xs text-amber-700">這份帳單尚未完成辨識，系統稍後會自動重試。</p>}
                   </div>
                   <Badge tone={bill.status === "paid" ? "green" : bill.status === "pending" ? "blue" : bill.status === "duplicate" ? "slate" : "amber"}>
                     {bill.status === "paid"
@@ -1561,21 +1575,27 @@ export default function SettingsPage() {
                 </div>
               ))}
             </div>
-          </div>
+          </details>
         ) : null}
 
         {gmail.data?.connected && (
-          <div className="mt-5 flex justify-end">
-            <Button
-              variant="ghost"
-              onClick={() => {
-                if (window.confirm("停止 Gmail 連接嗎？既有交易、規則與帳單會保留。")) disconnectGmail.mutate();
-              }}
-              disabled={disconnectGmail.isPending}
-            >
-              停止 Gmail 連接
-            </Button>
-          </div>
+          <details className="group mt-3 rounded-xl border border-transparent px-2 py-1">
+            <summary className="flex cursor-pointer list-none items-center justify-between text-xs font-semibold text-slate-400">
+              其他連線設定
+              <ChevronDown size={15} className="transition group-open:rotate-180" />
+            </summary>
+            <div className="mt-2 flex justify-end border-t border-slate-100 pt-2">
+              <Button
+                variant="ghost"
+                onClick={() => {
+                  if (window.confirm("停止 Gmail 連接嗎？既有交易、自動分類與帳單會保留。")) disconnectGmail.mutate();
+                }}
+                disabled={disconnectGmail.isPending}
+              >
+                停止 Gmail 連接
+              </Button>
+            </div>
+          </details>
         )}
       </Card>
       </MobileSettingsSection>
@@ -1586,8 +1606,8 @@ export default function SettingsPage() {
         id="categories"
         icon={<BookOpen size={18} />}
         title="自動分類"
-        description="管理店名與交易分類規則"
-        status={`${rules.data?.length || 0} 條`}
+        description="教系統記住常用店家分類"
+        status={`${rules.data?.filter((rule) => !rule.is_default).length || 0} 項`}
       >
       <Card className="settings-detail-card mt-6 overflow-hidden">
         <div className="border-b border-slate-100 px-6 py-5">
@@ -1597,9 +1617,9 @@ export default function SettingsPage() {
               <div>
                 <div className="flex flex-wrap items-center gap-2">
                   <h2 className="font-bold text-ink">自動分類</h2>
-                  <Badge>{rules.data?.length || 0} 條規則</Badge>
+                  <Badge>{rules.data?.filter((rule) => !rule.is_default).length || 0} 項我的自動分類</Badge>
                 </div>
-                <p className="mt-1 text-xs text-slate-400">摘要包含關鍵字時，自動套用指定分類。</p>
+                <p className="mt-1 text-xs text-slate-400">輸入常見店名，下次出現時會自動分類；內建規則會在背景運作。</p>
               </div>
             </div>
           </div>
@@ -1621,29 +1641,28 @@ export default function SettingsPage() {
                 </Select>
               </FormStep>
             </div>
-            {saveRule.isError && <p className="text-sm text-red-600">{(saveRule.error as Error).message}</p>}
+            {saveRule.isError && (
+              <p className="text-sm text-red-600">
+                {friendlySettingsMessage((saveRule.error as Error).message, "目前無法儲存自動分類，請稍後再試。")}
+              </p>
+            )}
             <div className="flex justify-end gap-2">
               {editingRuleId && <Button type="button" variant="ghost" onClick={resetRuleForm}>取消修改</Button>}
               <Button type="submit" disabled={saveRule.isPending || !ruleKeyword.trim() || !ruleCategoryId}>
-                <Save size={15} /> {editingRuleId ? "儲存修改" : "新增規則"}
+                <Save size={15} /> {editingRuleId ? "儲存修改" : "新增自動分類"}
               </Button>
             </div>
           </form>
         </div>
-        <div className="grid gap-3 border-b border-slate-100 px-6 py-4 md:grid-cols-[1fr_160px_160px]">
+        <div className="grid gap-3 border-b border-slate-100 px-6 py-4 md:grid-cols-[1fr_160px]">
           <label className="relative block">
             <Search className="pointer-events-none absolute left-3 top-1/2 -translate-y-1/2 text-slate-400" size={16} />
-            <Input className="pl-9" value={ruleSearch} onChange={(event) => setRuleSearch(event.target.value)} placeholder="搜尋關鍵字或分類" aria-label="搜尋分類規則" />
+            <Input className="pl-9" value={ruleSearch} onChange={(event) => setRuleSearch(event.target.value)} placeholder="搜尋店名或分類" aria-label="搜尋自動分類" />
           </label>
           <Select value={ruleKindFilter} onChange={(event) => setRuleKindFilter(event.target.value)} aria-label="依交易類型篩選">
             <option value="all">全部類型</option>
             <option value="expense">支出</option>
             <option value="income">收入</option>
-          </Select>
-          <Select value={ruleSourceFilter} onChange={(event) => setRuleSourceFilter(event.target.value)} aria-label="依規則來源篩選">
-            <option value="all">全部來源</option>
-            <option value="custom">我的規則</option>
-            <option value="default">系統預設</option>
           </Select>
         </div>
         <div className="max-h-96 overflow-auto">
@@ -1674,13 +1693,14 @@ export default function SettingsPage() {
             </section>
           )) : (
             <div className="px-6 py-10 text-center text-sm text-slate-400">
-              {rules.data?.length ? "找不到符合條件的規則。" : "目前沒有自動分類規則。之後常出現的店名或收入來源可以加在這裡。"}
+              {rules.data?.some((rule) => !rule.is_default) ? "找不到符合條件的自動分類。" : "目前沒有自己建立的自動分類；常見店家仍會正常分類。"}
             </div>
           )}
         </div>
       </Card>
       </MobileSettingsSection>
 
+      {SHOW_ENGINEERING_SETTINGS && (
       <Card className="settings-advanced-card mt-6 overflow-hidden">
         <button
           className="flex w-full items-center justify-between px-6 py-5 text-left hover:bg-slate-50"
@@ -1793,6 +1813,7 @@ export default function SettingsPage() {
           </div>
         )}
       </Card>
+      )}
     </>
   );
 }

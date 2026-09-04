@@ -97,12 +97,82 @@ input[type="time"]::-webkit-date-and-time-value {
   bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
 }
 
-/* Settings stays complete on desktop, but becomes a calm accordion on phones. */
-@media (min-width: 768px) {
-  .settings-mobile-section,
-  .settings-mobile-section-content {
-    display: contents;
-  }
+/* Settings uses the same calm, task-first accordion on desktop and phones. */
+.settings-mobile-section {
+  display: block;
+  width: 100%;
+  min-width: 0;
+  max-width: 100%;
+  margin-bottom: 1rem;
+  overflow: hidden;
+  border: 1px solid #e2e8f0;
+  border-radius: 1.25rem;
+  background: #fff;
+  box-shadow: 0 10px 28px rgb(15 23 42 / 5%);
+}
+
+.settings-mobile-section-summary {
+  display: grid;
+  width: 100%;
+  min-width: 0;
+  min-height: 4.75rem;
+  cursor: pointer;
+  grid-template-columns: 2.5rem minmax(0, 1fr) auto auto;
+  list-style: none;
+  align-items: center;
+  gap: .75rem;
+  padding: 1rem 1.25rem;
+  text-align: left;
+  -webkit-tap-highlight-color: transparent;
+  touch-action: manipulation;
+}
+
+.settings-mobile-section-summary > .min-w-0 {
+  overflow: hidden;
+}
+
+.settings-mobile-section-icon {
+  display: grid;
+  width: 2.5rem;
+  height: 2.5rem;
+  flex: 0 0 auto;
+  place-items: center;
+  border-radius: .85rem;
+  color: #047857;
+  background: #ecfdf5;
+}
+
+.settings-mobile-section-chevron {
+  transition: transform 180ms ease;
+}
+
+.settings-mobile-section.is-open > .settings-mobile-section-summary {
+  background: #f8fafc;
+}
+
+.settings-mobile-section.is-open > .settings-mobile-section-summary .settings-mobile-section-chevron {
+  transform: rotate(180deg);
+}
+
+.settings-mobile-section-content {
+  border-top: 1px solid #e2e8f0;
+}
+
+.settings-mobile-section-content > .settings-detail-card {
+  margin: 0 !important;
+  border: 0;
+  border-radius: 0;
+  box-shadow: none;
+}
+
+.dark .settings-mobile-section {
+  border-color: #31413a;
+  background: #151e1b;
+  box-shadow: 0 12px 30px rgb(0 0 0 / 18%);
+}
+
+.dark .settings-mobile-section.is-open > .settings-mobile-section-summary {
+  background: #1b2722;
 }
 
 @media (max-width: 767px) {

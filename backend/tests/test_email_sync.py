@@ -1,4 +1,5 @@
-from datetime import date
+import base64
+from datetime import date, datetime
 from decimal import Decimal
 from types import SimpleNamespace
 
@@ -13,6 +14,7 @@ from app.database import (
     Base,
     CreditCardBill,
     EmailCardRule,
+    EmailImportRecord,
     Transaction,
     TransferLink,
 )
@@ -27,6 +29,7 @@ from app.email_sync import (
     process_due_card_bills,
     repair_duplicate_card_bills,
     serialize_card_cycle,
+    sync_gmail,
 )
 from app import email_sync as email_sync_module
 from app.services import (
@@ -135,6 +138,128 @@ def test_parse_cathay_consumption_digest_table() -> None:
             "kind": "expense",
         }
     ]
+
+
+def test_sync_gmail_retries_failed_cathay_email_and_backfills_transactions(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = make_session()
+    payment = Account(
+        name="生活費帳戶",
+        account_type="bank",
+        nature="asset",
+        currency="TWD",
+        owner="me",
+    )
+    card = Account(
+        name="國泰世華銀行 信用卡",
+        account_type="credit_card",
+        nature="liability",
+        currency="TWD",
+        owner="me",
+    )
+    db.add_all([payment, card])
+    db.flush()
+    rule = EmailCardRule(
+        name="國泰世華銀行 信用卡",
+        owner="me",
+        card_account_id=card.id,
+        payment_account_id=payment.id,
+        sender_pattern="cathaybk.com.tw",
+        lookback_days=90,
+        payment_due_day=23,
+        auto_pay=True,
+        active=True,
+    )
+    db.add(rule)
+    db.flush()
+    failed_record = EmailImportRecord(
+        provider="gmail",
+        provider_message_id="cathay-retry-1",
+        rule_id=rule.id,
+        message_date=datetime(2026, 8, 31, 8, 0),
+        sender="國泰世華銀行 <service@cathaybk.com.tw>",
+        subject="國泰世華銀行消費彙整通知",
+        status="error",
+        imported_transactions=0,
+        error="舊版解析器無法處理",
+    )
+    db.add(failed_record)
+    db.commit()
+
+    html = """
+    <table>
+      <tr>
+        <td>正卡</td><td>6196</td><td>2026/08/30</td><td>21:41</td><td>TW</td>
+      </tr>
+      <tr>
+        <td colspan="2">消費金額</td><td>商店名稱</td><td>消費類別</td><td>備註</td>
+      </tr>
+      <tr>
+        <td colspan="2">NT$50</td><td>統一超商－鑽寶</td><td>超市∕量販</td><td>&nbsp;</td>
+      </tr>
+    </table>
+    """
+    encoded_html = base64.urlsafe_b64encode(html.encode("utf-8")).decode("ascii").rstrip("=")
+
+    monkeypatch.setattr(email_sync_module, "_gmail_access_token", lambda _db: "token")
+
+    def fake_get(_token: str, path: str, params: dict | None = None):
+        if path == "/messages":
+            return {"messages": [{"id": "cathay-retry-1"}]}
+        if path == "/messages/cathay-retry-1":
+            return {
+                "internalDate": "1788134400000",
+                "payload": {
+                    "headers": [
+                        {
+                            "name": "From",
+                            "value": "國泰世華銀行 <service@cathaybk.com.tw>",
+                        },
+                        {"name": "Subject", "value": "國泰世華銀行消費彙整通知"},
+                        {"name": "Date", "value": "Mon, 31 Aug 2026 08:00:00 +0800"},
+                    ],
+                    "mimeType": "multipart/alternative",
+                    "parts": [
+                        {
+                            "mimeType": "text/html",
+                            "filename": "",
+                            "body": {"data": encoded_html},
+                        }
+                    ],
+                },
+            }
+        raise AssertionError(f"unexpected Gmail request: {path} {params}")
+
+    monkeypatch.setattr(email_sync_module, "_gmail_get", fake_get)
+
+    result = sync_gmail(db)
+    imported = db.scalars(
+        select(Transaction).where(Transaction.source == "gmail")
+    ).all()
+    db.refresh(failed_record)
+
+    assert result["messages_scanned"] == 1
+    assert result["retries_attempted"] == 1
+    assert result["retries_recovered"] == 1
+    assert result["transactions_recognized"] == 1
+    assert result["transactions_imported"] == 1
+    assert result["errors"] == []
+    assert failed_record.status == "processed"
+    assert failed_record.error is None
+    assert len(imported) == 1
+    assert imported[0].transaction_date == date(2026, 8, 30)
+    assert imported[0].description == "統一超商－鑽寶"
+    assert Decimal(str(imported[0].amount)) == Decimal("-50")
+
+    second_result = sync_gmail(db)
+    second_imported = db.scalars(
+        select(Transaction).where(Transaction.source == "gmail")
+    ).all()
+    assert second_result["already_processed"] == 1
+    assert second_result["transactions_imported"] == 0
+    assert len(second_imported) == 1
+    db.close()
 
 
 def test_gmail_card_balance_uses_current_month_without_old_statements() -> None:

@@ -1120,9 +1120,14 @@ def sync_gmail(db: Session) -> dict[str, Any]:
         result = {
             "messages_scanned": 0,
             "matched": 0,
+            "transactions_recognized": 0,
             "transactions_imported": 0,
             "bills_found": 0,
             "payments_created": 0,
+            "already_processed": 0,
+            "no_finance_data": 0,
+            "retries_attempted": 0,
+            "retries_recovered": 0,
             "ignored": 0,
             "errors": [],
         }
@@ -1156,9 +1161,14 @@ def sync_gmail(db: Session) -> dict[str, Any]:
     result: dict[str, Any] = {
         "messages_scanned": len(message_ids),
         "matched": 0,
+        "transactions_recognized": 0,
         "transactions_imported": 0,
         "bills_found": 0,
         "payments_created": 0,
+        "already_processed": 0,
+        "no_finance_data": 0,
+        "retries_attempted": 0,
+        "retries_recovered": 0,
         "ignored": 0,
         "errors": [],
     }
@@ -1169,9 +1179,16 @@ def sync_gmail(db: Session) -> dict[str, Any]:
                 EmailImportRecord.provider_message_id == message_id,
             )
         )
-        if existing_record and existing_record.status != "no_finance_data":
+        # Only a completed import is final.  Older parser failures and messages
+        # that previously contained no recognizable finance data must be read
+        # again so a parser fix can backfill them on the next scheduled sync.
+        if existing_record and existing_record.status == "processed":
+            result["already_processed"] += 1
             result["ignored"] += 1
             continue
+        previous_status = existing_record.status if existing_record else None
+        if existing_record:
+            result["retries_attempted"] += 1
         message = _gmail_get(token, f"/messages/{message_id}", {"format": "full"})
         payload = message.get("payload") or {}
         headers = _headers(payload)
@@ -1201,6 +1218,8 @@ def sync_gmail(db: Session) -> dict[str, Any]:
                 message_datetime.date(),
                 default_due_day=rule.payment_due_day,
             )
+            recognized_transactions = len(parsed["transactions"])
+            has_finance_data = bool(recognized_transactions or parsed["bill"])
             imported = sum(
                 1 for item in parsed["transactions"] if _create_card_transaction(db, rule, item, message_id)
             )
@@ -1210,7 +1229,7 @@ def sync_gmail(db: Session) -> dict[str, Any]:
                 existing_record.message_date = message_datetime
                 existing_record.sender = sender[:300]
                 existing_record.subject = subject[:500]
-                existing_record.status = "processed" if imported or parsed["bill"] else "no_finance_data"
+                existing_record.status = "processed" if has_finance_data else "no_finance_data"
                 existing_record.imported_transactions = imported
                 existing_record.error = None
             else:
@@ -1221,13 +1240,17 @@ def sync_gmail(db: Session) -> dict[str, Any]:
                     message_date=message_datetime,
                     sender=sender[:300],
                     subject=subject[:500],
-                    status="processed" if imported or parsed["bill"] else "no_finance_data",
+                    status="processed" if has_finance_data else "no_finance_data",
                     imported_transactions=imported,
                 ))
             db.commit()
             result["matched"] += 1
+            result["transactions_recognized"] += recognized_transactions
             result["transactions_imported"] += imported
             result["bills_found"] += int(bill_created)
+            result["no_finance_data"] += int(not has_finance_data)
+            if previous_status and has_finance_data:
+                result["retries_recovered"] += 1
         except Exception as exc:
             db.rollback()
             if existing_record:
