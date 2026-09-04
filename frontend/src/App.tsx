@@ -405,6 +405,78 @@ function AuthCheckingScreen() {
   );
 }
 
+function PublicInfoPage({ kind }: { kind: "privacy" | "terms" }) {
+  const privacy = kind === "privacy";
+
+  return (
+    <div className="min-h-screen bg-canvas px-4 py-10 text-slate-700 sm:px-6">
+      <main className="mx-auto max-w-3xl rounded-3xl border border-slate-200 bg-white p-6 shadow-card sm:p-10">
+        <div className="flex items-center gap-3 border-b border-slate-100 pb-6">
+          <img src="/finance-home-icon-192.png" alt="財務居" className="size-12 rounded-2xl object-cover" />
+          <div>
+            <p className="text-lg font-bold text-forest">財務居</p>
+            <p className="text-sm text-slate-400">Personal Finance</p>
+          </div>
+        </div>
+        <h1 className="mt-8 text-3xl font-bold text-ink">
+          {privacy ? "隱私權政策" : "服務條款"}
+        </h1>
+        <p className="mt-2 text-sm text-slate-400">最後更新：2026 年 9 月 4 日</p>
+
+        {privacy ? (
+          <div className="mt-8 space-y-6 text-sm leading-7">
+            <section>
+              <h2 className="text-lg font-semibold text-ink">我們會處理哪些資料</h2>
+              <p className="mt-2">
+                財務居只在你主動使用功能時處理帳戶、交易、投資與固定支出資料。若你連接 Gmail，系統僅依你設定的寄件者或主旨讀取符合條件的郵件，用來辨識信用卡消費與帳單；不會讀取其他郵件內容。
+              </p>
+            </section>
+            <section>
+              <h2 className="text-lg font-semibold text-ink">資料用途與保存</h2>
+              <p className="mt-2">
+                資料只用於提供個人財務記錄、提醒與統計，不會販售或提供給廣告商。Gmail 授權憑證與財務資料會受到存取控制保護；你可以隨時在設定中停止 Gmail 連接，或刪除相關記錄。
+              </p>
+            </section>
+            <section>
+              <h2 className="text-lg font-semibold text-ink">你的選擇</h2>
+              <p className="mt-2">
+                你可以修改自動辨識規則、停止同步、匯出或刪除資料。財務居不會登入銀行，也不會代你從銀行或信用卡帳戶發起扣款。
+              </p>
+            </section>
+            <p className="border-t border-slate-100 pt-5 text-slate-500">
+              隱私問題請聯絡：b0968935235@gmail.com
+            </p>
+          </div>
+        ) : (
+          <div className="mt-8 space-y-6 text-sm leading-7">
+            <section>
+              <h2 className="text-lg font-semibold text-ink">服務內容</h2>
+              <p className="mt-2">
+                財務居提供個人記帳、帳戶餘額快照、投資持倉與信用卡郵件辨識工具。所有數字僅供個人整理與參考，不構成投資、會計或法律建議。
+              </p>
+            </section>
+            <section>
+              <h2 className="text-lg font-semibold text-ink">Gmail 連接</h2>
+              <p className="mt-2">
+                Gmail 連接採唯讀權限，依你設定的規則處理郵件。你可隨時停止連接；服務不會登入銀行、不會替你付款，也不會自動從銀行或信用卡帳戶扣款。
+              </p>
+            </section>
+            <section>
+              <h2 className="text-lg font-semibold text-ink">使用責任與變更</h2>
+              <p className="mt-2">
+                請確認輸入的帳戶、交易與規則正確，並自行保管登入資訊。服務內容可能為維護安全或修正錯誤而調整；重大變更會在服務中提示。
+              </p>
+            </section>
+            <p className="border-t border-slate-100 pt-5 text-slate-500">
+              條款問題請聯絡：b0968935235@gmail.com
+            </p>
+          </div>
+        )}
+      </main>
+    </div>
+  );
+}
+
 function GlobalQueryProgress() {
   const activeFetches = useIsFetching({ type: "active" });
 
@@ -519,6 +591,7 @@ function FinanceApp() {
 
 export default function App() {
   const queryClient = useQueryClient();
+  const location = useLocation();
   const [authState, setAuthState] = useState<"checking" | "authenticated" | "anonymous">(
     !AUTH_REQUIRED ? "authenticated" : getAuthToken() ? "checking" : "anonymous",
   );
@@ -568,6 +641,10 @@ export default function App() {
       window.removeEventListener("finance:auth-changed", syncAuth);
     };
   }, [queryClient]);
+
+  if (location.pathname === "/privacy" || location.pathname === "/terms") {
+    return <PublicInfoPage kind={location.pathname === "/privacy" ? "privacy" : "terms"} />;
+  }
 
   if (authState === "checking") return <AuthCheckingScreen />;
   if (authState === "anonymous") {
