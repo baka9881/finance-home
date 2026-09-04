@@ -147,6 +147,7 @@ interface AutomationStatus {
 interface GmailStatus {
   configured: boolean;
   connected: boolean;
+  reconnect_required?: boolean;
   email?: string;
   last_sync_at?: string;
   last_error?: string;
@@ -296,6 +297,9 @@ export function friendlyExchangeMessage(message?: string) {
 
 function friendlySettingsMessage(message?: string, fallback = "目前無法完成操作，請稍後再試。") {
   if (!message) return fallback;
+  if (/invalid_grant|expired|revoked|Gmail.*授權.*(過期|失效)|重新連接 Gmail/i.test(message)) {
+    return "Gmail 授權已到期，請重新連接 Gmail。";
+  }
   if (/401|403|unauthor|forbidden|登入|login|session|token/i.test(message)) {
     return "登入狀態已失效，請重新登入後再試。";
   }
@@ -488,7 +492,10 @@ export default function SettingsPage() {
         `郵件同步完成：掃描 ${result.messages_scanned} 封、辨識 ${result.transactions_recognized ?? 0} 筆、新增 ${result.transactions_imported} 筆消費${result.errors.length ? `；${result.errors.length} 封處理失敗` : ""}。`,
       );
     },
-    onError: (error) => setMessage(friendlySettingsMessage((error as Error).message, "郵件同步暫時未完成，系統會在下一次自動更新時重試。")),
+    onError: (error) => {
+      client.invalidateQueries({ queryKey: ["gmail-status"] });
+      setMessage(friendlySettingsMessage((error as Error).message, "郵件同步暫時未完成，系統會在下一次自動更新時重試。"));
+    },
   });
   const discoverGmailCards = useMutation({
     mutationFn: () => api<GmailCardDiscovery>("/email/gmail/discover", { method: "POST" }),
@@ -768,10 +775,13 @@ export default function SettingsPage() {
     if (!gmailResult) return;
     setMessage(
       gmailResult === "connected"
-        ? "Gmail 已安全連接。接著按一下自動偵測，就能完成信用卡設定。"
+        ? "Gmail 已安全連接，正在補抓尚未匯入的信用卡郵件。"
         : "Gmail 連接沒有完成，請再試一次。",
     );
-    if (gmailResult === "connected") setEmailSettingsOpen(true);
+    if (gmailResult === "connected") {
+      setEmailSettingsOpen(true);
+      syncGmail.mutate();
+    }
     window.history.replaceState({}, "", window.location.pathname);
     client.invalidateQueries({ queryKey: ["gmail-status"] });
   }, [client]);
@@ -1131,7 +1141,7 @@ export default function SettingsPage() {
         icon={<Mail size={18} />}
         title="信用卡自動記帳"
         description="自動匯入刷卡消費與帳單"
-        status={gmail.data?.connected ? "已連接" : "未連接"}
+        status={gmail.data?.reconnect_required ? "需要重新連接" : gmail.data?.connected ? "已連接" : "未連接"}
       >
       <Card className="settings-detail-card mt-6 p-6">
         <div className="flex flex-col justify-between gap-5 lg:flex-row lg:items-start">
@@ -1141,12 +1151,16 @@ export default function SettingsPage() {
               <div className="flex flex-wrap items-center gap-2">
                 <h2 className="font-bold text-ink">信用卡郵件自動記帳</h2>
                 <Badge tone={gmail.data?.connected ? "green" : "amber"}>
-                  {gmail.data?.connected ? "已連接" : "尚未連接 Gmail"}
+                  {gmail.data?.reconnect_required ? "授權已到期" : gmail.data?.connected ? "已連接" : "尚未連接 Gmail"}
                 </Badge>
                 {gmail.data?.connected && automationStatus.data?.enabled && <Badge tone="green">每小時同步</Badge>}
               </div>
               <p className="mt-1 truncate text-sm text-slate-500">
-                {gmail.data?.connected ? gmail.data.email || "Gmail" : "連接 Gmail 後自動辨識信用卡消費與帳單"}
+                {gmail.data?.reconnect_required
+                  ? `${gmail.data.email || "Gmail"} 需要重新授權`
+                  : gmail.data?.connected
+                    ? gmail.data.email || "Gmail"
+                    : "連接 Gmail 後自動辨識信用卡消費與帳單"}
               </p>
               <p className="mt-1 text-xs leading-5 text-slate-400">
                 唯讀取信；到期只在財務居記帳，不會向銀行發動付款。
@@ -1184,7 +1198,7 @@ export default function SettingsPage() {
                 onClick={() => authorizeGmail.mutate()}
                 disabled={authorizeGmail.isPending || !gmail.data?.configured}
               >
-                <Mail size={15} /> {authorizeGmail.isPending ? "正在前往 Google…" : "連接 Gmail"}
+                <Mail size={15} /> {authorizeGmail.isPending ? "正在前往 Google…" : gmail.data?.reconnect_required ? "重新連接 Gmail" : "連接 Gmail"}
               </Button>
             )}
           </div>
@@ -1193,6 +1207,12 @@ export default function SettingsPage() {
         {!gmail.isLoading && !gmail.data?.configured && (
           <p className="mt-5 rounded-xl bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-800">
             目前無法連接 Gmail，請稍後再試。
+          </p>
+        )}
+
+        {gmail.data?.reconnect_required && (
+          <p className="mt-5 rounded-xl bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-800">
+            Google 授權已到期。重新連接後，系統會自動補抓漏掉的信用卡郵件，不會重複建立既有交易。
           </p>
         )}
 
@@ -1220,7 +1240,9 @@ export default function SettingsPage() {
             </p>
           )}
           {gmail.data?.last_error && (
-            <p className="w-full text-xs leading-5 text-amber-700">最近一次同步遇到問題，系統會在下次更新時自動重試。</p>
+            <p className="w-full text-xs leading-5 text-amber-700">
+              {gmail.data.reconnect_required ? "需要重新連接 Gmail 才能繼續同步。" : "最近一次同步遇到問題，系統會在下次更新時自動重試。"}
+            </p>
           )}
         </div>
 

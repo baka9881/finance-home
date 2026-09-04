@@ -262,6 +262,42 @@ def test_sync_gmail_retries_failed_cathay_email_and_backfills_transactions(
     db.close()
 
 
+def test_expired_gmail_refresh_token_requires_reconnection(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    db = make_session()
+    db.add(AppSetting(key="gmail:refresh_token", value="encrypted-refresh-token"))
+    db.add(AppSetting(key="gmail:email", value="owner@example.com"))
+    db.commit()
+    monkeypatch.setenv("FINANCE_GOOGLE_CLIENT_ID", "client-id")
+    monkeypatch.setenv("FINANCE_GOOGLE_CLIENT_SECRET", "client-secret")
+    monkeypatch.setattr(email_sync_module, "decrypt_credential", lambda _value: "refresh-token")
+    monkeypatch.setattr(
+        email_sync_module.httpx,
+        "post",
+        lambda *args, **kwargs: SimpleNamespace(
+            status_code=400,
+            json=lambda: {
+                "error": "invalid_grant",
+                "error_description": "Token has been expired or revoked.",
+            },
+        ),
+    )
+
+    with pytest.raises(email_sync_module.GmailReconnectRequired, match="重新連接 Gmail"):
+        email_sync_module._gmail_access_token(db)
+
+    status = email_sync_module.gmail_status(db)
+    assert status["connected"] is False
+    assert status["reconnect_required"] is True
+    assert status["email"] == "owner@example.com"
+    assert status["last_error"] == "Gmail 授權已過期，請重新連接 Gmail"
+
+    with pytest.raises(email_sync_module.GmailReconnectRequired, match="重新連接 Gmail"):
+        email_sync_module._gmail_access_token(db)
+    db.close()
+
+
 def test_gmail_card_balance_uses_current_month_without_old_statements() -> None:
     db = make_session()
     payment = Account(

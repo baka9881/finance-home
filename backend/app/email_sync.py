@@ -53,6 +53,10 @@ GMAIL_API_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
 ZERO = Decimal("0")
 
 
+class GmailReconnectRequired(ValueError):
+    """Raised when Google has revoked or expired the stored refresh token."""
+
+
 GMAIL_CARD_PROVIDERS: tuple[dict[str, Any], ...] = (
     {
         "key": "cathay",
@@ -227,6 +231,7 @@ def frontend_settings_url() -> str:
 def gmail_status(db: Session) -> dict[str, Any]:
     client_id, client_secret = gmail_configuration()
     connected = bool(_setting(db, "gmail:refresh_token"))
+    reconnect_required = _setting(db, "gmail:reconnect_required") == "1"
     rules = db.scalars(
         select(EmailCardRule).where(EmailCardRule.active.is_(True)).order_by(EmailCardRule.id)
     ).all()
@@ -246,6 +251,7 @@ def gmail_status(db: Session) -> dict[str, Any]:
     return {
         "configured": bool(client_id and client_secret),
         "connected": connected,
+        "reconnect_required": reconnect_required,
         "email": _setting(db, "gmail:email"),
         "last_sync_at": _setting(db, "gmail:last_sync_at"),
         "last_error": _setting(db, "gmail:last_error"),
@@ -323,6 +329,7 @@ def complete_gmail_authorization(
     _set_setting(db, "gmail:email", str(profile.get("emailAddress") or ""))
     _delete_setting(db, "gmail:oauth_state")
     _delete_setting(db, "gmail:oauth_state_expires_at")
+    _delete_setting(db, "gmail:reconnect_required")
     _set_setting(db, "gmail:last_error", "")
     db.commit()
     return gmail_status(db)
@@ -335,6 +342,7 @@ def disconnect_gmail(db: Session) -> None:
         "gmail:last_sync_at",
         "gmail:last_error",
         "gmail:last_result",
+        "gmail:reconnect_required",
         "gmail:oauth_state",
         "gmail:oauth_state_expires_at",
     ):
@@ -345,6 +353,8 @@ def disconnect_gmail(db: Session) -> None:
 def _gmail_access_token(db: Session) -> str:
     encrypted = _setting(db, "gmail:refresh_token")
     if not encrypted:
+        if _setting(db, "gmail:reconnect_required") == "1":
+            raise GmailReconnectRequired("Gmail 授權已過期，請重新連接 Gmail")
         raise ValueError("Gmail 尚未連接")
     client_id, client_secret = gmail_configuration()
     if not client_id or not client_secret:
@@ -362,7 +372,15 @@ def _gmail_access_token(db: Session) -> str:
     )
     payload = response.json()
     if response.status_code >= 400:
-        raise ValueError(payload.get("error_description") or "Gmail 授權已失效，請重新連接")
+        error_code = str(payload.get("error") or "") if isinstance(payload, dict) else ""
+        error_description = str(payload.get("error_description") or "") if isinstance(payload, dict) else ""
+        if error_code == "invalid_grant" or re.search(r"expired|revoked", error_description, re.IGNORECASE):
+            _delete_setting(db, "gmail:refresh_token")
+            _set_setting(db, "gmail:reconnect_required", "1")
+            _set_setting(db, "gmail:last_error", "Gmail 授權已過期，請重新連接 Gmail")
+            db.commit()
+            raise GmailReconnectRequired("Gmail 授權已過期，請重新連接 Gmail")
+        raise ValueError(error_description or "Gmail 授權暫時無法使用，請稍後再試")
     return str(payload["access_token"])
 
 
