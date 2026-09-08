@@ -26,6 +26,7 @@ import {
   YAxis,
 } from "recharts";
 import { api } from "../api";
+import AttentionReminders from "../AttentionReminders";
 import { useOwnerFilter } from "../ownerFilter";
 import type { Dashboard } from "../types";
 import { Badge, Button, Card, EmptyState, PageHeader, money, number } from "../ui";
@@ -91,7 +92,7 @@ export default function DashboardPage() {
     );
   }
 
-  if (dashboard.isError || !dashboard.data) {
+  if (!dashboard.data) {
     return (
       <Card>
         <EmptyState
@@ -123,6 +124,8 @@ export default function DashboardPage() {
         }
       />
 
+      <AttentionReminders owner={ownerFilter} />
+      {dashboard.isError && <p role="alert" className="mb-4 text-sm text-amber-700">更新失敗，目前保留上次載入的數字。<Button onClick={() => dashboard.refetch()}>重試</Button></p>}
       {!hasData ? (
         <Card>
           <EmptyState
@@ -257,7 +260,7 @@ export default function DashboardPage() {
               <div className="flex flex-wrap items-start justify-between gap-4">
                 <div>
                   <h2 className="font-bold text-ink">資產走勢圖</h2>
-                  <p className="mt-1 text-xs text-slate-400">每次更新餘額或行情後，保留當日快照</p>
+                  <p className="mt-1 text-xs text-slate-400">每次更新餘額或行情後，保留當日資產紀錄</p>
                 </div>
                 <div className="flex flex-wrap gap-3 text-xs text-slate-500">
                   <span className="flex items-center gap-1.5"><i className="size-2 rounded-full bg-emerald-600" />總資產</span>

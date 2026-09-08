@@ -27,10 +27,10 @@ export class ApiError extends Error {
   }
 }
 
-export async function api<T>(
+async function apiResponse(
   path: string,
   options: RequestInit = {},
-): Promise<T> {
+): Promise<Response> {
   const headers = new Headers(options.headers);
   if (options.body && !(options.body instanceof FormData)) {
     headers.set("Content-Type", "application/json");
@@ -42,15 +42,24 @@ export async function api<T>(
     let message = `操作失敗（${response.status}）`;
     try {
       const payload = await response.json();
-      message = payload.detail || message;
+      message = typeof payload.detail === "string" ? payload.detail : Array.isArray(payload.detail)
+        ? "部分欄位格式不正確，請檢查日期、金額與必填欄位後重試。" : message;
     } catch {
       // Keep the generic message when the server did not return JSON.
     }
     if (response.status === 401 && path !== "/auth/login") clearAuthToken();
     throw new ApiError(response.status, message);
   }
-  if (response.status === 204) return undefined as T;
-  return response.json() as Promise<T>;
+  return response;
+}
+
+export async function api<T>(path: string, options: RequestInit = {}): Promise<T> {
+  const response = await apiResponse(path, options);
+  return response.status === 204 ? undefined as T : response.json() as Promise<T>;
+}
+
+export async function apiBlob(path: string): Promise<Blob> {
+  return (await apiResponse(path)).blob();
 }
 
 export function jsonBody(value: unknown): RequestInit {

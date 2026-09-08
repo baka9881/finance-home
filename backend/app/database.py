@@ -116,9 +116,25 @@ class Transaction(Base, TimestampMixin):
     fingerprint: Mapped[str] = mapped_column(String(64), index=True)
     source: Mapped[str] = mapped_column(String(20), default="manual")
     note: Mapped[str | None] = mapped_column(Text)
+    excluded: Mapped[bool] = mapped_column(Boolean, default=False)
+    revision: Mapped[int] = mapped_column(Integer, default=0)
+    original_date: Mapped[date | None] = mapped_column(Date)
+    original_amount: Mapped[Decimal | None] = mapped_column(Numeric(18, 4))
+    original_description: Mapped[str | None] = mapped_column(String(300))
 
     account: Mapped["Account"] = relationship(back_populates="transactions")
     category: Mapped["Category | None"] = relationship()
+
+
+class TransactionRevision(Base, TimestampMixin):
+    __tablename__ = "transaction_revisions"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    transaction_id: Mapped[int] = mapped_column(ForeignKey("transactions.id"), index=True)
+    action: Mapped[str] = mapped_column(String(20))
+    before_json: Mapped[str] = mapped_column(Text)
+    after_json: Mapped[str] = mapped_column(Text)
+    balance_note: Mapped[str] = mapped_column(Text)
 
 
 class ClassificationRule(Base, TimestampMixin):
@@ -131,6 +147,21 @@ class ClassificationRule(Base, TimestampMixin):
     priority: Mapped[int] = mapped_column(Integer, default=100)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)
 
+    category: Mapped["Category"] = relationship()
+
+
+class LearnedClassificationRule(Base, TimestampMixin):
+    __tablename__ = "learned_classification_rules"
+    __table_args__ = (UniqueConstraint("account_id", "keyword", name="uq_learned_account_keyword"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    keyword: Mapped[str] = mapped_column(String(300))
+    category_id: Mapped[int] = mapped_column(ForeignKey("categories.id"))
+    transaction_kind: Mapped[str] = mapped_column(String(20))
+    priority: Mapped[int] = mapped_column(Integer, default=10)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    account: Mapped["Account"] = relationship()
     category: Mapped["Category"] = relationship()
 
 
@@ -228,6 +259,7 @@ class RecurringExpense(Base, TimestampMixin):
 
     id: Mapped[int] = mapped_column(primary_key=True)
     name: Mapped[str] = mapped_column(String(100))
+    match_name: Mapped[str | None] = mapped_column(String(300))
     owner: Mapped[str] = mapped_column(String(20), default="me", index=True)
     amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
     due_day: Mapped[int | None] = mapped_column(Integer)

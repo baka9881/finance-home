@@ -228,6 +228,15 @@ def frontend_settings_url() -> str:
     return configured if configured.endswith("/settings") else f"{configured}/settings"
 
 
+def usable_email_rules(db: Session) -> list[EmailCardRule]:
+    """Archived accounts retain history, but must not receive automated writes."""
+    return list(db.scalars(select(EmailCardRule).where(
+        EmailCardRule.active.is_(True),
+        EmailCardRule.card_account.has(Account.archived.is_(False)),
+        EmailCardRule.payment_account.has(Account.archived.is_(False)),
+    ).order_by(EmailCardRule.id)).all())
+
+
 def gmail_status(db: Session) -> dict[str, Any]:
     client_id, client_secret = gmail_configuration()
     connected = bool(_setting(db, "gmail:refresh_token"))
@@ -248,6 +257,15 @@ def gmail_status(db: Session) -> dict[str, Any]:
         last_result = json.loads(raw_result) if raw_result else None
     except json.JSONDecodeError:
         last_result = None
+    issues = []
+    for record in db.scalars(select(EmailImportRecord).where(EmailImportRecord.status == "error")
+                             .order_by(EmailImportRecord.updated_at.desc()).limit(20)).all():
+        password_problem = bool(re.search(r"password|decrypt|encrypted|密碼", record.error or "", re.I))
+        issues.append({"id": record.id, "rule_id": record.rule_id,
+            "subject": record.subject or "信用卡郵件", "message_date": record.message_date,
+            "reason": "電子帳單需要正確的 PDF 密碼" if password_problem else "這封郵件尚未成功讀取",
+            "action": "password" if password_problem else "retry"})
+    latest_transaction = db.scalar(select(func.max(Transaction.transaction_date)).where(Transaction.source == "gmail"))
     return {
         "configured": bool(client_id and client_secret),
         "connected": connected,
@@ -256,8 +274,11 @@ def gmail_status(db: Session) -> dict[str, Any]:
         "last_sync_at": _setting(db, "gmail:last_sync_at"),
         "last_error": _setting(db, "gmail:last_error"),
         "last_result": last_result,
-        "active_rules": len(rules),
+        "active_rules": len(usable_email_rules(db)),
+        "paused_rules": sum(rule.card_account.archived or rule.payment_account.archived for rule in rules),
         "pending_bills": pending_bills,
+        "latest_transaction_date": latest_transaction.isoformat() if latest_transaction else None,
+        "issues": issues,
     }
 
 
@@ -789,7 +810,7 @@ def _create_card_transaction(
     fingerprint = transaction_fingerprint(account.id, transaction_date, amount, description)
     if db.scalar(select(Transaction).where(Transaction.fingerprint == fingerprint)):
         return False
-    category_id, classified_kind = classify_transaction(db, description, amount)
+    category_id, classified_kind = classify_transaction(db, description, amount, rule.card_account_id)
     kind = item.get("kind") or classified_kind
     rate, estimated = latest_fx_rate(db, account.currency, transaction_date)
     csv_copy = find_linked_csv_transaction_for_gmail(
@@ -801,6 +822,9 @@ def _create_card_transaction(
         description,
     )
     if csv_copy is not None:
+        if csv_copy.revision or csv_copy.excluded:
+            # A user-reviewed row retains its original import identity and decision.
+            return False
         detach_csv_balance_effect(db, rule.payment_account, csv_copy)
         csv_copy.account_id = account.id
         csv_copy.description = description
@@ -834,8 +858,9 @@ def _create_card_transaction(
     return True
 
 
-def _refresh_current_gmail_card_balance(
-    db: Session, rule: EmailCardRule, as_of: date | None = None
+def gmail_card_balance_value(
+    db: Session, rule: EmailCardRule, as_of: date | None = None,
+    replacement: tuple[int, dict[str, Any]] | None = None,
 ) -> Decimal | None:
     """Rebuild liability from unpaid statements plus the still-open billing cycle."""
     as_of = as_of or date.today()
@@ -869,13 +894,26 @@ def _refresh_current_gmail_card_balance(
             Transaction.source == "gmail",
         )
     ).all()
-    if not rows and not bills:
+    replaced_id, values = replacement if replacement else (None, {})
+    has_history = bool(rows or bills)
+    amounts = [decimal_value(item.amount) for item in rows if not item.excluded and item.id != replaced_id]
+    if replacement:
+        has_history = True
+        changed_date = date.fromisoformat(values["transaction_date"])
+        if not values["excluded"] and open_cycle_start <= changed_date <= as_of:
+            amounts.append(decimal_value(values["amount"]))
+    if not has_history:
         return None
+    return max(ZERO, unpaid_total + max(ZERO, -sum(amounts, ZERO)))
 
-    open_cycle_amount = max(
-        ZERO, -sum((decimal_value(item.amount) for item in rows), ZERO)
-    )
-    balance = max(ZERO, unpaid_total + open_cycle_amount)
+
+def _refresh_current_gmail_card_balance(
+    db: Session, rule: EmailCardRule, as_of: date | None = None
+) -> Decimal | None:
+    as_of = as_of or date.today()
+    balance = gmail_card_balance_value(db, rule, as_of)
+    if balance is None:
+        return None
     latest = get_latest_balance(db, rule.card_account_id)
     if (
         latest
@@ -1131,9 +1169,7 @@ def process_due_card_bills(db: Session, today: date | None = None) -> dict[str, 
 
 
 def sync_gmail(db: Session) -> dict[str, Any]:
-    rules = db.scalars(
-        select(EmailCardRule).where(EmailCardRule.active.is_(True)).order_by(EmailCardRule.id)
-    ).all()
+    rules = usable_email_rules(db)
     if not rules:
         result = {
             "messages_scanned": 0,
@@ -1342,6 +1378,7 @@ def serialize_email_rule(rule: EmailCardRule) -> dict[str, Any]:
         "payment_due_day": rule.payment_due_day,
         "auto_pay": rule.auto_pay,
         "active": rule.active,
+        "paused_reason": "帳戶已封存，恢復帳戶後才會繼續同步" if rule.card_account.archived or rule.payment_account.archived else None,
         "statement_password_configured": bool(rule.statement_password),
     }
 
@@ -1405,6 +1442,7 @@ def serialize_card_cycle(
             Transaction.transaction_date >= open_start,
             Transaction.transaction_date <= activity_end,
             Transaction.source == "gmail",
+            Transaction.excluded.is_(False),
         )
     ).all()
     open_amount = max(
@@ -1425,6 +1463,7 @@ def serialize_card_cycle(
     return {
         "rule_id": rule.id,
         "rule_name": rule.name,
+        "card_account_id": rule.card_account_id,
         "card_account_name": rule.card_account.name,
         "currency": rule.card_account.currency,
         "closing_day": rule.closing_day,

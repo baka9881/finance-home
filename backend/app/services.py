@@ -34,6 +34,7 @@ from .database import (
     Budget,
     Category,
     ClassificationRule,
+    LearnedClassificationRule,
     CreditCardBill,
     EmailCardRule,
     EmailImportRecord,
@@ -44,6 +45,7 @@ from .database import (
     PriceSnapshot,
     RecurringExpense,
     Transaction,
+    TransactionRevision,
     TransferLink,
     ValuationSnapshot,
     DATA_DIR,
@@ -291,8 +293,15 @@ def repair_linked_transfer_kinds(db: Session) -> dict[str, int]:
     return {"updated": updated}
 
 
-def classify_transaction(db: Session, description: str, amount: Decimal) -> tuple[int | None, str]:
+def classify_transaction(db: Session, description: str, amount: Decimal, account_id: int | None = None) -> tuple[int | None, str]:
     normalized_description = unicodedata.normalize("NFKC", description).casefold()
+    if account_id is not None:
+        for learned in db.scalars(select(LearnedClassificationRule).where(
+            LearnedClassificationRule.account_id == account_id,
+            LearnedClassificationRule.enabled.is_(True),
+        ).order_by(LearnedClassificationRule.priority, LearnedClassificationRule.id.desc())).all():
+            if unicodedata.normalize("NFKC", learned.keyword).casefold() == normalized_description and learned.transaction_kind == ("income" if amount > 0 else "expense"):
+                return learned.category_id, learned.transaction_kind
     rules = db.scalars(
         select(ClassificationRule)
         .where(ClassificationRule.enabled.is_(True))
@@ -311,25 +320,28 @@ def classify_transaction(db: Session, description: str, amount: Decimal) -> tupl
     return (fallback.id if fallback else None), category_kind
 
 
-def reclassify_uncategorized_transactions(db: Session, owner: str = "all") -> dict[str, int]:
+def reclassify_uncategorized_transactions(db: Session, owner: str = "all", transaction_ids: set[int] | None = None) -> dict[str, int]:
     uncategorized = db.scalar(select(Category).where(Category.name == "未分類"))
     if not uncategorized:
         return {"updated": 0, "remaining": 0}
 
     linked_ids = linked_transfer_transaction_ids(db)
     query = select(Transaction).where(
+        Transaction.excluded.is_(False),
         or_(Transaction.category_id.is_(None), Transaction.category_id == uncategorized.id),
         Transaction.transaction_kind.notin_(["transfer", "investment", "debt_principal"]),
     )
     if linked_ids:
         query = query.where(Transaction.id.notin_(linked_ids))
+    if transaction_ids is not None:
+        query = query.where(Transaction.id.in_(transaction_ids))
     if owner != "all":
         query = query.join(Account).where(Account.owner == owner)
 
     rows = db.scalars(query).all()
     updated = 0
     for row in rows:
-        category_id, kind = classify_transaction(db, row.description, decimal_value(row.amount))
+        category_id, kind = classify_transaction(db, row.description, decimal_value(row.amount), row.account_id)
         if category_id and category_id != uncategorized.id:
             row.category_id = category_id
             row.transaction_kind = kind
@@ -339,11 +351,14 @@ def reclassify_uncategorized_transactions(db: Session, owner: str = "all") -> di
         db.commit()
 
     remaining_query = select(func.count(Transaction.id)).where(
+        Transaction.excluded.is_(False),
         or_(Transaction.category_id.is_(None), Transaction.category_id == uncategorized.id),
         Transaction.transaction_kind.notin_(["transfer", "investment", "debt_principal"]),
     )
     if linked_ids:
         remaining_query = remaining_query.where(Transaction.id.notin_(linked_ids))
+    if transaction_ids is not None:
+        remaining_query = remaining_query.where(Transaction.id.in_(transaction_ids))
     if owner != "all":
         remaining_query = remaining_query.join(Account).where(Account.owner == owner)
     remaining = int(db.scalar(remaining_query) or 0)
@@ -539,6 +554,12 @@ def account_summary(db: Session, account: Account) -> dict[str, Any]:
         "auto_balance_base_twd": float(auto_base_twd) if auto_base_twd is not None else None,
         "valuation_mode": valuation_mode,
         "archived": account.archived,
+        "linked_email_rules": [
+            rule.name for rule in db.scalars(select(EmailCardRule).where(
+                EmailCardRule.active.is_(True),
+                or_(EmailCardRule.card_account_id == account.id, EmailCardRule.payment_account_id == account.id),
+            )).all()
+        ],
         "note": account.note,
         "balance": float(decimal_value(latest.amount)) if latest else 0,
         "balance_twd": float(cash_twd),
@@ -585,6 +606,7 @@ def calculate_dashboard(db: Session, owner: str = "all") -> dict[str, Any]:
     today = date.today()
     month_start = today.replace(day=1)
     transaction_query = select(Transaction).join(Account).where(
+        Transaction.excluded.is_(False),
         Transaction.transaction_date >= month_start
     )
     if owner != "all":
@@ -618,14 +640,16 @@ def calculate_dashboard(db: Session, owner: str = "all") -> dict[str, Any]:
             allocation[item["account_type"]] += Decimal(str(item["total_twd"]))
 
     category_query = (
-        select(Category.name, Category.color, func.sum(func.abs(Transaction.base_amount)))
-        .join(Transaction, Transaction.category_id == Category.id)
+        select(func.coalesce(Category.name, "未分類"), func.coalesce(Category.color, "#94a3b8"), func.sum(func.abs(Transaction.base_amount)))
+        .select_from(Transaction)
+        .outerjoin(Category, Transaction.category_id == Category.id)
         .join(Account, Transaction.account_id == Account.id)
         .where(
+            Transaction.excluded.is_(False),
             Transaction.transaction_date >= month_start,
             Transaction.transaction_kind.in_(["expense", "interest"]),
         )
-        .group_by(Category.id)
+        .group_by(Category.id, Category.name, Category.color)
         .order_by(func.sum(func.abs(Transaction.base_amount)).desc())
     )
     if linked_ids:
@@ -645,6 +669,7 @@ def calculate_dashboard(db: Session, owner: str = "all") -> dict[str, Any]:
             else date(year, month_number + 1, 1)
         )
         month_query = select(Transaction).join(Account).where(
+        Transaction.excluded.is_(False),
             Transaction.transaction_date >= start, Transaction.transaction_date < end
         )
         if owner != "all":
@@ -914,6 +939,7 @@ def calculate_spending_analysis(
     month_end = _shift_month_start(month_start, 1)
 
     month_query = select(Transaction).join(Account).where(
+        Transaction.excluded.is_(False),
         Transaction.transaction_date >= month_start,
         Transaction.transaction_date < month_end,
         Transaction.base_amount < 0,
@@ -937,6 +963,7 @@ def calculate_spending_analysis(
 
     history_start = _shift_month_start(month_start, -5)
     recurring_query = select(Transaction).join(Account).where(
+        Transaction.excluded.is_(False),
         Transaction.transaction_date >= history_start,
         Transaction.transaction_date < month_end,
         Transaction.base_amount < 0,
@@ -1023,7 +1050,7 @@ def calculate_spending_analysis(
             }
         )
 
-    custom_query = select(RecurringExpense).where(RecurringExpense.active.is_(True))
+    custom_query = select(RecurringExpense)
     if owner != "all":
         custom_query = custom_query.where(RecurringExpense.owner == owner)
     custom_rows = db.scalars(custom_query.order_by(RecurringExpense.id)).all()
@@ -1040,7 +1067,7 @@ def calculate_spending_analysis(
     ]
 
     custom_keys = {
-        (row.account_id, recurring_expense_signature(row.name))
+        (row.account_id, recurring_expense_signature(row.match_name or row.name))
         for row in custom_rows
     }
     recurring_expenses = [
@@ -1053,7 +1080,9 @@ def calculate_spending_analysis(
     ]
 
     for row in custom_rows:
-        normalized_name = recurring_expense_signature(row.name)
+        if not row.active:
+            continue
+        normalized_name = recurring_expense_signature(row.match_name or row.name)
         matching_rows = [
             transaction
             for transaction in month_rows
@@ -1082,6 +1111,8 @@ def calculate_spending_analysis(
                 ),
                 "status": "recorded" if current_amount > 0 else "expected",
                 "source": "custom",
+                "match_name": row.match_name,
+                "confirmed": bool(row.match_name),
                 "due_day": row.due_day,
                 "note": row.note,
             }
@@ -1140,6 +1171,7 @@ def calculate_health_score(db: Session, owner: str = "all") -> dict[str, Any]:
     end = date.today()
     start = end - timedelta(days=90)
     transaction_query = select(Transaction).join(Account).where(
+        Transaction.excluded.is_(False),
         Transaction.transaction_date >= start
     )
     if owner != "all":
@@ -1197,6 +1229,7 @@ def calculate_health_score(db: Session, owner: str = "all") -> dict[str, Any]:
     )
     current_start = end.replace(day=1)
     current_transaction_query = select(Transaction).join(Account).where(
+        Transaction.excluded.is_(False),
         Transaction.transaction_date >= current_start
     )
     if owner != "all":
@@ -1359,6 +1392,7 @@ def _pending_csv_balance_transactions(db: Session, account: Account) -> list[Tra
             select(Transaction).where(
                 Transaction.account_id == account.id,
                 Transaction.source == "csv",
+                Transaction.excluded.is_(False),
             )
         ).all()
         if transaction.id not in applied_ids
@@ -1393,7 +1427,7 @@ def _pick_cross_source_duplicate(
     exact = [
         candidate
         for candidate in candidates
-        if _normalized_duplicate_description(candidate.description) == normalized
+        if _normalized_duplicate_description(candidate.original_description or candidate.description) == normalized
     ]
     return exact[0] if len(exact) == 1 else None
 
@@ -1420,8 +1454,8 @@ def find_linked_gmail_transaction_for_csv(
     candidates = db.scalars(
         select(Transaction).where(
             Transaction.account_id.in_(card_account_ids),
-            Transaction.transaction_date == transaction_date,
-            Transaction.amount == amount,
+            func.coalesce(Transaction.original_date, Transaction.transaction_date) == transaction_date,
+            func.coalesce(Transaction.original_amount, Transaction.amount) == amount,
             Transaction.currency == currency,
             Transaction.source == "gmail",
             Transaction.transaction_kind != "transfer",
@@ -1442,8 +1476,8 @@ def find_linked_csv_transaction_for_gmail(
     candidates = db.scalars(
         select(Transaction).where(
             Transaction.account_id == rule.payment_account_id,
-            Transaction.transaction_date == transaction_date,
-            Transaction.amount == amount,
+            func.coalesce(Transaction.original_date, Transaction.transaction_date) == transaction_date,
+            func.coalesce(Transaction.original_amount, Transaction.amount) == amount,
             Transaction.currency == currency,
             Transaction.source == "csv",
             Transaction.transaction_kind != "transfer",
@@ -1612,6 +1646,8 @@ def repair_cross_source_card_duplicates(db: Session) -> dict[str, Any]:
             duplicates_by_id[row.id] = row
 
     for csv_row in duplicates_by_id.values():
+        if csv_row.revision or csv_row.excluded:
+            continue
         account = csv_row.account
         if detach_csv_balance_effect(db, account, csv_row):
             corrected_accounts.add(account.id)
@@ -1744,7 +1780,7 @@ def import_csv(
                 else account.currency
             )
             rate, estimated = latest_fx_rate(db, currency, tx_date)
-            category_id, kind = classify_transaction(db, description, amount)
+            category_id, kind = classify_transaction(db, description, amount, account.id)
             fingerprint = transaction_fingerprint(account.id, tx_date, amount, description)
             existing_transaction = existing_by_fingerprint.get(fingerprint)
             if existing_transaction is None:
@@ -1805,7 +1841,7 @@ def import_csv(
                 db.add(existing_transaction)
                 existing_by_fingerprint[fingerprint] = existing_transaction
                 imported += 1
-            if commit and existing_transaction and existing_transaction.source == "csv":
+            if commit and existing_transaction and existing_transaction.source == "csv" and not existing_transaction.excluded:
                 balance_candidates[fingerprint] = existing_transaction
             if mapping.get("balance") and str(row[mapping["balance"]]).strip():
                 balance = parse_number(row[mapping["balance"]])
@@ -3548,6 +3584,7 @@ BACKUP_MODELS = [
     BalanceSnapshot,
     Transaction,
     ClassificationRule,
+    LearnedClassificationRule,
     TransferLink,
     EmailImportRecord,
     CreditCardBill,

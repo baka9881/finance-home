@@ -31,20 +31,21 @@ import {
   YAxis,
 } from "recharts";
 import { api } from "../api";
+import { invalidateFinanceData } from "../appQueries";
 import { taipeiMonthInputValue } from "../date";
 import { ownerFilterLabels, useOwnerFilter } from "../ownerFilter";
-import type { Account, Category, Dashboard, HealthScore, IgnoredRecurringExpense, SpendingAnalysis } from "../types";
+import type { Account, Category, Dashboard, HealthScore, IgnoredRecurringExpense, RecurringExpenseDefinition, SpendingAnalysis } from "../types";
 import { Badge, Button, Card, Dialog, EmptyState, Field, FormStep, Input, MonthInput, PageHeader, Select, Skeleton, money, number } from "../ui";
 
 const recurringPresets = ["房貸", "車貸", "信貸", "學貸", "房租", "保險", "健身房月費", "手機費", "網路費", "訂閱服務"];
 const recurringOwnerOptions = [
   { value: "me", label: "我" },
   { value: "partner", label: "小居" },
-  { value: "shared", label: "共同" },
 ];
 
 interface RecurringDraft {
   name: string;
+  match_name: string;
   amount: string;
   due_day: string;
   account_id: string;
@@ -56,6 +57,7 @@ interface RecurringDraft {
 function emptyRecurringDraft(ownerFilter: string): RecurringDraft {
   return {
     name: "",
+    match_name: "",
     amount: "",
     due_day: "",
     account_id: "",
@@ -132,6 +134,14 @@ export default function AnalysisPage() {
     queryKey: ["ignored-recurring-expenses", ownerFilter],
     queryFn: () => api<IgnoredRecurringExpense[]>(`/recurring-expenses/ignored?owner=${ownerFilter}`),
   });
+  const recurringDefinitions = useQuery({
+    queryKey: ["recurring-expenses", ownerFilter, "including-inactive"],
+    queryFn: () => api<RecurringExpenseDefinition[]>(`/recurring-expenses?owner=${ownerFilter}&include_inactive=true`),
+  });
+  const resumeRecurring = useMutation({
+    mutationFn: (id: number) => api(`/recurring-expenses/${id}`, { method: "PATCH", body: JSON.stringify({ active: true }) }),
+    onSuccess: () => invalidateFinanceData(client),
+  });
 
   const saveRecurring = useMutation({
     mutationFn: (payload: Record<string, unknown>) =>
@@ -145,7 +155,7 @@ export default function AnalysisPage() {
         },
       ),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["spending-analysis"] });
+      invalidateFinanceData(client, ["spending-analysis"]);
       setRecurringOpen(false);
       setEditingRecurringId(null);
       setRecurringDraft(emptyRecurringDraft(ownerFilter));
@@ -154,7 +164,7 @@ export default function AnalysisPage() {
 
   const deleteRecurring = useMutation({
     mutationFn: (id: number) => api(`/recurring-expenses/${id}`, { method: "DELETE" }),
-    onSuccess: () => client.invalidateQueries({ queryKey: ["spending-analysis"] }),
+    onSuccess: () => invalidateFinanceData(client, ["spending-analysis"]),
   });
 
   const ignoreDetectedRecurring = useMutation({
@@ -164,16 +174,14 @@ export default function AnalysisPage() {
         body: JSON.stringify({ account_id: item.account_id, name: item.name }),
       }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["spending-analysis"] });
-      client.invalidateQueries({ queryKey: ["ignored-recurring-expenses"] });
+      invalidateFinanceData(client, ["spending-analysis","ignored-recurring-expenses"]);
     },
   });
 
   const restoreIgnoredRecurring = useMutation({
     mutationFn: (id: number) => api(`/recurring-expenses/ignored/${id}`, { method: "DELETE" }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["spending-analysis"] });
-      client.invalidateQueries({ queryKey: ["ignored-recurring-expenses"] });
+      invalidateFinanceData(client, ["spending-analysis","ignored-recurring-expenses"]);
     },
   });
 
@@ -185,15 +193,15 @@ export default function AnalysisPage() {
   }
 
   function openEditRecurring(item: SpendingAnalysis["recurring_expenses"][number]) {
-    if (!item.id || item.source !== "custom") return;
-    setEditingRecurringId(item.id);
+    setEditingRecurringId(item.source === "custom" ? item.id : null);
     setRecurringDraft({
       name: item.name,
+      match_name: item.source === "detected" ? item.name : item.match_name || "",
       amount: String(item.average_amount),
       due_day: item.due_day ? String(item.due_day) : "",
       account_id: item.account_id ? String(item.account_id) : "",
-      category_id: item.category_id ? String(item.category_id) : "",
-      owner: item.owner || "me",
+      category_id: item.category_id ? String(item.category_id) : String(categories.data?.find((category) => category.name === item.category_name)?.id || ""),
+      owner: item.owner || accounts.data?.find((account) => account.id === item.account_id)?.owner || "me",
       note: item.note || "",
     });
     saveRecurring.reset();
@@ -204,6 +212,7 @@ export default function AnalysisPage() {
     event.preventDefault();
     saveRecurring.mutate({
       name: recurringDraft.name.trim(),
+      match_name: recurringDraft.match_name || null,
       amount: Number(recurringDraft.amount),
       due_day: recurringDraft.due_day ? Number(recurringDraft.due_day) : null,
       account_id: recurringDraft.account_id ? Number(recurringDraft.account_id) : null,
@@ -233,7 +242,7 @@ export default function AnalysisPage() {
   const recurringExpenses = spending.data?.recurring_expenses || [];
   const monthLabel = displayMonth(selectedMonth);
   const primaryLoading = health.isLoading || dashboard.isLoading;
-  const primaryError = health.isError || dashboard.isError;
+  const primaryError = (health.isError && !health.data) || (dashboard.isError && !dashboard.data);
 
   return (
     <>
@@ -243,6 +252,9 @@ export default function AnalysisPage() {
         description="用透明公式檢視現金流、預備金、負債與預算執行情況。"
       />
 
+      {!primaryError && (health.isError || dashboard.isError) && <p role="alert" className="mb-4 text-amber-800">更新失敗，目前保留上次的分析。<Button onClick={() => { health.refetch(); dashboard.refetch(); }}>重試</Button></p>}
+      {spending.isError && spending.data && <p role="alert" className="mb-4 text-amber-800">消費資料更新失敗，目前保留上次結果。<Button onClick={() => spending.refetch()}>重試</Button></p>}
+      {(deleteRecurring.isError || ignoreDetectedRecurring.isError) && <p role="alert" className="mb-4 text-red-700">固定花費尚未移除，請重試。{deleteRecurring.error?.message || ignoreDetectedRecurring.error?.message}</p>}
       {primaryError ? (
         <Card>
           <EmptyState
@@ -325,12 +337,12 @@ export default function AnalysisPage() {
                   <p className="text-xs text-slate-400">當月總支出</p>
                   {spending.isPending
                     ? <Skeleton className="mt-1 h-6 w-24 sm:ml-auto" />
-                    : <p className="mt-0.5 text-xl font-bold text-slate-800">{money(totalExpense)}</p>}
+                    : <p className="mt-0.5 text-xl font-bold text-slate-800">{spending.data ? money(totalExpense) : "—"}</p>}
                 </div>
               </div>
             </div>
 
-            {spending.isError ? (
+            {spending.isError && !spending.data ? (
               <div className="mt-6 rounded-2xl border border-amber-200 bg-amber-50 p-5 text-center">
                 <p className="text-sm font-semibold text-amber-900">這個月份的消費資料載入失敗</p>
                 <p className="mt-1 text-xs text-amber-700">目前不會顯示 NT$0，以免誤以為沒有消費。</p>
@@ -413,7 +425,7 @@ export default function AnalysisPage() {
               </div>
               <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
                 <Button variant="secondary" onClick={() => setIgnoredRecurringOpen(true)}>
-                  <EyeOff size={16} /> 已忽略項目
+                  <EyeOff size={16} /> 已忽略／停用
                   {ignoredRecurring.data?.length ? ` ${ignoredRecurring.data.length}` : ""}
                 </Button>
                 <Button variant="secondary" onClick={openNewRecurring}>
@@ -421,12 +433,12 @@ export default function AnalysisPage() {
                 </Button>
                 <div className="rounded-xl bg-slate-50 px-4 py-3 sm:text-right">
                   <p className="text-xs text-slate-400">預估每月固定支出</p>
-                  <p className="mt-0.5 text-xl font-bold text-slate-800">{money(spending.data?.estimated_recurring_total || 0)}</p>
+                  <p className="mt-0.5 text-xl font-bold text-slate-800">{spending.data ? money(spending.data.estimated_recurring_total || 0) : "—"}</p>
                 </div>
               </div>
             </div>
 
-            {spending.isError ? (
+            {spending.isError && !spending.data ? (
               <div className="mt-5 rounded-2xl bg-slate-50 p-5 text-center text-sm text-slate-500">固定花費暫時無法載入，請先重新載入上方的消費資料。</div>
             ) : spending.isPending ? (
               <div className="mt-5 h-36 animate-pulse rounded-2xl bg-slate-100" />
@@ -449,7 +461,7 @@ export default function AnalysisPage() {
                             </p>
                             <Badge>{item.category_name}</Badge>
                             <Badge tone={item.source === "custom" ? "blue" : "slate"}>
-                              {item.source === "custom" ? "自行設定" : "自動辨識"}
+                              {item.confirmed ? "已確認固定花費" : item.source === "custom" ? "自行設定" : "待確認"}
                             </Badge>
                             <Badge tone={item.status === "recorded" ? "green" : "amber"}>
                               {item.status === "recorded" ? "當月已發生" : "當月尚未出現"}
@@ -489,9 +501,9 @@ export default function AnalysisPage() {
                             <button
                               type="button"
                               className="rounded-lg p-2 text-slate-400 hover:bg-red-50 hover:text-red-600"
-                              aria-label={`刪除${item.name}`}
+                              aria-label={`停用${item.name}`}
                               onClick={() => {
-                                if (window.confirm(`確定刪除「${item.name}」固定花費？`)) {
+                                if (window.confirm(`停用「${item.name}」固定花費？不會刪除交易，之後可以恢復。`)) {
                                   deleteRecurring.mutate(item.id as number);
                                 }
                               }}
@@ -501,6 +513,7 @@ export default function AnalysisPage() {
                           </div>
                         ) : item.source === "detected" && item.account_id ? (
                           <div className="flex justify-end sm:mt-2">
+                            <Button variant="ghost" className="h-9 px-2 text-xs" onClick={() => openEditRecurring(item)}>確認／改名</Button>
                             <button
                               type="button"
                               className="rounded-lg p-2 text-slate-400 hover:bg-red-50 hover:text-red-600"
@@ -530,16 +543,22 @@ export default function AnalysisPage() {
               />
             )}
             <p className="mt-4 text-xs leading-5 text-slate-400">
-              自訂項目只用於每月預估與提醒，不會直接扣除帳戶餘額；實際交易匯入後會標記為「當月已發生」。已知訂閱近三個月出現兩次即可辨識；月費與貸款需連續出現兩個月，其他帳單需連續三個月，且扣款日與金額穩定。自動辨識項目漏抓一期時仍會保留，避免換月就消失。購物、餐飲、超商與車票不會自動列為固定花費。移除自動辨識項目只會隱藏固定花費，不會刪除原始交易。
+              固定花費僅供每月預估，不會直接扣款。確認後會持續保留；實際消費匯入時標示「當月已發生」。停用或忽略不會刪除交易。
             </p>
           </Card>
 
           <Dialog
             open={ignoredRecurringOpen}
             onClose={() => setIgnoredRecurringOpen(false)}
-            title="已忽略的固定花費"
-            description="恢復後，只要交易仍符合重複條件，就會重新出現在每月固定花費。"
+            title="已忽略或停用的固定花費"
+            description="已確認項目恢復後會持續顯示；自動辨識項目恢復後會重新依交易判斷。"
           >
+            {recurringDefinitions.data?.filter((item) => !item.active).map((item) => (
+              <div key={item.id} className="mb-3 flex items-center justify-between gap-3 rounded-xl border border-slate-200 p-3"><span>{item.name} · 已停用</span><Button variant="secondary" disabled={resumeRecurring.isPending} onClick={() => resumeRecurring.mutate(item.id)}>恢復固定花費</Button></div>
+            ))}
+            {recurringDefinitions.isError && <p role="alert" className="text-sm text-red-700">停用項目載入失敗<Button onClick={() => recurringDefinitions.refetch()}>重試</Button></p>}
+            {restoreIgnoredRecurring.isError && <p role="alert" className="text-sm text-red-700">{restoreIgnoredRecurring.error.message}</p>}
+            {resumeRecurring.isError && <p role="alert" className="text-sm text-red-600">{resumeRecurring.error.message}</p>}
             {ignoredRecurring.isPending ? (
               <div className="space-y-3">
                 <Skeleton className="h-20 w-full rounded-2xl" />
@@ -570,7 +589,7 @@ export default function AnalysisPage() {
                   </div>
                 ))}
               </div>
-            ) : (
+            ) : recurringDefinitions.data?.some((item) => !item.active) ? null : (
               <EmptyState
                 icon={<EyeOff size={24} />}
                 title="沒有已忽略項目"
@@ -582,7 +601,7 @@ export default function AnalysisPage() {
           <Dialog
             open={recurringOpen}
             onClose={() => setRecurringOpen(false)}
-            title={editingRecurringId ? "編輯固定花費" : "新增固定花費"}
+            title={editingRecurringId ? "編輯固定花費" : recurringDraft.match_name ? "確認固定花費" : "新增固定花費"}
             description="設定每月通常會發生的支出；這裡不會直接建立交易或扣款。"
           >
             <form className="space-y-5" onSubmit={submitRecurring}>
@@ -597,7 +616,7 @@ export default function AnalysisPage() {
                       {recurringPresets.map((preset) => <option key={preset}>{preset}</option>)}
                     </Select>
                   </Field>
-                  <Field label="顯示名稱">
+                  <Field label="顯示名稱" hint={recurringDraft.match_name ? `原始商家：${recurringDraft.match_name}；改名後仍會比對原始交易。` : undefined}>
                     <Input
                       value={recurringDraft.name}
                       onChange={(event) => setRecurringDraft((draft) => ({ ...draft, name: event.target.value }))}
@@ -682,7 +701,7 @@ export default function AnalysisPage() {
               <div className="mobile-safe-actions sticky bottom-0 -mx-4 flex justify-end gap-2 border-t border-slate-100 bg-white/95 px-4 py-3 backdrop-blur sm:static sm:mx-0 sm:border-0 sm:bg-transparent sm:p-0">
                 <Button type="button" variant="ghost" onClick={() => setRecurringOpen(false)}>取消</Button>
                 <Button type="submit" disabled={saveRecurring.isPending}>
-                  {saveRecurring.isPending ? "儲存中…" : editingRecurringId ? "儲存修改" : "建立固定花費"}
+                  {saveRecurring.isPending ? "儲存中…" : editingRecurringId ? "儲存修改" : recurringDraft.match_name ? "確認並持續追蹤" : "建立固定花費"}
                 </Button>
               </div>
             </form>

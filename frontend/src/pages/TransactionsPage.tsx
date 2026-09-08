@@ -1,4 +1,4 @@
-import { FormEvent, type ReactNode, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, type ReactNode, type SetStateAction, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
@@ -7,6 +7,8 @@ import {
   ArrowUpRight,
   Check,
   ChevronDown,
+  ChevronLeft,
+  ChevronRight,
   CircleAlert,
   FileSpreadsheet,
   Landmark,
@@ -19,9 +21,16 @@ import {
   Upload,
 } from "lucide-react";
 import { api } from "../api";
+import TransactionCategory from "../TransactionCategory";
+import TransactionCorrection from "../TransactionCorrection";
+import BatchClassification from "../BatchClassification";
+import { useTransactionScroll } from "../useTransactionScroll";
+import QuickTransactionForm, { clearQuickDraft, rememberTransactionAccount } from "../QuickTransactionForm";
+import { invalidateFinanceData } from "../appQueries";
+import { readTransactionFilters, saveTransactionFilters, transactionFilterParams, transactionSourceLabel, type TransactionFilters } from "../transactionFilters";
 import { taipeiDateInputValue, taipeiMonthInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
-import type { Account, Category, CsvInspection, Transaction } from "../types";
+import type { Account, Category, CsvInspection, Transaction, TransactionPage } from "../types";
 import {
   Badge,
   Button,
@@ -130,12 +139,40 @@ export default function TransactionsPage() {
   const client = useQueryClient();
   const navigate = useNavigate();
   const [searchParams, setSearchParams] = useSearchParams();
-  const [month, setMonth] = useState(currentMonth);
+  const [filters, setFilters] = useState(() => readTransactionFilters(searchParams));
+  const lastFilterUrl = useRef(searchParams.toString());
+  useEffect(() => {
+    const url = searchParams.toString();
+    if (url !== lastFilterUrl.current) {
+      lastFilterUrl.current = url;
+      const next = readTransactionFilters(searchParams);
+      setFilters(previous => JSON.stringify(previous) === JSON.stringify(next) ? previous : next);
+      return;
+    }
+    const next = transactionFilterParams(filters, searchParams);
+    if (next.toString() !== url) {
+      lastFilterUrl.current = next.toString();
+      setSearchParams(next, { replace: true });
+    }
+  }, [filters, searchParams, setSearchParams]);
+  const { month, account: accountFilter, search, onlyUnclassified, showTransfers, page, excluded } = filters;
+  function updateFilter<K extends keyof TransactionFilters>(key: K, next: SetStateAction<TransactionFilters[K]>) {
+    setFilters((previous) => ({ ...previous, page: 1, [key]: typeof next === "function" ? (next as (value: TransactionFilters[K]) => TransactionFilters[K])(previous[key]) : next }));
+  }
+  const setMonth = (value: string) => updateFilter("month", value);
+  const setAccountFilter = (value: string) => updateFilter("account", value);
+  const setSearch = (value: string) => updateFilter("search", value);
+  const setOnlyUnclassified = (value: SetStateAction<boolean>) => updateFilter("onlyUnclassified", value);
+  const setShowTransfers = (value: SetStateAction<boolean>) => updateFilter("showTransfers", value);
+  function shiftMonth(delta: number) {
+    const [year, value] = (month || currentMonth).split("-").map(Number);
+    const shifted = new Date(year, value - 1 + delta, 1);
+    setMonth(`${shifted.getFullYear()}-${String(shifted.getMonth() + 1).padStart(2, "0")}`);
+  }
+  const [searchQuery, setSearchQuery] = useState(search);
+  useEffect(() => { saveTransactionFilters(filters); }, [filters]);
+  useEffect(() => { const timer = setTimeout(() => setSearchQuery(search), 250); return () => clearTimeout(timer); }, [search]);
   const [ownerFilter] = useOwnerFilter();
-  const [accountFilter, setAccountFilter] = useState("");
-  const [search, setSearch] = useState("");
-  const [onlyUnclassified, setOnlyUnclassified] = useState(false);
-  const [showTransfers, setShowTransfers] = useState(false);
   const [manualOpen, setManualOpen] = useState(false);
   const [manualScenario, setManualScenario] = useState<ManualScenario | null>(null);
   const [manualKind, setManualKind] = useState("expense");
@@ -151,6 +188,11 @@ export default function TransactionsPage() {
   const [importResult, setImportResult] = useState<Record<string, unknown> | null>(null);
   const [advancedMappingOpen, setAdvancedMappingOpen] = useState(false);
   const [classificationMessage, setClassificationMessage] = useState("");
+  const [correcting, setCorrecting] = useState<Transaction | null>(null);
+  const [batchMode, setBatchMode] = useState(false);
+  const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  useEffect(() => { setSelectedIds([]); }, [month, accountFilter, ownerFilter, searchQuery, page, excluded]);
+  const toggleSelected = (id: number) => setSelectedIds((ids) => ids.includes(id) ? ids.filter((value) => value !== id) : [...ids, id]);
   const [manualStep, setManualStep] = useState(1);
   const [accountTransferStep, setAccountTransferStep] = useState(1);
   const manualFormRef = useRef<HTMLFormElement>(null);
@@ -183,11 +225,15 @@ export default function TransactionsPage() {
     queryFn: () => api<Account[]>(`/accounts?owner=${ownerFilter}`),
   });
   const categories = useQuery({ queryKey: ["categories"], queryFn: () => api<Category[]>("/categories") });
+  const filterAccounts = useQuery({
+    queryKey: ["accounts", ownerFilter, "including-archived"],
+    queryFn: () => api<Account[]>(`/accounts?owner=${ownerFilter}&include_archived=true`),
+  });
   const transactions = useQuery({
-    queryKey: ["transactions", month, accountFilter, ownerFilter],
+    queryKey: ["transactions", "page", month, accountFilter, ownerFilter, searchQuery, showTransfers, onlyUnclassified, page, excluded],
     queryFn: () =>
-      api<Transaction[]>(
-        `/transactions?month=${month}&owner=${ownerFilter}${accountFilter ? `&account_id=${accountFilter}` : ""}`,
+      api<TransactionPage>(
+        `/transactions/page?month=${month}&owner=${ownerFilter}&search=${encodeURIComponent(searchQuery)}&page=${page}&show_transfers=${showTransfers}&only_unclassified=${onlyUnclassified}&excluded=${excluded}${accountFilter ? `&account_id=${accountFilter}` : ""}`,
       ),
   });
   const pendingCsvBalances = useQuery({
@@ -210,49 +256,28 @@ export default function TransactionsPage() {
   );
   const accountFilterOptions = useMemo(
     () =>
-      (accounts.data || []).filter(
+      (filterAccounts.data || []).filter(
         (account) => ownerFilter === "all" || account.owner === ownerFilter,
       ),
-    [accounts.data, ownerFilter],
+    [filterAccounts.data, ownerFilter],
   );
   useEffect(() => {
-    if (!accountFilter) return;
+    if (!accountFilter || !filterAccounts.data) return;
     if (!accountFilterOptions.some((account) => String(account.id) === accountFilter)) {
       setAccountFilter("");
     }
-  }, [accountFilter, accountFilterOptions]);
+  }, [accountFilter, accountFilterOptions, filterAccounts.data]);
   const paymentAccountOptions = useMemo(
     () => (accounts.data || []).filter((account) => account.nature === "asset"),
     [accounts.data],
   );
   const loanAccountOptions = useMemo(
-    () => (accounts.data || []).filter((account) => account.nature === "liability"),
+    () => (accounts.data || []).filter((account) => account.nature === "liability" && account.account_type === "loan"),
     [accounts.data],
   );
 
-  const filteredTransactions = useMemo(() => {
-    const query = search.trim().toLowerCase();
-    let rows = transactions.data || [];
-    if (!showTransfers) {
-      rows = rows.filter((transaction) => transaction.transaction_kind !== "transfer");
-    }
-    if (query) {
-      rows = rows.filter(
-        (item) =>
-          item.description.toLowerCase().includes(query) ||
-          item.category_name.toLowerCase().includes(query) ||
-          item.account_name.toLowerCase().includes(query),
-      );
-    }
-    if (onlyUnclassified) {
-      rows = rows.filter(
-        (transaction) =>
-          transaction.transaction_kind !== "transfer" &&
-          transaction.category_name === "未分類",
-      );
-    }
-    return rows;
-  }, [transactions.data, search, onlyUnclassified, showTransfers]);
+  const filteredTransactions = transactions.data?.items || [];
+  useTransactionScroll(JSON.stringify([ownerFilter, month, accountFilter, searchQuery, page, onlyUnclassified, showTransfers, excluded]), Boolean(transactions.data));
   const importMappingReady = Boolean(
     mapping.date && mapping.description && (mapping.amount || mapping.debit || mapping.credit),
   );
@@ -260,20 +285,16 @@ export default function TransactionsPage() {
     () => accounts.data?.find((account) => String(account.id) === String(mapping.account_id)),
     [accounts.data, mapping.account_id],
   );
-  const unclassifiedCount = (transactions.data || []).filter(
-    (transaction) => transaction.transaction_kind !== "transfer" && transaction.category_name === "未分類",
-  ).length;
-  const transferCount = (transactions.data || []).filter(
-    (transaction) => transaction.transaction_kind === "transfer",
-  ).length;
+  const unclassifiedCount = excluded ? 0 : transactions.data?.unclassified_count || 0;
+  const transferCount = transactions.data?.transfer_count || 0;
 
   const createTransaction = useMutation({
     mutationFn: (payload: Record<string, unknown>) =>
       api("/transactions", { method: "POST", body: JSON.stringify(payload) }),
-    onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["transactions"] });
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+    onSuccess: (_result, payload) => {
+      rememberTransactionAccount(ownerFilter, Number(payload.account_id));
+      clearQuickDraft(ownerFilter, String(payload.transaction_kind));
+      invalidateFinanceData(client, ["transactions","accounts","dashboard"]);
       setManualOpen(false);
       setManualScenario(null);
       setManualKind("expense");
@@ -281,45 +302,18 @@ export default function TransactionsPage() {
     },
   });
 
-  const updateTransaction = useMutation({
-    mutationFn: ({ id, payload }: { id: number; payload: Record<string, unknown> }) =>
-      api(`/transactions/${id}`, { method: "PATCH", body: JSON.stringify(payload) }),
-    onSuccess: (_result, variables) => {
-      client.invalidateQueries({ queryKey: ["transactions"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
-
-      const previous = (transactions.data || []).find(
-        (transaction) => transaction.id === variables.id,
-      );
-      const selectedCategory = categories.data?.find(
-        (category) => category.id === Number(variables.payload.category_id),
-      );
-      const completedManualClassification =
-        previous?.transaction_kind !== "transfer" &&
-        previous?.category_name === "未分類" &&
-        selectedCategory?.name !== "未分類";
-
-      if (completedManualClassification && onlyUnclassified) {
-        const remaining = (transactions.data || []).filter(
-          (transaction) =>
-            transaction.id !== variables.id &&
-            transaction.transaction_kind !== "transfer" &&
-            transaction.category_name === "未分類",
-        ).length;
-        if (remaining === 0) {
-          setOnlyUnclassified(false);
-          setClassificationMessage("分類完成，已返回完整交易清單。");
-        } else {
-          setClassificationMessage(`已完成一筆分類，還有 ${remaining} 筆待處理。`);
-        }
-      }
-    },
-  });
+  function onCategorySaved(previous: Transaction) {
+    if (onlyUnclassified && previous.category_name === "未分類") {
+      const remaining = Math.max(0, unclassifiedCount - 1);
+      if (!remaining) setOnlyUnclassified(false);
+      setClassificationMessage(remaining ? `已完成一筆分類，還有 ${remaining} 筆待處理。` : "分類完成，已返回完整交易清單。");
+    }
+  }
 
   const reclassifyTransactions = useMutation({
     mutationFn: () =>
       api<{ updated: number; remaining: number }>(
-        `/transactions/reclassify?owner=${ownerFilter}`,
+        `/transactions/reclassify?owner=${ownerFilter}&month=${month}&search=${encodeURIComponent(searchQuery)}${accountFilter ? `&account_id=${accountFilter}` : ""}`,
         { method: "POST" },
       ),
     onSuccess: (result) => {
@@ -332,17 +326,14 @@ export default function TransactionsPage() {
             ? "這筆交易無法自動判斷，已替你顯示出來，請手動選擇分類。"
             : "目前沒有能自動辨識的未分類交易。",
       );
-      client.invalidateQueries({ queryKey: ["transactions"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["transactions","dashboard"]);
     },
   });
 
   const deleteTransaction = useMutation({
     mutationFn: (id: number) => api(`/transactions/${id}`, { method: "DELETE" }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["transactions"] });
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["transactions","accounts","dashboard"]);
     },
   });
 
@@ -387,9 +378,7 @@ export default function TransactionsPage() {
     },
     onSuccess: (result) => {
       setImportResult(result);
-      client.invalidateQueries({ queryKey: ["transactions"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
-      client.invalidateQueries({ queryKey: ["accounts"] });
+      invalidateFinanceData(client, ["transactions","dashboard","accounts"]);
     },
   });
 
@@ -399,9 +388,7 @@ export default function TransactionsPage() {
         method: "POST",
       }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["pending-csv-balances"] });
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["pending-csv-balances","accounts","dashboard"]);
     },
   });
 
@@ -415,9 +402,7 @@ export default function TransactionsPage() {
         }),
       }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["transactions"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
-      client.invalidateQueries({ queryKey: ["transfer-suggestions"] });
+      invalidateFinanceData(client, ["transactions","dashboard","transfer-suggestions"]);
     },
   });
 
@@ -425,9 +410,7 @@ export default function TransactionsPage() {
     mutationFn: (payload: Record<string, unknown>) =>
       api("/account-transfers", { method: "POST", body: JSON.stringify(payload) }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["transactions"] });
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["transactions","accounts","dashboard"]);
       setAccountTransferOpen(false);
       setTransferFromAccountId("");
       setTransferToAccountId("");
@@ -438,9 +421,7 @@ export default function TransactionsPage() {
     mutationFn: (payload: Record<string, unknown>) =>
       api("/loan-payments", { method: "POST", body: JSON.stringify(payload) }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["transactions"] });
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["transactions","accounts","dashboard"]);
       setManualOpen(false);
       setManualKind("expense");
       setLoanAccountId("");
@@ -602,37 +583,46 @@ export default function TransactionsPage() {
               onChange={(event) => setSearch(event.target.value)}
             />
           </div>
-          <MonthInput
-            value={month}
-            onChange={(event) => setMonth(event.target.value)}
-          />
+          <div className="flex min-w-0 items-center gap-1">
+            <Button variant="ghost" aria-label="上一個月" className="shrink-0 px-2" onClick={() => shiftMonth(-1)}><ChevronLeft size={16} /></Button>
+            <MonthInput value={month} onChange={(event) => setMonth(event.target.value)} aria-label="查看月份" />
+            <Button variant="ghost" aria-label="下一個月" className="shrink-0 px-2" onClick={() => shiftMonth(1)}><ChevronRight size={16} /></Button>
+          </div>
           <Select value={accountFilter} onChange={(event) => setAccountFilter(event.target.value)}>
             <option value="">全部帳戶</option>
             {accountFilterOptions.map((account) => (
               <option key={account.id} value={account.id}>
-                {account.name}（{account.owner_label}）
+                {account.name}（{account.owner_label}{account.archived ? " · 已封存" : ""}）
               </option>
             ))}
           </Select>
         </div>
-        {transactions.isFetching && (
+        <div className="mt-3 flex flex-wrap gap-2 text-sm">
+          <Button variant="ghost" onClick={() => setMonth(currentMonth)}>本月</Button>
+          <Button variant="ghost" onClick={() => setMonth("")}>所有月份</Button>
+          <Button variant={excluded ? "secondary" : "ghost"} onClick={() => setFilters((value) => ({ ...value, excluded: !excluded, onlyUnclassified: false, page: 1 }))}>{excluded ? "返回一般交易" : "查看已排除"}</Button>
+          {(search || accountFilter || onlyUnclassified) && <Button variant="ghost" onClick={() => setFilters((value) => ({ ...value, search: "", account: "", onlyUnclassified: false, page: 1 }))}>清除篩選</Button>}
+          {!month && <span className="self-center text-slate-500">目前搜尋所有月份</span>}
+        </div>
+        {(transactions.isFetching || search !== searchQuery) && (
           <div
             className="mt-3 flex items-center gap-2 rounded-xl bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-700"
             role="status"
             aria-live="polite"
           >
             <RefreshCw className="animate-spin" size={15} />
-            正在載入 {monthLabel(month)}的交易…
+            正在載入 {month ? monthLabel(month) : "所有月份"}的交易…
           </div>
         )}
       </Card>
 
       <div className="mb-5 flex flex-wrap items-center justify-between gap-3">
         <p className="text-sm text-slate-500">
+          {excluded && "已排除 · 不列入統計 · "}
           {transactions.isPending ? (
             "正在載入交易…"
           ) : (
-            <>共 <strong className="text-slate-800">{filteredTransactions.length}</strong> 筆交易</>
+            <>共 <strong className="text-slate-800">{transactions.data?.total || 0}</strong> 筆交易</>
           )}
         </p>
         <div className="flex flex-wrap gap-2">
@@ -668,11 +658,19 @@ export default function TransactionsPage() {
                 : `自動整理 ${unclassifiedCount} 筆未分類`}
             </Button>
           )}
-          <Button variant="ghost" onClick={() => setTransferOpen(true)}>
+          <Button variant="ghost" disabled={excluded} onClick={() => setTransferOpen(true)}>
             <Link2 size={16} /> 尋找帳戶間轉帳
           </Button>
         </div>
       </div>
+
+      {(transactions.data?.total || 0) > 50 && (
+        <nav aria-label="交易分頁" className="mb-4 flex items-center justify-between gap-3">
+          <Button variant="secondary" disabled={transactions.isFetching || (transactions.data?.page || 1) <= 1} onClick={() => updateFilter("page", (transactions.data?.page || 1) - 1)}>上一頁</Button>
+          <span className="text-sm text-slate-500">第 {transactions.data?.page || 1} / {Math.ceil((transactions.data?.total || 0) / 50)} 頁</span>
+          <Button variant="secondary" disabled={transactions.isFetching || (transactions.data?.page || 1) * 50 >= (transactions.data?.total || 0)} onClick={() => updateFilter("page", (transactions.data?.page || 1) + 1)}>下一頁</Button>
+        </nav>
+      )}
 
       {(classificationMessage || reclassifyTransactions.isError) && (
         <div className={`mb-5 rounded-xl px-4 py-3 text-sm ${
@@ -686,8 +684,10 @@ export default function TransactionsPage() {
         </div>
       )}
 
+      {!excluded && <BatchClassification rows={filteredTransactions} categories={categories.data || []} selected={selectedIds} onSelect={setSelectedIds} active={batchMode} onToggle={() => { setBatchMode(!batchMode); setSelectedIds([]); }} onSaved={() => { if (onlyUnclassified) { setOnlyUnclassified(false); setClassificationMessage("批次分類完成，已返回交易清單。"); } }} />}
       <Card className="overflow-hidden" aria-busy={transactions.isFetching}>
-        {transactions.isError ? (
+        {transactions.isError && transactions.data && <p role="alert" className="p-4 text-sm text-amber-700">更新失敗，保留上次載入的交易。<Button onClick={() => transactions.refetch()}>重試</Button></p>}
+        {transactions.isError && !transactions.data ? (
           <EmptyState
             icon={<CircleAlert size={25} />}
             title="交易資料載入失敗"
@@ -696,7 +696,7 @@ export default function TransactionsPage() {
           />
         ) : transactions.isPending ? (
           <div className="space-y-1 p-4" role="status" aria-live="polite">
-            <span className="sr-only">正在載入 {monthLabel(month)}的交易</span>
+            <span className="sr-only">正在載入 {month ? monthLabel(month) : "所有月份"}的交易</span>
             {[0, 1, 2, 3].map((row) => (
               <div key={row} className="flex items-center gap-3 rounded-xl px-1 py-3">
                 <Skeleton className="size-10 shrink-0 rounded-xl" />
@@ -712,21 +712,21 @@ export default function TransactionsPage() {
           <EmptyState
             icon={<ArrowRightLeft size={25} />}
             title={
-              onlyUnclassified
+              excluded ? "這個範圍沒有已排除交易" : search.trim() || accountFilter ? "找不到符合條件的交易" : onlyUnclassified
                 ? "這個月份沒有未分類交易"
                 : !showTransfers && transferCount > 0 && !search.trim()
                     ? "帳戶互轉已隱藏"
                     : "這個月份沒有交易"
             }
             description={
-              onlyUnclassified
+              excluded ? "已排除的交易會保留在此，隨時可以查看與復原。" : search.trim() || accountFilter ? "可以清除搜尋與帳戶篩選，或改查所有月份。" : onlyUnclassified
                 ? "目前顯示範圍內的交易都已完成分類。"
                 : !showTransfers && transferCount > 0 && !search.trim()
                     ? "自己的帳戶之間移動資金不算收入或支出，因此預設不顯示。"
                 : "你可以手動新增交易，或匯入銀行與信用卡提供的 CSV 明細。"
             }
             action={
-              onlyUnclassified
+              excluded ? <Button onClick={() => updateFilter("excluded", false)}>返回一般交易</Button> : search.trim() || accountFilter ? <Button onClick={() => setFilters((value) => ({ ...value, search: "", account: "", page: 1 }))}>清除篩選</Button> : onlyUnclassified
                 ? <Button onClick={() => setOnlyUnclassified(false)}>顯示全部交易</Button>
                 : !showTransfers && transferCount > 0 && !search.trim()
                     ? <Button variant="secondary" onClick={() => setShowTransfers(true)}>查看帳戶互轉</Button>
@@ -766,11 +766,12 @@ export default function TransactionsPage() {
                     </div>
                   </div>
                 </summary>
+                {batchMode && !excluded && transaction.can_correct && <label className="mb-3 flex items-center gap-2 text-sm"><input type="checkbox" checked={selectedIds.includes(transaction.id)} onChange={() => toggleSelected(transaction.id)} />選取 {transaction.description}</label>}
                 <div className="mt-4 space-y-3 border-t border-slate-100 pt-4">
                   <div className="grid grid-cols-2 gap-3 text-sm">
                     <div className="rounded-xl bg-slate-50 p-3">
                       <p className="text-xs text-slate-400">來源</p>
-                      <p className="mt-1 font-medium text-slate-700">{transaction.source === "csv" ? "CSV 匯入" : "手動新增"}</p>
+                      <p className="mt-1 font-medium text-slate-700">{transactionSourceLabel(transaction.source)}</p>
                     </div>
                     <div className="rounded-xl bg-slate-50 p-3">
                       <p className="text-xs text-slate-400">類型</p>
@@ -782,26 +783,7 @@ export default function TransactionsPage() {
                     </div>
                   </div>
                   <Field label="分類">
-                    <Select
-                      className="h-11"
-                      value={transaction.category_id || ""}
-                      onChange={(event) => {
-                        const categoryId = Number(event.target.value);
-                        const category = categories.data?.find((item) => item.id === categoryId);
-                        updateTransaction.mutate({
-                          id: transaction.id,
-                          payload: {
-                            category_id: categoryId,
-                            create_rule: category?.name !== "未分類",
-                            rule_keyword: transaction.description,
-                          },
-                        });
-                      }}
-                    >
-                      {categories.data?.map((category) => (
-                        <option key={category.id} value={category.id}>{category.name}</option>
-                      ))}
-                    </Select>
+                    <TransactionCategory transaction={transaction} categories={categories.data || []} onSaved={onCategorySaved} />
                   </Field>
                   {transaction.currency !== "TWD" && (
                     <p className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-500">
@@ -809,22 +791,7 @@ export default function TransactionsPage() {
                       {transaction.fx_estimated ? " · 使用估算匯率" : ""}
                     </p>
                   )}
-                  {transaction.source === "manual" && (
-                    <div className="flex justify-end">
-                      <Button
-                        variant="danger"
-                        className="h-11"
-                        disabled={deleteTransaction.isPending}
-                        onClick={() => {
-                          if (window.confirm("確定要刪除這筆交易嗎？帳戶餘額會同步調整回去。")) {
-                            deleteTransaction.mutate(transaction.id);
-                          }
-                        }}
-                      >
-                        <Trash2 size={15} /> 刪除交易
-                      </Button>
-                    </div>
-                  )}
+                  {transaction.can_correct && <Button variant="secondary" onClick={() => setCorrecting(transaction)}>{transaction.excluded ? "查看／復原" : "更正／排除"}</Button>}
                 </div>
               </details>
             ))}
@@ -833,6 +800,7 @@ export default function TransactionsPage() {
             <table className="w-full min-w-[850px]">
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/80 text-left text-xs font-semibold uppercase tracking-wider text-slate-400">
+                  {batchMode && !excluded && <th className="px-3 py-4">選取</th>}
                   <th className="px-5 py-4">日期與摘要</th>
                   <th className="px-4 py-4">帳戶</th>
                   <th className="px-4 py-4">分類</th>
@@ -844,6 +812,7 @@ export default function TransactionsPage() {
               <tbody className="divide-y divide-slate-100">
                 {filteredTransactions.map((transaction) => (
                   <tr key={transaction.id} className="group hover:bg-slate-50/60">
+                    {batchMode && !excluded && <td className="px-3">{transaction.can_correct && <input type="checkbox" aria-label={`選取 ${transaction.description}`} checked={selectedIds.includes(transaction.id)} onChange={() => toggleSelected(transaction.id)} />}</td>}
                     <td className="px-5 py-4">
                       <div className="flex items-center gap-3">
                         <div
@@ -858,7 +827,7 @@ export default function TransactionsPage() {
                         <div>
                           <p className="max-w-xs truncate text-sm font-semibold text-slate-800">{transaction.description}</p>
                           <p className="mt-1 text-xs text-slate-400">
-                            {transaction.transaction_date} · {transaction.source === "csv" ? "CSV 匯入" : "手動"}
+                            {transaction.transaction_date} · {transactionSourceLabel(transaction.source)}
                             {transaction.fx_estimated ? " · 估算匯率" : ""}
                           </p>
                         </div>
@@ -866,28 +835,7 @@ export default function TransactionsPage() {
                     </td>
                     <td className="px-4 py-4 text-sm text-slate-600">{transaction.account_name}</td>
                     <td className="px-4 py-4">
-                      <Select
-                        className="h-9 min-w-32"
-                        value={transaction.category_id || ""}
-                        onChange={(event) => {
-                          const categoryId = Number(event.target.value);
-                          const category = categories.data?.find((item) => item.id === categoryId);
-                          updateTransaction.mutate({
-                            id: transaction.id,
-                            payload: {
-                              category_id: categoryId,
-                              create_rule: category?.name !== "未分類",
-                              rule_keyword: transaction.description,
-                            },
-                          });
-                        }}
-                      >
-                        {categories.data?.map((category) => (
-                          <option key={category.id} value={category.id}>
-                            {category.name}
-                          </option>
-                        ))}
-                      </Select>
+                      <TransactionCategory transaction={transaction} categories={categories.data || []} onSaved={onCategorySaved} />
                     </td>
                     <td className="px-4 py-4">
                       <Badge tone={transaction.transaction_kind === "transfer" ? "blue" : transaction.base_amount >= 0 ? "green" : "slate"}>
@@ -904,20 +852,7 @@ export default function TransactionsPage() {
                       )}
                     </td>
                     <td className="px-4 py-4 text-right">
-                      {transaction.source === "manual" && (
-                        <button
-                          className="inline-flex size-9 items-center justify-center rounded-xl text-slate-300 transition hover:bg-red-50 hover:text-red-600 disabled:opacity-40"
-                          title="刪除交易"
-                          disabled={deleteTransaction.isPending}
-                          onClick={() => {
-                            if (window.confirm("確定要刪除這筆交易嗎？帳戶餘額會同步調整回去。")) {
-                              deleteTransaction.mutate(transaction.id);
-                            }
-                          }}
-                        >
-                          <Trash2 size={15} />
-                        </button>
-                      )}
+                      {transaction.can_correct && <Button variant="ghost" className="h-10 px-2 text-xs" onClick={() => setCorrecting(transaction)}>{transaction.excluded ? "查看／復原" : "更正／排除"}</Button>}
                     </td>
                   </tr>
                 ))}
@@ -928,6 +863,7 @@ export default function TransactionsPage() {
         )}
       </Card>
 
+      {correcting && <TransactionCorrection transaction={correcting} onClose={() => setCorrecting(null)} onSaved={(message) => { setCorrecting(null); setClassificationMessage(message); }} />}
       <Dialog
         open={manualOpen}
         onClose={closeManualDialog}
@@ -971,6 +907,10 @@ export default function TransactionsPage() {
               如果只是自己的帳戶之間移動錢，選「帳戶互轉」；它不會被算成收入或支出。
             </p>
           </div>
+        ) : manualScenario === "income" || manualScenario === "expense" ? (
+          accounts.isLoading ? <p role="status">正在載入帳戶…</p> : accounts.isError ? <div role="alert">無法載入帳戶<Button onClick={() => accounts.refetch()}>重試</Button></div> : (
+            <QuickTransactionForm key={`${ownerFilter}-${manualScenario}`} kind={manualScenario} accounts={accounts.data || []} categories={categories.data || []} owner={ownerFilter} pending={createTransaction.isPending} error={createTransaction.error?.message} onSubmit={submitManual} onCancel={closeManualDialog} />
+          )
         ) : (
           <form ref={manualFormRef} className="space-y-5" onSubmit={submitManual}>
             <input type="hidden" name="transaction_kind" value={manualKind} />

@@ -42,6 +42,7 @@ from .database import (
     Budget,
     Category,
     ClassificationRule,
+    LearnedClassificationRule,
     CreditCardBill,
     EmailCardRule,
     FxRate,
@@ -50,6 +51,7 @@ from .database import (
     Position,
     RecurringExpense,
     Transaction,
+    TransactionRevision,
     TransferLink,
     SessionLocal,
     engine,
@@ -82,6 +84,9 @@ from .schemas import (
     GmailCardQuickSetup,
     TransactionCreate,
     TransactionUpdate,
+    TransactionCorrection,
+    BatchClassification,
+    UndoClassification,
     TransferCreate,
 )
 from .services import (
@@ -139,7 +144,9 @@ from .email_sync import (
     serialize_card_bill,
     serialize_email_rule,
     sync_gmail,
+    usable_email_rules,
 )
+from .transaction_corrections import require_editable, plan_correction, public_plan, commit_correction
 
 
 def ensure_schema() -> None:
@@ -155,6 +162,12 @@ def ensure_schema() -> None:
             if name not in columns(table):
                 conn.execute(text(f"ALTER TABLE {table} ADD COLUMN {name} {definition}"))
 
+        add_column("transactions", "excluded", "BOOLEAN NOT NULL DEFAULT FALSE")
+        add_column("transactions", "revision", "INTEGER NOT NULL DEFAULT 0")
+        add_column("transactions", "original_date", "DATE")
+        add_column("transactions", "original_amount", "NUMERIC(18, 4)")
+        add_column("transactions", "original_description", "VARCHAR(300)")
+
         if engine.url.get_backend_name() == "sqlite":
             add_column("accounts", "balance_includes_positions", "BOOLEAN NOT NULL DEFAULT 0")
             add_column("accounts", "auto_balance_base_twd", "NUMERIC(18, 4)")
@@ -168,6 +181,7 @@ def ensure_schema() -> None:
         add_column("email_card_rules", "payment_due_day", "INTEGER NOT NULL DEFAULT 23")
         add_column("credit_card_bills", "period_start", "DATE")
         add_column("credit_card_bills", "period_end", "DATE")
+        add_column("recurring_expenses", "match_name", "VARCHAR(300)")
 
 
 @asynccontextmanager
@@ -183,11 +197,7 @@ async def lifespan(_: FastAPI):
         repair_cross_source_card_duplicates(db)
         repair_duplicate_card_bills(db)
         adjusted_email_balances = False
-        for rule in db.scalars(
-            select(EmailCardRule)
-            .where(EmailCardRule.active.is_(True))
-            .order_by(EmailCardRule.id)
-        ).all():
+        for rule in usable_email_rules(db):
             if _refresh_current_gmail_card_balance(db, rule) is not None:
                 adjusted_email_balances = True
         if adjusted_email_balances:
@@ -575,6 +585,48 @@ def list_accounts(db: DB, include_archived: bool = False, owner: str = "all"):
     return [account_summary(db, item) for item in db.scalars(query).all()]
 
 
+@app.get("/api/activity")
+def background_activity(db: DB):
+    keys = ["gmail:last_sync_at", "automation:last_run_at"]
+    values = {row.key: row.value for row in db.scalars(select(AppSetting).where(AppSetting.key.in_(keys))).all()}
+    return {"revision": "|".join(values.get(key, "") for key in keys)}
+
+
+@app.get("/api/attention")
+def actionable_reminders(db: DB, owner: str = "all"):
+    owner = validate_owner_filter(owner)
+    reminders = []
+    accounts = db.scalars(select(Account).where(Account.owner == owner) if owner != "all" else select(Account)).all()
+    account_ids = [row.id for row in accounts if not row.archived]
+    uncategorized = db.scalar(select(func.count(Transaction.id)).outerjoin(Category).where(
+        Transaction.account_id.in_(account_ids), Transaction.excluded.is_(False),
+        Transaction.transaction_kind.in_(["income", "expense", "interest"]),
+        (Transaction.category_id.is_(None) | (Category.name == "未分類")),
+        Transaction.id.notin_(linked_transfer_transaction_ids(db)),
+    )) or 0
+    if uncategorized:
+        reminders.append({"id": "categories", "label": f"{uncategorized} 筆交易待分類", "action": "前往分類", "href": "/transactions?month=all&account=&search=&unclassified=1&excluded=0&page=1", "tone": "info"})
+    stale = [row.name for row in accounts if not row.archived and row.account_type in {"bank", "cash", "ewallet"}
+             and ((latest := get_latest_balance(db, row.id)) is None or latest.snapshot_date < date.today() - timedelta(days=30))]
+    if stale:
+        reminders.append({"id": "balances", "label": f"{len(stale)} 個帳戶超過 30 天未確認餘額", "action": "確認餘額", "href": "/accounts?quick=balance", "tone": "info"})
+    rules = db.scalars(select(EmailCardRule).where(EmailCardRule.active.is_(True))).all()
+    scoped_rules = [row for row in rules if owner == "all" or row.owner == owner]
+    paused = [row for row in scoped_rules if row.card_account.archived or row.payment_account.archived]
+    if paused:
+        reminders.append({"id": "archived-sync", "label": f"{len(paused)} 張信用卡因帳戶封存暫停同步", "action": "查看／恢復帳戶", "href": "/accounts", "tone": "warning"})
+    status = gmail_status(db)
+    needs_auth = status.get("reconnect_required")
+    issues = [item for item in status.get("issues", []) if item.get("rule_id") in {row.id for row in scoped_rules}]
+    if needs_auth or issues:
+        reminders.append({"id": "email", "label": "信用卡郵件需要重新連接" if needs_auth else f"{len(issues)} 封信用卡郵件需要處理", "action": "前往處理", "href": "/settings#email", "tone": "warning"})
+    bills = db.scalar(select(func.count(CreditCardBill.id)).where(
+        CreditCardBill.card_account_id.in_(account_ids), CreditCardBill.status.in_(["insufficient_funds", "needs_review"]))) or 0
+    if bills:
+        reminders.append({"id": "bills", "label": f"{bills} 份帳單需要確認，尚未記錄繳款", "action": "查看帳期", "href": "/accounts#card-cycles", "tone": "warning"})
+    return reminders
+
+
 @app.post("/api/accounts", status_code=201)
 def create_account(payload: AccountCreate, db: DB):
     if payload.nature not in {"asset", "liability"}:
@@ -734,37 +786,32 @@ def list_categories(db: DB):
     ]
 
 
-@app.get("/api/transactions")
-def list_transactions(
-    db: DB,
-    account_id: int | None = None,
-    month: str | None = None,
-    owner: str = "all",
-    limit: int = Query(200, ge=1, le=1000),
-):
+def transaction_query(account_id: int | None, month: str | None, owner: str, search: str = ""):
     owner = validate_owner_filter(owner)
-    query = select(Transaction).order_by(
-        Transaction.transaction_date.desc(), Transaction.id.desc()
-    )
+    query = select(Transaction).join(Account).outerjoin(Category)
     if owner != "all":
-        query = query.join(Account).where(Account.owner == owner)
+        query = query.where(Account.owner == owner)
     if account_id:
         query = query.where(Transaction.account_id == account_id)
     if month:
         try:
             year, month_number = map(int, month.split("-"))
             start = date(year, month_number, 1)
-            end = (
-                date(year + 1, 1, 1)
-                if month_number == 12
-                else date(year, month_number + 1, 1)
-            )
-            query = query.where(
-                Transaction.transaction_date >= start, Transaction.transaction_date < end
-            )
+            end = date(year + 1, 1, 1) if month_number == 12 else date(year, month_number + 1, 1)
+            query = query.where(Transaction.transaction_date >= start, Transaction.transaction_date < end)
         except ValueError as exc:
             raise HTTPException(422, "月份格式必須是 YYYY-MM") from exc
-    rows = db.scalars(query.limit(limit)).all()
+    if search.strip():
+        value = search.strip().lower()
+        query = query.where(
+            func.lower(Transaction.description).contains(value, autoescape=True)
+            | func.lower(Account.name).contains(value, autoescape=True)
+            | func.lower(func.coalesce(Category.name, "未分類")).contains(value, autoescape=True)
+        )
+    return query
+
+
+def serialize_transactions(db: Session, rows: list[Transaction]) -> list[dict[str, Any]]:
     linked_ids = linked_transfer_transaction_ids(db)
     return [
         {
@@ -784,26 +831,130 @@ def list_transactions(
             "category_color": item.category.color if item.category else "#94a3b8",
             "source": item.source,
             "note": item.note,
+            "excluded": item.excluded,
+            "revision": item.revision,
+            "can_correct": item.source in {"manual", "csv", "gmail"} and item.transaction_kind in {"income", "expense", "interest"} and item.id not in linked_ids,
         }
         for item in rows
     ]
 
 
+@app.get("/api/transactions")
+def list_transactions(
+    db: DB, account_id: int | None = None, month: str | None = None, owner: str = "all",
+    limit: int = Query(200, ge=1, le=1000),
+):
+    query = transaction_query(account_id, month, owner).where(Transaction.excluded.is_(False))
+    rows = db.scalars(query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc()).limit(limit)).all()
+    return serialize_transactions(db, rows)
+
+
+@app.get("/api/transactions/page")
+def transaction_page(
+    db: DB, account_id: int | None = None, month: str | None = None, owner: str = "all",
+    search: str = Query("", max_length=300), page: int = Query(1, ge=1),
+    page_size: int = Query(50, ge=1, le=200), show_transfers: bool = False,
+    only_unclassified: bool = False,
+    excluded: bool = False,
+):
+    query = transaction_query(account_id, month, owner, search).where(Transaction.excluded == excluded)
+    linked_ids = linked_transfer_transaction_ids(db)
+    is_transfer = Transaction.transaction_kind == "transfer"
+    if linked_ids:
+        is_transfer = is_transfer | Transaction.id.in_(linked_ids)
+    is_unclassified = (Transaction.category_id.is_(None) | (Category.name == "未分類")) & ~is_transfer & Transaction.transaction_kind.in_(["income", "expense", "interest"]) & (Transaction.excluded == False)
+    def count(q):
+        return int(db.scalar(select(func.count()).select_from(q.subquery())) or 0)
+    matched_total = count(query)
+    transfer_count = count(query.where(is_transfer))
+    unclassified_count = count(query.where(is_unclassified))
+    if not show_transfers:
+        query = query.where(~is_transfer)
+    if only_unclassified:
+        query = query.where(is_unclassified)
+    total = count(query)
+    # Clamp after changes so deleting/classifying the last row does not leave an empty page.
+    page = min(page, max(1, (total + page_size - 1) // page_size))
+    rows = db.scalars(query.order_by(Transaction.transaction_date.desc(), Transaction.id.desc())
+                      .offset((page - 1) * page_size).limit(page_size)).all()
+    return {"items": serialize_transactions(db, rows), "total": total, "page": page,
+            "page_size": page_size, "matched_total": matched_total,
+            "transfer_count": transfer_count, "unclassified_count": unclassified_count}
+
+
+@app.post("/api/transactions/classify-batch")
+def classify_batch(payload: BatchClassification, db: DB):
+    category = db.get(Category, payload.category_id)
+    if not category:
+        raise HTTPException(404, "找不到分類")
+    ids = set(payload.ids)
+    rows = db.scalars(select(Transaction).where(Transaction.id.in_(ids)).with_for_update()).all()
+    linked = linked_transfer_transaction_ids(db)
+    if len(rows) != len(ids) or any(row.excluded or row.id in linked or row.transaction_kind not in {"expense", "income", "interest"} or category.kind != ("income" if row.amount > 0 else "expense") for row in rows):
+        raise HTTPException(422, "請選取同為收入或同為支出的交易，不包含已排除、互轉或投資記錄")
+    undo = [{"id": row.id, "category_id": row.category_id, "expected_category_id": category.id} for row in rows]
+    for row in rows:
+        row.category_id = category.id
+    db.commit()
+    return {"updated": len(rows), "undo": undo}
+
+
+@app.post("/api/transactions/classify-batch/undo")
+def undo_batch_classification(payload: UndoClassification, db: DB):
+    ids = {item.id for item in payload.items}
+    rows = {row.id: row for row in db.scalars(select(Transaction).where(Transaction.id.in_(ids)).with_for_update()).all()}
+    linked = linked_transfer_transaction_ids(db)
+    for item in payload.items:
+        row = rows.get(item.id)
+        category = db.get(Category, item.category_id) if item.category_id else None
+        if not row or row.excluded or row.id in linked or row.transaction_kind not in {"expense", "income", "interest"} or row.category_id != item.expected_category_id:
+            raise HTTPException(409, "部分分類已有其他變更，請重新整理後逐筆確認，未覆寫新分類")
+        if item.category_id is not None and (not category or category.kind != ("income" if row.amount > 0 else "expense")):
+            raise HTTPException(422, "原分類已無法使用，請重新選擇分類")
+    for item in payload.items:
+        rows[item.id].category_id = item.category_id
+    db.commit()
+    return {"updated": len(rows)}
+
+
+@app.post("/api/transactions/{transaction_id}/correction/preview")
+def preview_transaction_correction(transaction_id: int, payload: TransactionCorrection, db: DB):
+    return public_plan(plan_correction(db, require_editable(db, transaction_id), payload))
+
+
+@app.post("/api/transactions/{transaction_id}/correction")
+def save_transaction_correction(transaction_id: int, payload: TransactionCorrection, db: DB):
+    return commit_correction(db, transaction_id, payload)
+
+
+@app.get("/api/transactions/{transaction_id}/history")
+def transaction_history(transaction_id: int, db: DB):
+    if not db.get(Transaction, transaction_id):
+        raise HTTPException(404, "找不到交易")
+    return [{"id": row.id, "action": row.action, "created_at": row.created_at,
+             "before": json.loads(row.before_json), "after": json.loads(row.after_json), "balance_note": row.balance_note}
+            for row in db.scalars(select(TransactionRevision).where(TransactionRevision.transaction_id == transaction_id).order_by(TransactionRevision.id.desc())).all()]
+
+
 @app.post("/api/transactions/reclassify")
-def reclassify_transactions(db: DB, owner: str = "all"):
+def reclassify_transactions(db: DB, owner: str = "all", month: str | None = None,
+                           account_id: int | None = None, search: str = Query("", max_length=300)):
     owner = validate_owner_filter(owner)
     seed_defaults(db)
-    return reclassify_uncategorized_transactions(db, owner)
+    ids = {row.id for row in db.scalars(transaction_query(account_id, month, owner, search)).all()}
+    return reclassify_uncategorized_transactions(db, owner, ids)
 
 
 @app.post("/api/transactions", status_code=201)
 def create_transaction(payload: TransactionCreate, db: DB):
     account = require_account(db, payload.account_id)
+    if account.archived:
+        raise HTTPException(422, "此帳戶已封存，請先到帳戶頁恢復")
     currency = (payload.currency or account.currency).upper()
     rate, estimated = latest_fx_rate(db, currency, payload.transaction_date)
     if payload.fx_rate is not None:
         rate, estimated = payload.fx_rate, False
-    category_id, kind = classify_transaction(db, payload.description, payload.amount)
+    category_id, kind = classify_transaction(db, payload.description, payload.amount, account.id)
     if payload.category_id is not None:
         category_id = payload.category_id
     if payload.transaction_kind:
@@ -865,6 +1016,8 @@ def update_transaction(transaction_id: int, payload: TransactionUpdate, db: DB):
     values = payload.model_dump(
         exclude_unset=True, exclude={"create_rule", "rule_keyword"}
     )
+    if row.excluded:
+        raise HTTPException(422, "請先復原已排除的交易")
     linked = db.scalar(
         select(TransferLink).where(
             TransferLink.confirmed.is_(True),
@@ -878,33 +1031,30 @@ def update_transaction(transaction_id: int, payload: TransactionUpdate, db: DB):
         values.pop("transaction_kind", None)
         if row.transaction_kind != "debt_principal":
             row.transaction_kind = "transfer"
+    elif payload.category_id is not None:
+        category = db.get(Category, payload.category_id)
+        if not category:
+            raise HTTPException(404, "找不到分類")
+        expected_kind = "income" if row.amount > 0 else "expense"
+        if category.kind != expected_kind:
+            raise HTTPException(422, "請選擇符合這筆收入或支出的分類")
     for key, value in values.items():
         setattr(row, key, value)
     if payload.create_rule and payload.category_id and not linked:
-        keyword = (payload.rule_keyword or payload.description or row.description).strip()
+        keyword = (payload.rule_keyword or row.description).strip().casefold()
         if keyword:
-            rule = db.scalar(
-                select(ClassificationRule).where(
-                    func.lower(ClassificationRule.keyword) == keyword.lower()
-                )
-            )
-            if not rule:
-                rule = ClassificationRule(keyword=keyword, category_id=payload.category_id)
-                db.add(rule)
-            rule.category_id = payload.category_id
-            rule.transaction_kind = payload.transaction_kind or row.transaction_kind
-            uncategorized = db.scalar(select(Category).where(Category.name == "未分類"))
-            matching_rows = db.scalars(
-                select(Transaction).where(
-                    func.lower(Transaction.description).contains(keyword.lower())
-                )
-            ).all()
-            for matching_row in matching_rows:
-                if matching_row.category_id is None or (
-                    uncategorized and matching_row.category_id == uncategorized.id
-                ):
-                    matching_row.category_id = payload.category_id
-                    matching_row.transaction_kind = payload.transaction_kind or row.transaction_kind
+            learned = db.scalar(select(LearnedClassificationRule).where(
+                LearnedClassificationRule.account_id == row.account_id,
+                LearnedClassificationRule.keyword == keyword,
+            ))
+            if not learned:
+                learned = LearnedClassificationRule(account_id=row.account_id, keyword=keyword,
+                    category_id=payload.category_id, transaction_kind=row.transaction_kind)
+                db.add(learned)
+            learned.category_id = payload.category_id
+            learned.transaction_kind = row.transaction_kind
+            learned.enabled = True
+        # Remembering a merchant affects future imports only, never historical rows.
     db.commit()
     return {"ok": True}
 
@@ -916,6 +1066,8 @@ def delete_transaction(transaction_id: int, db: DB):
         raise HTTPException(404, "找不到交易")
     if row.source != "manual":
         raise HTTPException(422, "目前只支援刪除手動新增的交易")
+    if row.revision:
+        raise HTTPException(422, "此筆保有更正紀錄，請使用排除功能以便復原")
     linked = db.scalar(
         select(TransferLink).where(TransferLink.from_transaction_id == transaction_id)
     ) or db.scalar(
@@ -971,6 +1123,8 @@ async def import_transactions(
 ):
     account = require_account(db, account_id)
     content = await file.read()
+    if account.archived:
+        raise HTTPException(422, "此帳戶已封存，請先恢復再匯入")
     try:
         mapping = json.loads(mapping_json)
         return import_csv(
@@ -998,6 +1152,8 @@ def pending_imported_transaction_balances(db: DB, owner: str = "all"):
 @app.post("/api/transactions/import-balance/apply/{account_id}")
 def apply_imported_transaction_balance(account_id: int, db: DB):
     account = require_account(db, account_id)
+    if account.archived:
+        raise HTTPException(422, "此帳戶已封存，請先恢復再更新餘額")
     return apply_pending_csv_balance(db, account)
 
 
@@ -1010,7 +1166,7 @@ def transfer_suggestions(db: DB):
     cutoff = date.today() - timedelta(days=120)
     rows = db.scalars(
         select(Transaction)
-        .where(Transaction.transaction_date >= cutoff)
+        .where(Transaction.transaction_date >= cutoff, Transaction.excluded.is_(False))
         .order_by(Transaction.transaction_date)
     ).all()
     suggestions = []
@@ -1051,6 +1207,8 @@ def confirm_transfer(payload: TransferCreate, db: DB):
     right = db.get(Transaction, payload.to_transaction_id)
     if not left or not right:
         raise HTTPException(404, "找不到要配對的交易")
+    if left.excluded or right.excluded:
+        raise HTTPException(422, "已排除的交易不能配對轉帳")
     if left.account_id == right.account_id:
         raise HTTPException(422, "轉帳必須發生在不同帳戶")
     if abs(decimal_value(left.base_amount) + decimal_value(right.base_amount)) > Decimal("2"):
@@ -1695,6 +1853,7 @@ def list_budgets(db: DB, month: str | None = None):
         spent = db.scalar(
             select(func.sum(func.abs(Transaction.base_amount))).where(
                 Transaction.category_id == row.category_id,
+                Transaction.excluded.is_(False),
                 Transaction.transaction_kind.in_(["expense", "interest"]),
                 Transaction.transaction_date >= start,
                 Transaction.transaction_date < end,
@@ -1806,7 +1965,12 @@ def update_goal(goal_id: int, payload: GoalUpdate, db: DB):
 @app.get("/api/rules")
 def list_rules(db: DB):
     default_keywords = {keyword.casefold() for keyword, _, _ in DEFAULT_RULES}
-    return [
+    learned = [{"id": -row.id, "keyword": row.keyword, "category_id": row.category_id,
+                "category_name": row.category.name, "transaction_kind": row.transaction_kind,
+                "priority": row.priority, "enabled": row.enabled, "is_default": False,
+                "account_name": row.account.name, "scope": "account"}
+               for row in db.scalars(select(LearnedClassificationRule).order_by(LearnedClassificationRule.id)).all()]
+    return learned + [
         {
             "id": row.id,
             "keyword": row.keyword,
@@ -1848,7 +2012,8 @@ def create_rule(payload: RuleCreate, db: DB):
 
 @app.patch("/api/rules/{rule_id}")
 def update_rule(rule_id: int, payload: RuleUpdate, db: DB):
-    row = db.get(ClassificationRule, rule_id)
+    model = LearnedClassificationRule if rule_id < 0 else ClassificationRule
+    row = db.get(model, abs(rule_id))
     if not row:
         raise HTTPException(404, "找不到規則")
     changes = payload.model_dump(exclude_unset=True)
@@ -1858,12 +2023,10 @@ def update_rule(rule_id: int, payload: RuleUpdate, db: DB):
         keyword = str(changes["keyword"]).strip()
         if not keyword:
             raise HTTPException(422, "關鍵字不可空白")
-        duplicate = db.scalar(
-            select(ClassificationRule).where(
-                func.lower(ClassificationRule.keyword) == keyword.lower(),
-                ClassificationRule.id != rule_id,
-            )
-        )
+        duplicate_query = select(model).where(func.lower(model.keyword) == keyword.lower(), model.id != abs(rule_id))
+        if rule_id < 0:
+            duplicate_query = duplicate_query.where(model.account_id == row.account_id)
+        duplicate = db.scalar(duplicate_query)
         if duplicate:
             raise HTTPException(409, "已有相同關鍵字的規則")
         changes["keyword"] = keyword
@@ -1875,7 +2038,7 @@ def update_rule(rule_id: int, payload: RuleUpdate, db: DB):
 
 @app.delete("/api/rules/{rule_id}")
 def delete_rule(rule_id: int, db: DB):
-    row = db.get(ClassificationRule, rule_id)
+    row = db.get(LearnedClassificationRule if rule_id < 0 else ClassificationRule, abs(rule_id))
     if not row:
         raise HTTPException(404, "找不到規則")
     db.delete(row)
@@ -1909,6 +2072,7 @@ def recurring_expense_payload(row: RecurringExpense) -> dict[str, Any]:
     return {
         "id": row.id,
         "name": row.name,
+        "match_name": row.match_name,
         "owner": row.owner,
         "amount": float(row.amount),
         "due_day": row.due_day,
@@ -1976,6 +2140,18 @@ def create_recurring_expense(payload: RecurringExpenseCreate, db: DB):
     if payload.owner not in {"me", "partner", "shared"}:
         raise HTTPException(422, "固定花費所有人必須是 me、partner 或 shared")
     validate_recurring_expense_links(db, payload.account_id, payload.category_id)
+    if payload.match_name:
+        # Confirming or renaming the same detected merchant must not double count it.
+        signature = recurring_expense_signature(payload.match_name)
+        existing = next((item for item in db.scalars(select(RecurringExpense).where(
+            RecurringExpense.account_id == payload.account_id,
+            RecurringExpense.owner == payload.owner,
+        )).all() if recurring_expense_signature(item.match_name or item.name) == signature), None)
+        if existing:
+            for key, value in payload.model_dump().items():
+                setattr(existing, key, value)
+            db.commit()
+            return recurring_expense_payload(existing)
     row = RecurringExpense(**payload.model_dump())
     row.name = row.name.strip()
     db.add(row)
@@ -2015,7 +2191,7 @@ def delete_recurring_expense(expense_id: int, db: DB):
     row = db.get(RecurringExpense, expense_id)
     if not row:
         raise HTTPException(404, "找不到自訂固定花費")
-    db.delete(row)
+    row.active = False
     db.commit()
     return {"ok": True}
 

@@ -5,6 +5,7 @@ import {
   useRef,
   useState,
   type ButtonHTMLAttributes,
+  type HTMLAttributes,
   type InputHTMLAttributes,
   type ReactNode,
   type SelectHTMLAttributes,
@@ -20,12 +21,10 @@ export const cn = (...values: (string | false | null | undefined)[]) =>
 export function Card({
   children,
   className,
-}: {
-  children: ReactNode;
-  className?: string;
-}) {
+  ...props
+}: HTMLAttributes<HTMLElement>) {
   return (
-    <section className={cn("rounded-2xl border border-slate-200/80 bg-white shadow-soft", className)}>
+    <section {...props} className={cn("rounded-2xl border border-slate-200/80 bg-white shadow-soft", className)}>
       {children}
     </section>
   );
@@ -33,6 +32,7 @@ export function Card({
 
 export function Button({
   variant = "primary",
+  type = "button",
   className,
   ...props
 }: ButtonHTMLAttributes<HTMLButtonElement> & {
@@ -46,6 +46,7 @@ export function Button({
   };
   return (
     <button
+      type={type}
       className={cn(
         "inline-flex h-10 items-center justify-center gap-2 rounded-xl px-4 text-sm font-semibold transition disabled:cursor-not-allowed disabled:opacity-50",
         styles[variant],
@@ -89,6 +90,19 @@ const notifyPickerChange = (
   onChange({ target, currentTarget: target } as ChangeEvent<HTMLInputElement>);
 };
 
+function trapFocus(event: KeyboardEvent, panel: HTMLElement | null) {
+  if (!panel) return;
+  const controls = Array.from(panel.querySelectorAll<HTMLElement>('button:not([disabled]), input:not([disabled]), select:not([disabled]), [href], [tabindex="0"]'));
+  const first = controls[0];
+  const last = controls[controls.length - 1];
+  if (!first || !last) return;
+  if (event.shiftKey && (document.activeElement === first || document.activeElement === panel)) {
+    event.preventDefault(); last.focus();
+  } else if (!event.shiftKey && (document.activeElement === last || document.activeElement === panel)) {
+    event.preventDefault(); first.focus();
+  }
+}
+
 function PickerPopover({
   open,
   anchorRef,
@@ -105,6 +119,7 @@ function PickerPopover({
   children: ReactNode;
 }) {
   const [position, setPosition] = useState({ left: 12, top: 12, width: 320, compact: false });
+  const panelRef = useRef<HTMLElement>(null);
 
   useEffect(() => {
     if (!open) return;
@@ -135,11 +150,18 @@ function PickerPopover({
   useEffect(() => {
     if (!open) return;
     const closeWithEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") onClose();
+      if (event.key === "Escape") {
+        event.preventDefault();
+        event.stopImmediatePropagation();
+        onClose();
+        anchorRef.current?.focus();
+      }
+      if (event.key === "Tab") trapFocus(event, panelRef.current);
     };
-    document.addEventListener("keydown", closeWithEscape);
-    return () => document.removeEventListener("keydown", closeWithEscape);
-  }, [onClose, open]);
+    panelRef.current?.focus();
+    document.addEventListener("keydown", closeWithEscape, true);
+    return () => document.removeEventListener("keydown", closeWithEscape, true);
+  }, [anchorRef, onClose, open]);
 
   if (!open || typeof document === "undefined") return null;
   return createPortal(
@@ -148,6 +170,9 @@ function PickerPopover({
       onMouseDown={onClose}
     >
       <section
+        ref={panelRef}
+        data-picker-popover="true"
+        tabIndex={-1}
         className={cn(
           "fixed border border-slate-200 bg-white p-4 text-slate-800 shadow-2xl",
           position.compact
@@ -261,7 +286,10 @@ export function DateInput({
           <button type="button" className={pickerIconButton} aria-label="上一個月" onClick={() => changeMonth(-1)}>
             <ChevronLeft size={19} />
           </button>
-          <p className="font-semibold tabular-nums">{viewYear}年 {viewMonth}月</p>
+          <div className="flex min-w-0 items-center gap-1">
+            <input aria-label="跳至年份" type="number" min={1} max={9999} value={viewYear} className="h-9 w-20 rounded-lg border border-slate-200 px-2 text-sm" onChange={(event) => { const next = Number(event.target.value); if (next >= 1 && next <= 9999) setViewYear(next); }} />
+            <select aria-label="跳至月份" value={viewMonth} className="h-9 rounded-lg border border-slate-200 px-2 text-sm" onChange={(event) => setViewMonth(Number(event.target.value))}>{Array.from({ length: 12 }, (_, i) => <option key={i + 1} value={i + 1}>{i + 1}月</option>)}</select>
+          </div>
           <button type="button" className={pickerIconButton} aria-label="下一個月" onClick={() => changeMonth(1)}>
             <ChevronRight size={19} />
           </button>
@@ -372,7 +400,7 @@ export function MonthInput({
           <button type="button" className={pickerIconButton} aria-label="上一年" onClick={() => setViewYear((current) => current - 1)}>
             <ChevronLeft size={19} />
           </button>
-          <p className="font-semibold tabular-nums">{viewYear}年</p>
+          <label className="flex items-center gap-1 font-semibold"><input type="number" min="1" max="9999" aria-label="跳至年份" className="w-24 rounded-lg border border-slate-200 bg-white px-2 py-1 tabular-nums" value={viewYear} onChange={(event) => { const year = Number(event.target.value); if (year >= 1 && year <= 9999) setViewYear(year); }} />年</label>
           <button type="button" className={pickerIconButton} aria-label="下一年" onClick={() => setViewYear((current) => current + 1)}>
             <ChevronRight size={19} />
           </button>
@@ -532,6 +560,7 @@ export function Dialog({
     dialogRef.current?.focus();
 
     function handleKeyDown(event: KeyboardEvent) {
+      if (event.defaultPrevented || document.querySelector('[data-picker-popover="true"]')) return;
       if (event.key === "Escape") {
         event.preventDefault();
         onCloseRef.current();
@@ -677,20 +706,20 @@ export function MobileWizardActions({
   return (
     <>
       <div className="mobile-safe-actions sticky bottom-0 z-20 -mx-4 mt-5 flex gap-2 border-t border-slate-100 bg-white/95 px-4 py-3 backdrop-blur sm:hidden">
-        <Button type="button" variant="secondary" className="flex-1" onClick={current === 1 ? onCancel : onPrevious}>
+        <Button type="button" variant="secondary" className="flex-1" disabled={pending} onClick={current === 1 ? onCancel : onPrevious}>
           {current === 1 ? "取消" : <><ChevronLeft size={16} /> 上一步</>}
         </Button>
         {current < total ? (
-          <Button type="button" className="flex-1" onClick={onNext}>
+          <Button key="next-step" type="button" className="flex-1" disabled={pending} onClick={onNext}>
             下一步 <ChevronRight size={16} />
           </Button>
         ) : (
-          <Button type="submit" className="flex-1" disabled={pending || submitDisabled}>{submitLabel}</Button>
+          <Button key="submit-form" type="submit" className="flex-1" disabled={pending || submitDisabled}>{pending ? "儲存中…" : submitLabel}</Button>
         )}
       </div>
       <div className="hidden justify-end gap-3 pt-2 sm:flex">
-        <Button type="button" variant="ghost" onClick={onCancel}>取消</Button>
-        <Button type="submit" disabled={pending || submitDisabled}>{submitLabel}</Button>
+        <Button type="button" variant="ghost" disabled={pending} onClick={onCancel}>取消</Button>
+        <Button type="submit" disabled={pending || submitDisabled}>{pending ? "儲存中…" : submitLabel}</Button>
       </div>
     </>
   );

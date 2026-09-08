@@ -14,6 +14,7 @@ import {
   TrendingUp,
 } from "lucide-react";
 import { api } from "../api";
+import { invalidateFinanceData } from "../appQueries";
 import { taipeiDateInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
 import type { Account, Position } from "../types";
@@ -166,10 +167,7 @@ export default function InvestmentsPage() {
     mutationFn: (payload: Record<string, unknown>) =>
       api("/investment-trades", { method: "POST", body: JSON.stringify(payload) }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["positions"] });
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
-      client.invalidateQueries({ queryKey: ["transactions"] });
+      invalidateFinanceData(client, ["positions","accounts","dashboard","transactions"]);
       setCreateOpen(false);
       resetTradeDraft();
     },
@@ -178,8 +176,7 @@ export default function InvestmentsPage() {
   const deletePosition = useMutation({
     mutationFn: (id: number) => api(`/positions/${id}`, { method: "DELETE" }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["positions"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["positions","dashboard"]);
     },
   });
 
@@ -190,9 +187,7 @@ export default function InvestmentsPage() {
         body: JSON.stringify({ quantity, average_cost: averageCost }),
       }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["positions"] });
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["positions","accounts","dashboard"]);
       setAdjustingPosition(null);
       setAdjustQuantity("");
       setAdjustAverageCost("");
@@ -275,8 +270,7 @@ export default function InvestmentsPage() {
       errors: string[];
     }>("/market/refresh?force=true", { method: "POST" }),
     onSuccess: (result) => {
-      client.invalidateQueries({ queryKey: ["positions"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["positions","dashboard"]);
       const warnings = result.warnings || [];
       if (result.updated === 0 && result.errors.length === 0 && warnings.length === 0) {
         setRefreshMessage("目前行情已是最新，暫時不需要再次呼叫外部服務。");
@@ -534,7 +528,8 @@ export default function InvestmentsPage() {
         </div>
       )}
 
-      {positions.isError ? (
+      {positions.isError && positions.data && <p role="alert" className="mb-4 text-amber-800">持倉更新失敗，目前保留上次資料。<Button onClick={() => positions.refetch()}>重試</Button></p>}
+      {positions.isError && !positions.data ? (
         <Card className="overflow-hidden">
           <EmptyState
             icon={<CircleAlert size={26} />}

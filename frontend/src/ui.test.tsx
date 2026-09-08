@@ -38,6 +38,24 @@ describe("Dialog accessibility", () => {
 });
 
 describe("custom date pickers", () => {
+  it("closes only the calendar with Escape and preserves the surrounding draft", async () => {
+    const user = userEvent.setup();
+    function Harness() {
+      const [open, setOpen] = useState(true);
+      return <Dialog open={open} onClose={() => setOpen(false)} title="更新餘額">
+        <Input aria-label="餘額" defaultValue="1200" />
+        <DateInput defaultValue="2026-08-18" />
+      </Dialog>;
+    }
+    render(<Harness />);
+    await user.click(screen.getByRole("button", { name: "選擇日期" }));
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog", { name: "選擇日期" })).toBeNull();
+    expect((screen.getByRole("textbox", { name: "餘額" }) as HTMLInputElement).value).toBe("1200");
+    expect(document.activeElement).toBe(screen.getByRole("button", { name: "選擇日期" }));
+    await user.keyboard("{Escape}");
+    expect(screen.queryByRole("dialog")).toBeNull();
+  });
   it("selects a date from the calendar and updates the submitted value", async () => {
     const user = userEvent.setup();
     render(

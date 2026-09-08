@@ -12,6 +12,7 @@ export interface Account {
   auto_balance_base_twd?: number | null;
   valuation_mode: "cash_plus_positions" | "manual_total" | "auto_estimate";
   archived: boolean;
+  linked_email_rules?: string[];
   note?: string;
   balance: number;
   balance_twd: number;
@@ -65,6 +66,19 @@ export interface Transaction {
   category_color: string;
   source: string;
   note?: string;
+  excluded?: boolean;
+  revision?: number;
+  can_correct?: boolean;
+}
+
+export interface TransactionPage {
+  items: Transaction[];
+  total: number;
+  page: number;
+  page_size: number;
+  matched_total: number;
+  transfer_count: number;
+  unclassified_count: number;
 }
 
 export interface Position {
@@ -136,6 +150,8 @@ export interface SpendingAnalysis {
     latest_date: string | null;
     status: "recorded" | "expected";
     source: "detected" | "custom";
+    match_name?: string | null;
+    confirmed?: boolean;
     due_day: number | null;
     note: string | null;
   }[];
@@ -145,6 +161,7 @@ export interface SpendingAnalysis {
 export interface RecurringExpenseDefinition {
   id: number;
   name: string;
+  match_name?: string | null;
   owner: "me" | "partner" | "shared";
   amount: number;
   due_day: number | null;

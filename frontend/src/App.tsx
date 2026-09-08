@@ -1,4 +1,4 @@
-import { type FormEvent, lazy, Suspense, useEffect, useState } from "react";
+import { type FormEvent, lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   ArrowDownLeft,
   ArrowLeftRight,
@@ -19,9 +19,9 @@ import {
   X,
 } from "lucide-react";
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
-import { useIsFetching, useQueryClient } from "@tanstack/react-query";
+import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
 import { api, ApiError, AUTH_REQUIRED, clearAuthToken, getAuthToken, setAuthToken } from "./api";
-import { prefetchPrimaryData, prefetchSecondaryData, preloadPageModules } from "./appQueries";
+import { invalidateFinanceData, prefetchPrimaryData, prefetchSecondaryData, preloadPageModules } from "./appQueries";
 import { ownerFilterOptions, useOwnerFilter } from "./ownerFilter";
 import { Button, cn, Input, Select } from "./ui";
 const DashboardPage = lazy(() => import("./pages/DashboardPage"));
@@ -52,7 +52,7 @@ function GlobalOwnerSelect({ compact = false }: { compact?: boolean }) {
 
   return (
     <label className={cn("flex items-center gap-2", compact ? "text-xs" : "text-sm")}>
-      {!compact && <span className="font-medium text-slate-500">目前查看</span>}
+      <span className={compact ? "sr-only" : "font-medium text-slate-500"}>目前查看</span>
       <Select
         className={cn(compact ? "h-10 w-24" : "h-10 w-32")}
         value={ownerFilter}
@@ -113,7 +113,7 @@ function MobileQuickActions() {
     },
     {
       label: "更新餘額",
-      description: "建立最新帳戶快照",
+      description: "記錄現在的帳戶餘額",
       icon: RefreshCw,
       tone: "bg-violet-50 text-violet-700",
       target: "/accounts?quick=balance",
@@ -210,7 +210,7 @@ function Sidebar({
         className={cn(
           "fixed inset-y-0 left-0 z-40 flex flex-col bg-forest text-white transition-all duration-300",
           compact ? "lg:w-[86px]" : "lg:w-[250px]",
-          mobileOpen ? "w-[270px] translate-x-0" : "w-[270px] -translate-x-full lg:translate-x-0",
+          mobileOpen ? "visible w-[270px] translate-x-0" : "invisible w-[270px] -translate-x-full lg:visible lg:translate-x-0",
         )}
       >
         <div className="flex h-24 items-center gap-3 px-6">
@@ -227,6 +227,7 @@ function Sidebar({
           )}
           <button
             className="ml-auto rounded-lg p-2 text-emerald-100/70 hover:bg-white/10 lg:hidden"
+            aria-label="關閉導覽選單"
             onClick={onMobileClose}
           >
             <X size={19} />
@@ -478,7 +479,7 @@ function PublicInfoPage({ kind }: { kind: "privacy" | "terms" }) {
 }
 
 function GlobalQueryProgress() {
-  const activeFetches = useIsFetching({ type: "active" });
+  const activeFetches = useIsFetching({ type: "active", predicate: (query) => query.state.data === undefined && !["activity", "gmail-status", "automation-status"].includes(String(query.queryKey[0])) });
 
   if (!activeFetches) return null;
 
@@ -499,6 +500,15 @@ function FinanceApp() {
   const [mobileOpen, setMobileOpen] = useState(false);
   const [ownerFilter] = useOwnerFilter();
   const queryClient = useQueryClient();
+  const lastRevision = useRef<string | undefined>(undefined);
+  const activity = useQuery({ queryKey: ["activity"], queryFn: () => api<{ revision: string }>("/activity"), refetchInterval: 60_000, refetchOnWindowFocus: true });
+  useEffect(() => {
+    if (!activity.data) return;
+    if (lastRevision.current !== undefined && lastRevision.current !== activity.data.revision) {
+      void invalidateFinanceData(queryClient, ["gmail-status", "automation-status", "email-card-rules"]);
+    }
+    lastRevision.current = activity.data.revision;
+  }, [activity.data, queryClient]);
   const showGlobalOwnerFilter = useShowGlobalOwnerFilter();
 
   useEffect(() => {
@@ -524,9 +534,7 @@ function FinanceApp() {
       void api<{ updated: number }>("/market/refresh", { method: "POST" })
         .then((result) => {
           if (!result.updated) return;
-          void queryClient.invalidateQueries({ queryKey: ["accounts"] });
-          void queryClient.invalidateQueries({ queryKey: ["positions"] });
-          void queryClient.invalidateQueries({ queryKey: ["dashboard"] });
+          void invalidateFinanceData(queryClient);
         })
         .catch(() => undefined);
     };
@@ -552,6 +560,7 @@ function FinanceApp() {
           <button
             className="rounded-xl border border-slate-200 bg-white p-2.5 text-slate-700"
             onClick={() => setMobileOpen(true)}
+            aria-label="開啟導覽選單"
           >
             <Menu size={20} />
           </button>
@@ -585,6 +594,9 @@ function FinanceApp() {
         </main>
       </div>
       <MobileQuickActions />
+      <nav aria-label="手機常用導覽" className="mobile-bottom-nav fixed inset-x-0 bottom-0 z-30 flex border-t border-slate-200 bg-canvas/95 backdrop-blur lg:hidden">
+        {[navigation[0], navigation[2], navigation[1]].map(({ to, label, icon: Icon }) => <NavLink key={to} to={to} end={to === "/"} className={({ isActive }) => cn("flex min-h-14 flex-1 flex-col items-center justify-center gap-1 text-xs font-semibold", isActive ? "text-emerald-700" : "text-slate-500")}><Icon size={20} /><span>{label}</span></NavLink>)}
+      </nav>
     </div>
   );
 }

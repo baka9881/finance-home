@@ -66,6 +66,29 @@ class TransactionUpdate(BaseModel):
     rule_keyword: str | None = None
 
 
+class TransactionCorrection(BaseModel):
+    action: Literal["edit", "exclude", "restore"]
+    transaction_date: date | None = None
+    description: str | None = Field(default=None, min_length=1, max_length=300)
+    amount: Decimal | None = Field(default=None, gt=-1000000000000, lt=1000000000000, allow_inf_nan=False)
+    token: str | None = None
+
+
+class BatchClassification(BaseModel):
+    ids: list[int] = Field(min_length=1, max_length=200)
+    category_id: int
+
+
+class UndoClassificationItem(BaseModel):
+    id: int
+    category_id: int | None
+    expected_category_id: int
+
+
+class UndoClassification(BaseModel):
+    items: list[UndoClassificationItem] = Field(min_length=1, max_length=200)
+
+
 class PositionCreate(BaseModel):
     account_id: int
     market: str
@@ -131,6 +154,7 @@ class GoalUpdate(BaseModel):
 
 class RecurringExpenseCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
+    match_name: str | None = Field(default=None, max_length=300)
     owner: str = "me"
     amount: Decimal = Field(gt=0)
     due_day: int | None = Field(default=None, ge=1, le=31)
@@ -142,6 +166,7 @@ class RecurringExpenseCreate(BaseModel):
 
 class RecurringExpenseUpdate(BaseModel):
     name: str | None = Field(default=None, min_length=1, max_length=100)
+    match_name: str | None = Field(default=None, max_length=300)
     owner: str | None = None
     amount: Decimal | None = Field(default=None, gt=0)
     due_day: int | None = Field(default=None, ge=1, le=31)

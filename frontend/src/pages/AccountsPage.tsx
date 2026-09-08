@@ -1,6 +1,6 @@
 import { FormEvent, useEffect, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { useSearchParams } from "react-router-dom";
+import { Link, useSearchParams } from "react-router-dom";
 import {
   Banknote,
   Bitcoin,
@@ -15,6 +15,8 @@ import {
   Wallet,
 } from "lucide-react";
 import { api } from "../api";
+import CreditCardCycles from "../CreditCardCycles";
+import { invalidateFinanceData } from "../appQueries";
 import { daysBetweenDateValues, taipeiDateInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
 import type { Account } from "../types";
@@ -54,7 +56,6 @@ const ownerOptions = [
   { value: "all", label: "全部" },
   { value: "me", label: "我" },
   { value: "partner", label: "小居" },
-  { value: "shared", label: "共同" },
 ];
 const accountOwnerOptions = ownerOptions.filter((option) => option.value !== "all");
 const customInstitutionValue = "__custom__";
@@ -157,6 +158,7 @@ export default function AccountsPage() {
   const [balancePickerOpen, setBalancePickerOpen] = useState(false);
   const [balanceAccount, setBalanceAccount] = useState<Account | null>(null);
   const [detailAccount, setDetailAccount] = useState<Account | null>(null);
+  const [archiveTarget, setArchiveTarget] = useState<Account | null>(null);
   const [message, setMessage] = useState("");
   const [ownerFilter] = useOwnerFilter();
   const [accountType, setAccountType] = useState("bank");
@@ -172,6 +174,9 @@ export default function AccountsPage() {
     const quickAction = searchParams.get("quick");
     if (quickAction === "balance") {
       setBalancePickerOpen(true);
+    } else if (quickAction === "create") {
+      setCreateOpen(true);
+      setAccountStep(1);
     } else if (quickAction === "loan") {
       setAccountType("loan");
       setNature("liability");
@@ -225,10 +230,13 @@ export default function AccountsPage() {
     const canAutoReplaceName = shouldReplaceDraftName();
     setAccountType(nextType);
     setNature(nextType === "credit_card" || nextType === "loan" ? "liability" : "asset");
-    setInstitutionChoice("");
-    setCustomInstitution("");
+    // Preserve an institution already entered; banks can offer both deposits and cards.
+    if (selectedInstitution && !institutionsFor(nextType).includes(selectedInstitution)) {
+      setInstitutionChoice(customInstitutionValue);
+      setCustomInstitution(selectedInstitution);
+    }
     if (canAutoReplaceName) {
-      setAccountName(defaultAccountName(nextType, ""));
+      setAccountName(defaultAccountName(nextType, selectedInstitution));
       setUseCustomAccountName(false);
     }
   }
@@ -268,16 +276,15 @@ export default function AccountsPage() {
   }
 
   const accounts = useQuery({
-    queryKey: ["accounts", ownerFilter],
-    queryFn: () => api<Account[]>(`/accounts?owner=${ownerFilter}`),
+    queryKey: ["accounts", ownerFilter, "including-archived"],
+    queryFn: () => api<Account[]>(`/accounts?owner=${ownerFilter}&include_archived=true`),
   });
 
   const createAccount = useMutation({
     mutationFn: (payload: Record<string, unknown>) =>
       api<Account>("/accounts", { method: "POST", body: JSON.stringify(payload) }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["accounts","dashboard"]);
       setCreateOpen(false);
       resetAccountDraft();
       setMessage("帳戶已建立。");
@@ -288,27 +295,33 @@ export default function AccountsPage() {
     mutationFn: ({ id, payload }: { id: number; payload: Record<string, unknown> }) =>
       api(`/accounts/${id}/balance`, { method: "POST", body: JSON.stringify(payload) }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["accounts","dashboard"]);
       setBalanceAccount(null);
-      setMessage("餘額快照已更新。");
+      setMessage("帳戶餘額已更新。");
     },
   });
 
   const deleteAccount = useMutation({
-    mutationFn: (id: number) => api(`/accounts/${id}`, { method: "DELETE" }),
+    mutationFn: (id: number) => api(`/accounts/${id}/archive`, { method: "POST" }),
     onSuccess: () => {
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
-      setMessage("帳戶已刪除。");
+      invalidateFinanceData(client, ["accounts","dashboard"]);
+      setArchiveTarget(null);
+      setMessage("帳戶已封存，歷史資料保留；可隨時從下方恢復。");
+    },
+  });
+
+  const restoreAccount = useMutation({
+    mutationFn: (id: number) => api(`/accounts/${id}/restore`, { method: "POST" }),
+    onSuccess: () => {
+      setMessage("帳戶已恢復，重新列入總資產；原本啟用的同步會繼續運作。");
+      return invalidateFinanceData(client, ["email-card-rules", "gmail-status"]);
     },
   });
 
   const calibrateAutoEstimate = useMutation({
     mutationFn: (id: number) => api<Account>(`/accounts/${id}/auto-estimate`, { method: "POST" }),
     onSuccess: (account) => {
-      client.invalidateQueries({ queryKey: ["accounts"] });
-      client.invalidateQueries({ queryKey: ["dashboard"] });
+      invalidateFinanceData(client, ["accounts","dashboard"]);
       setDetailAccount(account);
       setMessage("已啟用並校準自動估算總資產。");
     },
@@ -349,13 +362,14 @@ export default function AccountsPage() {
   const visibleAccounts = accounts.data?.filter((item) => !item.archived) || [];
   const assetAccounts = visibleAccounts.filter((item) => item.nature === "asset");
   const liabilityAccounts = visibleAccounts.filter((item) => item.nature === "liability");
+  const archivedAccounts = (accounts.data || []).filter((item) => item.archived);
 
   return (
     <>
       <PageHeader
         eyebrow="Accounts"
         title="帳戶與餘額"
-        description="以餘額快照記錄銀行、證券、交易所與負債，不會因交易匯入不完整而誤算。"
+        description="查看銀行、投資與信用卡餘額，也可以更新或恢復已封存帳戶。"
         action={
           <div className="flex flex-wrap gap-2">
             <Button onClick={openCreateDialog}>
@@ -372,13 +386,18 @@ export default function AccountsPage() {
         </div>
       )}
 
+      {accounts.isError && (
+        <Card className="mb-5">
+          <EmptyState icon={<RefreshCw size={24} />} title="帳戶資料暫時無法更新" description="原有帳戶不會因此消失，請重試。" action={<Button onClick={() => accounts.refetch()}>重新載入</Button>} />
+        </Card>
+      )}
       {accounts.isLoading ? (
         <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
           {[1, 2, 3].map((item) => (
             <div key={item} className="h-64 animate-pulse rounded-2xl bg-slate-200/70" />
           ))}
         </div>
-      ) : !visibleAccounts.length ? (
+      ) : !accounts.data ? null : !visibleAccounts.length ? (
         <Card>
           <EmptyState
             icon={<Building2 size={26} />}
@@ -395,11 +414,7 @@ export default function AccountsPage() {
             accounts={assetAccounts}
             onBalance={setBalanceAccount}
             onDetail={setDetailAccount}
-            onDelete={(account) => {
-              if (window.confirm(`確定刪除「${account.name}」？這會從帳戶頁與總資產移除，但會保留歷史資料。`)) {
-                deleteAccount.mutate(account.id);
-              }
-            }}
+            onDelete={setArchiveTarget}
           />
           {liabilityAccounts.length > 0 && (
             <AccountGroup
@@ -408,15 +423,44 @@ export default function AccountsPage() {
               accounts={liabilityAccounts}
               onBalance={setBalanceAccount}
               onDetail={setDetailAccount}
-              onDelete={(account) => {
-                if (window.confirm(`確定刪除「${account.name}」？這會從帳戶頁與總資產移除，但會保留歷史資料。`)) {
-                  deleteAccount.mutate(account.id);
-                }
-              }}
+              onDelete={setArchiveTarget}
             />
           )}
         </div>
       )}
+
+      <CreditCardCycles accountIds={visibleAccounts.filter((item) => item.account_type === "credit_card").map((item) => item.id)} />
+      {archivedAccounts.length > 0 && (
+        <Card className="mt-6 p-5">
+          <h2 className="font-bold">已封存帳戶（{archivedAccounts.length}）</h2>
+          <p className="mt-1 text-sm text-slate-500">這些帳戶不列入總資產，歷史交易仍可查詢。若信用卡不見了，可從這裡恢復。</p>
+          <div className="mt-4 space-y-3">
+            {archivedAccounts.map((account) => (
+              <div key={account.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 p-3">
+                <div className="min-w-0">
+                  <p className="font-semibold break-words">{account.name}</p>
+                  <p className="text-xs text-slate-500">{account.owner_label} · {account.currency} {account.balance.toLocaleString()}</p>
+                  {!!account.linked_email_rules?.length && <p className="mt-1 text-sm text-amber-700">信用卡同步已暫停：{account.linked_email_rules.join("、")}</p>}
+                </div>
+                <Button variant="secondary" disabled={restoreAccount.isPending} onClick={() => restoreAccount.mutate(account.id)}>
+                  {restoreAccount.isPending && restoreAccount.variables === account.id ? "恢復中…" : "恢復帳戶"}
+                </Button>
+              </div>
+            ))}
+          </div>
+          {restoreAccount.isError && <p role="alert" className="mt-3 text-sm text-red-600">恢復失敗：{restoreAccount.error.message}</p>}
+        </Card>
+      )}
+
+      <Dialog open={Boolean(archiveTarget)} onClose={() => { if (!deleteAccount.isPending) setArchiveTarget(null); }} title="封存帳戶" description="不刪除歷史交易，可以隨時恢復。">
+        {archiveTarget && <div className="space-y-4">
+          <p>「{archiveTarget.name}」封存後，餘額不再列入總資產，且不能新增交易。</p>
+          {!!archiveTarget.linked_email_rules?.length && <div className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800">下列信用卡的郵件同步與繳款記帳將暫停：{archiveTarget.linked_email_rules.join("、")}。恢復帳戶後繼續。</div>}
+          {archiveTarget.account_type === "crypto" && <p className="text-sm text-amber-700">交易所自動同步也會暫停。</p>}
+          {deleteAccount.isError && <p role="alert" className="text-sm text-red-600">{deleteAccount.error.message}</p>}
+          <div className="flex justify-end gap-3"><Button variant="ghost" disabled={deleteAccount.isPending} onClick={() => setArchiveTarget(null)}>取消</Button><Button disabled={deleteAccount.isPending} onClick={() => deleteAccount.mutate(archiveTarget.id)}>{deleteAccount.isPending ? "封存中…" : "確認封存"}</Button></div>
+        </div>}
+      </Dialog>
 
       <Dialog
         open={createOpen}
@@ -427,9 +471,34 @@ export default function AccountsPage() {
       >
         <form ref={accountFormRef} className="space-y-5" onSubmit={submitAccount}>
           <FormContext value="建立新的財務帳戶" />
-          <MobileWizardProgress current={accountStep} labels={["帳戶資料", "帳戶分類", "餘額與所有人"]} />
+          <MobileWizardProgress current={accountStep} labels={["帳戶類型", "名稱與銀行", "餘額與所有人"]} />
           <MobileWizardStep step={1} current={accountStep}>
-          <FormStep number={1} title="這是什麼帳戶？" description="先選常用名稱與金融機構，清單沒有也可以自訂。">
+          <FormStep number={1} title="這個帳戶怎麼分類？" tone="blue">
+          <div className="grid gap-4 sm:grid-cols-2">
+            <Field label="帳戶類型">
+              <Select
+                name="account_type"
+                value={accountType}
+                onChange={(event) => changeAccountType(event.target.value)}
+              >
+                {accountTypes.map((item) => (
+                  <option key={item.value} value={item.value}>
+                    {item.label}
+                  </option>
+                ))}
+              </Select>
+            </Field>
+            <Field label="帳戶性質">
+              <Select name="nature" value={nature} onChange={(event) => setNature(event.target.value)}>
+                <option value="asset">資產</option>
+                <option value="liability">負債</option>
+              </Select>
+            </Field>
+          </div>
+          </FormStep>
+          </MobileWizardStep>
+          <MobileWizardStep step={2} current={accountStep}>
+          <FormStep number={2} title="這是什麼帳戶？" description="先選常用名稱與金融機構，清單沒有也可以自訂。">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="帳戶名稱" hint="清單沒有的話選「其他 / 自訂」。">
               <Select
@@ -482,33 +551,8 @@ export default function AccountsPage() {
           </div>
           </FormStep>
           </MobileWizardStep>
-          <MobileWizardStep step={2} current={accountStep}>
-          <FormStep number={2} title="這個帳戶怎麼分類？" tone="blue">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="帳戶類型">
-              <Select
-                name="account_type"
-                value={accountType}
-                onChange={(event) => changeAccountType(event.target.value)}
-              >
-                {accountTypes.map((item) => (
-                  <option key={item.value} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
-              </Select>
-            </Field>
-            <Field label="帳戶性質">
-              <Select name="nature" value={nature} onChange={(event) => setNature(event.target.value)}>
-                <option value="asset">資產</option>
-                <option value="liability">負債</option>
-              </Select>
-            </Field>
-          </div>
-          </FormStep>
-          </MobileWizardStep>
           <MobileWizardStep step={3} current={accountStep}>
-          <FormStep number={3} title="目前有多少錢？" description="這會成為第一筆餘額快照。" tone="purple">
+          <FormStep number={3} title="目前有多少錢？" description="這會成為第一筆餘額紀錄。" tone="purple">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="幣別">
               <Select name="currency" defaultValue="TWD">
@@ -616,7 +660,7 @@ export default function AccountsPage() {
             <EmptyState
               icon={<Wallet size={22} />}
               title="目前沒有可更新的帳戶"
-              description="請先建立帳戶，再新增餘額快照。"
+              description="請先建立帳戶，再新增餘額紀錄。"
               action={<Button onClick={() => { setBalancePickerOpen(false); openCreateDialog(); }}>新增帳戶</Button>}
             />
           )}
@@ -627,7 +671,7 @@ export default function AccountsPage() {
         open={Boolean(balanceAccount)}
         onClose={() => setBalanceAccount(null)}
         title={`更新${balanceAccount?.name || ""}餘額`}
-        description="這會建立一筆新的餘額快照，不會改動舊資料。"
+        description="這會建立一筆新的餘額紀錄，不會改動舊資料。"
       >
         <form className="space-y-5" onSubmit={submitBalance}>
           <FormContext value={balanceAccount?.name || "更新帳戶餘額"} />
@@ -637,7 +681,7 @@ export default function AccountsPage() {
             </Field>
           </FormStep>
           <FormStep number={2} title="這筆餘額是哪一天的？" tone="blue">
-            <Field label="快照日期">
+            <Field label="餘額日期">
               <DateInput name="snapshot_date" defaultValue={taipeiDateInputValue()} required />
             </Field>
           </FormStep>
@@ -659,7 +703,7 @@ export default function AccountsPage() {
               取消
             </Button>
             <Button type="submit" disabled={addBalance.isPending}>
-              {addBalance.isPending ? "儲存中…" : "儲存快照"}
+              {addBalance.isPending ? "儲存中…" : "儲存餘額"}
             </Button>
           </div>
         </form>
@@ -680,7 +724,7 @@ export default function AccountsPage() {
             <div className="grid gap-3 sm:grid-cols-2">
               <div className="rounded-2xl border border-slate-100 p-4">
                 <p className="text-xs font-medium text-slate-400">
-                  {detailAccount.valuation_mode === "auto_estimate" ? "非持倉估算餘額" : "餘額快照"}
+                  {detailAccount.valuation_mode === "auto_estimate" ? "非持倉估算餘額" : "餘額紀錄"}
                 </p>
                 <p className="mt-1 text-lg font-bold text-slate-800">
                   {money(
@@ -689,7 +733,7 @@ export default function AccountsPage() {
                       : detailAccount.balance_twd,
                   )}
                 </p>
-                <p className="mt-1 text-xs text-slate-400">{detailAccount.balance_date || "尚未建立快照"}</p>
+                <p className="mt-1 text-xs text-slate-400">{detailAccount.balance_date || "尚未記錄餘額"}</p>
               </div>
               <div className="rounded-2xl border border-slate-100 p-4">
                 <p className="text-xs font-medium text-slate-400">投資持倉明細</p>
@@ -701,8 +745,8 @@ export default function AccountsPage() {
               {detailAccount.valuation_mode === "auto_estimate"
                 ? "此帳戶使用「自動估算總資產」：總資產 = 非持倉估算餘額 + 最新持倉市值。之後持倉行情變動會反映到帳戶總值。"
                 : detailAccount.valuation_mode === "manual_total"
-                  ? "此帳戶使用「手動總資產」：總資產只採用餘額快照，持倉明細不會重複加總。"
-                  : "此帳戶使用「餘額 + 持倉」：總資產會由餘額快照加上持倉市值。"}
+                  ? "此帳戶使用「手動總資產」：總資產只採用餘額紀錄，持倉明細不會重複加總。"
+                  : "此帳戶使用「餘額 + 持倉」：總資產會由餘額紀錄加上持倉市值。"}
             </div>
             {detailAccount.positions_count > 0 && (
               <div className="flex flex-col gap-2 rounded-2xl border border-slate-100 p-4 sm:flex-row sm:items-center sm:justify-between">
@@ -787,7 +831,7 @@ function AccountGroup({
                   </p>
                 </div>
                 <div className="mt-6 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
-                  <span>快照 {account.balance_date || "尚未建立"}</span>
+                  <span>餘額更新 {account.balance_date || "尚未建立"}</span>
                   <div className="flex flex-wrap items-center gap-2">
                     {!account.balance_date && <Badge tone="amber">尚未更新</Badge>}
                     {snapshotIsStale && <Badge tone="amber">{staleDays} 天未更新</Badge>}
@@ -808,7 +852,8 @@ function AccountGroup({
                   variant="ghost"
                   className="px-3 text-slate-400 hover:bg-red-50 hover:text-red-600"
                   onClick={() => onDelete(account)}
-                  title="刪除帳戶"
+                  title="封存帳戶"
+                  aria-label={`封存${account.name}`}
                 >
                   <Trash2 size={15} />
                 </Button>
