@@ -267,19 +267,35 @@ export default function InvestmentsPage() {
   }
 
   const refresh = useMutation({
-    mutationFn: () => api<{
-      updated: number;
-      skipped: number;
-      updated_items?: string[];
-      cached_items?: string[];
-      manual_items?: string[];
-      warnings?: string[];
-      errors: string[];
-    }>("/market/refresh?force=true", { method: "POST" }),
+    mutationFn: async () => {
+      const market = await api<{
+        updated: number;
+        skipped: number;
+        updated_items?: string[];
+        cached_items?: string[];
+        manual_items?: string[];
+        warnings?: string[];
+        errors: string[];
+      }>("/market/refresh?force=true", { method: "POST" });
+      let exchange: { connected: number; updated: number; skipped: number; errors: string[] } | undefined;
+      let exchangeError: string | undefined;
+      try {
+        exchange = await api<{
+          connected: number;
+          updated: number;
+          skipped: number;
+          errors: string[];
+        }>("/exchanges/sync?force=true", { method: "POST" });
+      } catch (error) {
+        exchangeError = (error as Error).message;
+      }
+      return { ...market, exchange, exchangeError };
+    },
     onSuccess: (result) => {
-      invalidateFinanceData(client, ["positions","dashboard"]);
+      invalidateFinanceData(client, ["positions","accounts","dashboard","binance-connections"]);
       const warnings = result.warnings || [];
-      if (result.updated === 0 && result.errors.length === 0 && warnings.length === 0) {
+      const exchangeErrors = result.exchange?.errors || [];
+      if (result.updated === 0 && result.errors.length === 0 && warnings.length === 0 && !result.exchange?.updated && !exchangeErrors.length && !result.exchangeError) {
         setRefreshMessage("目前行情已是最新，暫時不需要再次呼叫外部服務。");
         return;
       }
@@ -296,6 +312,9 @@ export default function InvestmentsPage() {
       if (result.manual_items?.length) {
         summary.push(`手動價格未更新：${result.manual_items.join("、")}`);
       }
+      if (result.exchange?.updated) summary.push("幣安帳戶與合約持倉已同步");
+      if (exchangeErrors.length) summary.push(`幣安同步未完成：${exchangeErrors.join("、")}`);
+      if (result.exchangeError) summary.push(`幣安同步未完成：${result.exchangeError}`);
       if (warnings.length > 0) summary.push(warnings.join("、"));
       if (result.errors.length > 0) summary.push(`失敗 ${result.errors.length} 筆：${result.errors.join("、")}`);
       setRefreshMessage(`行情更新完成：${summary.join("、")}。`);
