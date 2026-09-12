@@ -94,10 +94,8 @@ input[type="time"]::-webkit-date-and-time-value {
 }
 
 .mobile-quick-actions {
-  bottom: calc(4.75rem + env(safe-area-inset-bottom, 0px));
+  bottom: calc(1rem + env(safe-area-inset-bottom, 0px));
 }
-
-.mobile-bottom-nav { padding-bottom: env(safe-area-inset-bottom, 0px); }
 
 /* Settings uses the same calm, task-first accordion on desktop and phones. */
 .settings-mobile-section {

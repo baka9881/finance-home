@@ -1190,3 +1190,93 @@ def test_gmail_card_discovery_reads_metadata_only(monkeypatch: pytest.MonkeyPatc
 def decimal_amount(snapshot: BalanceSnapshot | None) -> Decimal:
     assert snapshot is not None
     return Decimal(str(snapshot.amount))
+
+
+@pytest.mark.parametrize("subject", ["【國泰世華銀行】電子存摺", "電子 存摺通知", "电子存折"])
+def test_deposit_passbook_is_not_card_mail(subject):
+    rule = SimpleNamespace(sender_pattern="cathaybk.com.tw", subject_pattern=None, card_last4=None)
+    assert not email_sync_module._rule_matches(rule, "service@cathaybk.com.tw", subject, None)
+    assert email_sync_module._rule_matches(rule, "service@cathaybk.com.tw", "信用卡電子帳單", None)
+    assert email_sync_module._rule_matches(rule, "service@cathaybk.com.tw", "消費彙整通知", None)
+
+
+def test_old_passbook_errors_do_not_hide_real_card_password_issues():
+    db = make_session()
+    # More than 20 irrelevant failures must not crowd out actionable card mail.
+    for index in range(25):
+        db.add(EmailImportRecord(provider="gmail", provider_message_id=f"passbook-{index}",
+            subject="【國泰世華銀行】電子存摺", status="error", error="PDF password required",
+            updated_at=datetime(2026, 9, 9)))
+    db.add(EmailImportRecord(provider="gmail", provider_message_id="real-card",
+        subject="信用卡電子帳單", status="error", error="PDF password required",
+        updated_at=datetime(2026, 9, 8)))
+    db.commit()
+    issues = email_sync_module.gmail_status(db)["issues"]
+    assert len(issues) == 1
+    assert issues[0]["subject"] == "信用卡電子帳單"
+    assert issues[0]["action"] == "password"
+    assert len(db.scalars(select(EmailImportRecord)).all()) == 26
+    db.close()
+
+
+def test_sync_skips_passbook_before_reading_pdf(monkeypatch):
+    db = make_session()
+    payment = Account(name="測試銀行", account_type="bank", nature="asset", currency="TWD", owner="me")
+    card = Account(name="測試卡", account_type="credit_card", nature="liability", currency="TWD", owner="me")
+    db.add_all([payment, card])
+    db.flush()
+    db.add(EmailCardRule(name="測試", card_account_id=card.id, payment_account_id=payment.id, sender_pattern="cathaybk.com.tw", active=True, lookback_days=90))
+    db.commit()
+    monkeypatch.setattr(email_sync_module, "_gmail_access_token", lambda _: "test")
+    def fake_get(token, path, params=None):
+        if path == "/messages":
+            return {"messages": [{"id": "passbook"}]}
+        assert path == "/messages/passbook"
+        return {"internalDate": str(int(datetime.now().timestamp() * 1000)), "payload": {"headers": [
+            {"name": "From", "value": "service@cathaybk.com.tw"},
+            {"name": "Subject", "value": "【國泰世華銀行】電子存摺"}]}}
+    monkeypatch.setattr(email_sync_module, "_gmail_get", fake_get)
+    def forbidden(*args, **kwargs):
+        pytest.fail("Passbook PDF must not be downloaded or decrypted")
+    monkeypatch.setattr(email_sync_module, "_message_content", forbidden)
+    result = sync_gmail(db)
+    assert result["errors"] == []
+    assert result["transactions_imported"] == 0
+    assert result["ignored"] == 1
+    assert not db.scalars(select(EmailImportRecord)).all()
+    assert not db.scalars(select(Transaction)).all()
+    db.close()
+
+
+@pytest.mark.parametrize("as_of,start,end,amount", [
+    (date(2026, 9, 22), date(2026, 8, 24), date(2026, 9, 23), 100.0),
+    (date(2026, 9, 23), date(2026, 8, 24), date(2026, 9, 23), 300.0),
+    (date(2026, 9, 24), date(2026, 9, 24), date(2026, 10, 23), 400.0),
+    (date(2026, 10, 1), date(2026, 9, 24), date(2026, 10, 23), 400.0),
+])
+def test_current_cycle_switches_after_closing_day(as_of, start, end, amount):
+    db = make_session()
+    payment = Account(name="Bank", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="Card", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([payment, card])
+    db.flush()
+    rule = EmailCardRule(name="Card", card_account_id=card.id, payment_account_id=payment.id,
+                         closing_day=23, payment_due_day=23, active=True)
+    db.add(rule)
+    db.flush()
+    bill = CreditCardBill(rule_id=rule.id, card_account_id=card.id, payment_account_id=payment.id,
+                          statement_date=date(2026, 8, 23), due_date=date(2026, 9, 23),
+                          amount_due=Decimal("900"), currency="TWD", status="pending")
+    db.add(bill)
+    for day, value in [(22, 100), (23, 200), (24, 400)]:
+        db.add(Transaction(account_id=card.id, transaction_date=date(2026, 9, day),
+                           description="Purchase", amount=Decimal(-value), currency="TWD",
+                           fx_rate=Decimal("1"), base_amount=Decimal(-value),
+                           transaction_kind="expense", fingerprint=f"boundary-{day}", source="gmail"))
+    db.commit()
+    result = serialize_card_cycle(db, rule, as_of)
+    assert result["current_cycle"] == {"amount": amount, "period_start": start,
+                                       "period_end": end, "transaction_count": 2 if amount == 300 else 1}
+    assert result["current_bill"]["amount_due"] == 900.0
+    assert bill.status == "pending"
+    db.close()

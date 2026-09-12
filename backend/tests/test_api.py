@@ -324,6 +324,198 @@ def test_binance_portfolio_margin_updates_tradfi_position(
     assert positions[0]["cost_status"] == "automatic"
 
 
+def test_binance_contract_sync_keeps_crypto_futures_out_of_asset_totals(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
+    client.post(
+        "/api/fx/manual",
+        json={
+            "currency": "USD",
+            "rate_date": date.today().isoformat(),
+            "rate_to_twd": 32,
+        },
+    )
+    account_response = client.post(
+        "/api/accounts",
+        json={
+            "name": "幣安合約帳戶",
+            "institution": "Binance",
+            "account_type": "crypto",
+            "nature": "asset",
+            "currency": "TWD",
+            "is_liquid": True,
+            "opening_balance": 0,
+            "opening_date": date.today().isoformat(),
+        },
+    )
+    account_id = account_response.json()["id"]
+    contract_positions: list[dict] | None = [
+        {
+            "symbol": "BTCUSDT",
+            "baseAsset": "BTC",
+            "contractType": "PERPETUAL",
+            "underlyingType": "COIN",
+            "positionAmt": "0.02",
+            "entryPrice": "55000",
+            "markPrice": "60000",
+            "positionSide": "BOTH",
+        }
+    ]
+
+    def fake_binance_snapshot(_key, _secret, **_kwargs):
+        return (
+            [{"asset": "USDT", "free": "100", "locked": "0"}],
+            {"BTCUSDT": services_module.Decimal("60000")},
+            services_module.Decimal("500"),
+            [],
+            {},
+            [],
+            contract_positions,
+            [],
+        )
+
+    monkeypatch.setattr(
+        services_module,
+        "_fetch_binance_spot_snapshot",
+        fake_binance_snapshot,
+    )
+    connected = client.post(
+        "/api/exchanges/binance/connect",
+        json={
+            "account_id": account_id,
+            "api_key": "read-only-key",
+            "api_secret": "read-only-secret",
+        },
+    )
+    assert connected.status_code == 200, connected.text
+
+    position = client.get("/api/positions").json()[0]
+    assert position["market"] == "BINANCE_FUTURES"
+    assert position["symbol"] == "BTCUSDT"
+    assert position["quantity"] == 0.02
+    assert position["display_quantity"] == 0.02
+    assert position["instrument_type"] == "futures"
+    assert position["direction"] == "long"
+    assert position["notional_value"] == 1200
+    assert position["asset_value_twd"] == 0
+    assert position["included_in_totals"] is False
+    assert position["profit_twd"] == 3200
+    account = next(item for item in client.get("/api/accounts").json() if item["id"] == account_id)
+    assert account["investments_twd"] == 0
+    assert account["total_twd"] == 16000
+
+    contract_positions[0].update(
+        {
+            "positionAmt": "-0.02",
+            "entryPrice": "65000",
+            "markPrice": "60000",
+        }
+    )
+    short_refresh = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert short_refresh.status_code == 200, short_refresh.text
+    short_position = client.get("/api/positions").json()[0]
+    assert short_position["quantity"] == -0.02
+    assert short_position["display_quantity"] == 0.02
+    assert short_position["direction"] == "short"
+    assert short_position["profit_twd"] == 3200
+
+    contract_positions = None
+    failed_refresh = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert failed_refresh.status_code == 200, failed_refresh.text
+    assert [item["symbol"] for item in client.get("/api/positions").json()] == ["BTCUSDT"]
+
+    contract_positions = []
+    closed_refresh = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert closed_refresh.status_code == 200, closed_refresh.text
+    assert client.get("/api/positions").json() == []
+
+
+def test_binance_contract_fetch_falls_back_to_regular_usdm_api(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    real_client = services_module.httpx.Client
+    real_response = services_module.httpx.Response
+    mock_transport = services_module.httpx.MockTransport
+
+    def handler(request):
+        path = request.url.path
+        host = request.url.host
+        if path == "/api/v3/time":
+            return real_response(200, json={"serverTime": 1_800_000_000_000}, request=request)
+        if path == "/api/v3/account":
+            return real_response(200, json={"balances": []}, request=request)
+        if path == "/sapi/v1/asset/wallet/balance":
+            return real_response(200, json=[], request=request)
+        if path == "/sapi/v1/asset/get-funding-asset":
+            return real_response(200, json=[], request=request)
+        if host == "papi.binance.com" and path == "/papi/v1/um/positionRisk":
+            return real_response(
+                400,
+                json={"code": -2015, "msg": "Portfolio Margin is not enabled"},
+                request=request,
+            )
+        if host == "fapi.binance.com" and path == "/fapi/v2/positionRisk":
+            return real_response(
+                200,
+                json=[{
+                    "symbol": "BTCUSDT",
+                    "positionAmt": "0.02",
+                    "entryPrice": "55000",
+                    "markPrice": "60000",
+                    "positionSide": "BOTH",
+                }],
+                request=request,
+            )
+        if host == "fapi.binance.com" and path == "/fapi/v1/exchangeInfo":
+            return real_response(
+                200,
+                json={"symbols": [{
+                    "symbol": "BTCUSDT",
+                    "baseAsset": "BTC",
+                    "contractType": "PERPETUAL",
+                    "underlyingType": "COIN",
+                }]},
+                request=request,
+            )
+        if path == "/api/v3/ticker/price":
+            return real_response(
+                200,
+                json=[{"symbol": "BTCUSDT", "price": "60000"}],
+                request=request,
+            )
+        raise AssertionError(f"Unexpected Binance request: {request.url}")
+
+    transport = mock_transport(handler)
+    monkeypatch.setattr(
+        services_module.httpx,
+        "Client",
+        lambda **kwargs: real_client(
+            transport=transport,
+            timeout=kwargs.get("timeout"),
+            headers=kwargs.get("headers"),
+            follow_redirects=kwargs.get("follow_redirects", False),
+        ),
+    )
+
+    snapshot = services_module._fetch_binance_spot_snapshot(
+        "read-only-key",
+        "read-only-secret",
+        include_cost_details=False,
+    )
+    assert snapshot[6] == [{
+        "symbol": "BTCUSDT",
+        "positionAmt": "0.02",
+        "entryPrice": "55000",
+        "markPrice": "60000",
+        "positionSide": "BOTH",
+        "baseAsset": "BTC",
+        "contractType": "PERPETUAL",
+        "underlyingType": "COIN",
+    }]
+
+
 def test_position_cost_can_be_confirmed_with_average_cost_patch(client: TestClient):
     account_id = create_account(client, "投資帳戶")
     created = client.post(
@@ -1250,7 +1442,8 @@ def test_spending_analysis_supports_months_and_recurring_expenses(client: TestCl
     food = next(item for item in categories if item["name"] == "餐飲")
     fees = next(item for item in categories if item["name"] == "利息與費用")
     today = date.today()
-    previous_date = today.replace(day=1) - timedelta(days=1)
+    previous_month_end = today.replace(day=1) - timedelta(days=1)
+    previous_date = previous_month_end.replace(day=min(today.day, previous_month_end.day))
 
     transactions = [
         (previous_date, "健身房月費", -999, "expense", subscription["id"]),

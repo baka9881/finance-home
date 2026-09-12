@@ -91,6 +91,7 @@ export interface Position {
   symbol: string;
   name?: string;
   quantity: number;
+  display_quantity: number;
   average_cost: number;
   currency: string;
   manual_price?: number;
@@ -101,6 +102,12 @@ export interface Position {
   fx_estimated: boolean;
   market_value: number;
   market_value_twd: number;
+  asset_value_twd: number;
+  included_in_totals: boolean;
+  instrument_type: "asset" | "futures";
+  direction?: "long" | "short";
+  notional_value?: number;
+  notional_value_twd?: number;
   cost_twd: number;
   cost_status: "automatic" | "calculated" | "confirmed" | "estimated" | "missing";
   cost_note: string;

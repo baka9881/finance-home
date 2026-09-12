@@ -148,6 +148,7 @@ BINANCE_ASSET_SYMBOLS = {
     "LTC": "litecoin",
 }
 BINANCE_CASH_ASSETS = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD"}
+BINANCE_FUTURES_MARKET = "BINANCE_FUTURES"
 BINANCE_MIN_POSITION_VALUE_TWD = Decimal("10")
 BINANCE_FULL_SYNC_INTERVAL = timedelta(hours=1)
 BINANCE_COST_SYNC_INTERVAL = timedelta(hours=24)
@@ -483,9 +484,18 @@ def position_summary(db: Session, position: Position) -> dict[str, Any]:
 
     rate, fx_estimated = latest_fx_rate(db, position.currency)
     quantity = decimal_value(position.quantity)
-    value_original = quantity * price
+    average_cost = decimal_value(position.average_cost)
+    is_futures = position.market == BINANCE_FUTURES_MARKET
+    display_quantity = abs(quantity) if is_futures else quantity
+    value_original = display_quantity * price
     value_twd = value_original * rate
-    cost_twd = quantity * decimal_value(position.average_cost) * rate
+    cost_twd = ZERO if is_futures else quantity * average_cost * rate
+    profit_twd = (
+        quantity * (price - average_cost) * rate
+        if is_futures
+        else value_twd - cost_twd
+    )
+    asset_value_twd = ZERO if is_futures else value_twd
     cost_status, cost_note = position_cost_status(db, position, source)
     return {
         "id": position.id,
@@ -497,7 +507,8 @@ def position_summary(db: Session, position: Position) -> dict[str, Any]:
         "symbol": position.symbol,
         "name": position.name,
         "quantity": float(quantity),
-        "average_cost": float(decimal_value(position.average_cost)),
+        "display_quantity": float(display_quantity),
+        "average_cost": float(average_cost),
         "currency": position.currency,
         "manual_price": float(position.manual_price) if position.manual_price is not None else None,
         "price": float(price),
@@ -507,10 +518,16 @@ def position_summary(db: Session, position: Position) -> dict[str, Any]:
         "fx_estimated": fx_estimated,
         "market_value": float(value_original),
         "market_value_twd": float(value_twd),
+        "asset_value_twd": float(asset_value_twd),
+        "included_in_totals": not is_futures,
+        "instrument_type": "futures" if is_futures else "asset",
+        "direction": "short" if is_futures and quantity < 0 else "long" if is_futures else None,
+        "notional_value": float(value_original) if is_futures else None,
+        "notional_value_twd": float(value_twd) if is_futures else None,
         "cost_twd": float(cost_twd),
         "cost_status": cost_status,
         "cost_note": cost_note,
-        "profit_twd": float(value_twd - cost_twd),
+        "profit_twd": float(profit_twd),
         "profit_pct": float((value_twd / cost_twd - 1) * 100) if cost_twd else None,
     }
 
@@ -525,7 +542,7 @@ def account_summary(db: Session, account: Account) -> dict[str, Any]:
         )
     ).all()
     position_values = [position_summary(db, item) for item in positions]
-    investments_twd = sum((Decimal(str(item["market_value_twd"])) for item in position_values), ZERO)
+    investments_twd = sum((Decimal(str(item["asset_value_twd"])) for item in position_values), ZERO)
     auto_base_twd = (
         decimal_value(account.auto_balance_base_twd)
         if account.auto_balance_base_twd is not None
@@ -2245,7 +2262,7 @@ def _fetch_binance_spot_snapshot(
     list[dict[str, Any]],
     dict[str, str],
     list[dict[str, Any]],
-    list[dict[str, Any]],
+    list[dict[str, Any]] | None,
     list[str],
 ]:
     api_key = _clean_binance_credential(api_key)
@@ -2414,7 +2431,7 @@ def _fetch_binance_spot_snapshot(
                     "暫時無法讀取 Binance 股票成交紀錄，既有股票持倉會先保留"
                 )
 
-        um_positions: list[dict[str, Any]] = []
+        um_positions: list[dict[str, Any]] | None = None
         try:
             portfolio_timestamp = int(time.time() * 1000) + server_time_offset
             portfolio_query = _binance_signed_query(api_secret, portfolio_timestamp)
@@ -2429,26 +2446,48 @@ def _fetch_binance_spot_snapshot(
                     if isinstance(item, dict)
                     and decimal_value(item.get("positionAmt")) != ZERO
                 ]
-
-                if um_positions:
-                    exchange_response = client.get(
-                        "https://fapi.binance.com/fapi/v1/exchangeInfo"
-                    )
-                    exchange_payload = _binance_response_payload(exchange_response)
-                    contract_info = {
-                        str(item.get("symbol")): item
-                        for item in exchange_payload.get("symbols", [])
-                        if isinstance(item, dict) and item.get("symbol")
-                    }
-                    for item in um_positions:
-                        info = contract_info.get(str(item.get("symbol")), {})
-                        item["baseAsset"] = info.get("baseAsset")
-                        item["contractType"] = info.get("contractType")
-                        item["underlyingType"] = info.get("underlyingType")
         except (ValueError, httpx.HTTPError):
-            wallet_warnings.append(
-                "暫時無法讀取 Portfolio Margin 合約持倉，現貨與帳戶總值仍會正常同步"
-            )
+            # Accounts that have not enabled Portfolio Margin use the regular
+            # USD-M Futures API instead of PAPI.
+            try:
+                futures_timestamp = int(time.time() * 1000) + server_time_offset
+                futures_query = _binance_signed_query(api_secret, futures_timestamp)
+                futures_response = client.get(
+                    f"https://fapi.binance.com/fapi/v2/positionRisk?{futures_query}",
+                )
+                futures_payload = _binance_response_payload(futures_response)
+                if isinstance(futures_payload, list):
+                    um_positions = [
+                        item
+                        for item in futures_payload
+                        if isinstance(item, dict)
+                        and decimal_value(item.get("positionAmt")) != ZERO
+                    ]
+            except (ValueError, httpx.HTTPError):
+                wallet_warnings.append(
+                    "暫時無法讀取合約持倉，已保留上次同步資料"
+                )
+
+        if um_positions:
+            try:
+                exchange_response = client.get(
+                    "https://fapi.binance.com/fapi/v1/exchangeInfo"
+                )
+                exchange_payload = _binance_response_payload(exchange_response)
+                contract_info = {
+                    str(item.get("symbol")): item
+                    for item in exchange_payload.get("symbols", [])
+                    if isinstance(item, dict) and item.get("symbol")
+                }
+                for item in um_positions:
+                    info = contract_info.get(str(item.get("symbol")), {})
+                    item["baseAsset"] = info.get("baseAsset")
+                    item["contractType"] = info.get("contractType")
+                    item["underlyingType"] = info.get("underlyingType")
+            except (ValueError, httpx.HTTPError):
+                wallet_warnings.append(
+                    "合約代號資料暫時無法更新，已使用持倉代號繼續同步"
+                )
 
         prices_response = client.get("https://data-api.binance.vision/api/v3/ticker/price")
         prices_payload = _binance_response_payload(prices_response)
@@ -2831,46 +2870,101 @@ def sync_binance_account(
         json.dumps(sorted(processed_trade_ids)),
     )
 
-    for item in um_positions:
+    for item in um_positions or []:
         raw_symbol = str(item.get("symbol") or "").upper()
         base_asset = str(item.get("baseAsset") or "").upper()
         contract_type = str(item.get("contractType") or "").upper()
         underlying_type = str(item.get("underlyingType") or "").upper()
-        if not base_asset and raw_symbol.endswith("USDT"):
-            base_asset = raw_symbol.removesuffix("USDT")
-        if not base_asset or (
-            underlying_type != "EQUITY"
-            and contract_type != "TRADIFI_PERPETUAL"
-        ):
+        if not base_asset:
+            for quote_asset in ("USDT", "USDC"):
+                if raw_symbol.endswith(quote_asset):
+                    base_asset = raw_symbol.removesuffix(quote_asset)
+                    break
+        if not base_asset:
             continue
 
-        quantity = abs(decimal_value(item.get("positionAmt")))
+        signed_quantity = decimal_value(item.get("positionAmt"))
         entry_price = decimal_value(item.get("entryPrice"))
         mark_price = decimal_value(item.get("markPrice"))
-        if quantity <= 0 or mark_price <= 0:
+        if signed_quantity == ZERO or mark_price <= 0:
             continue
 
+        is_tradifi = (
+            underlying_type == "EQUITY"
+            or contract_type == "TRADIFI_PERPETUAL"
+        )
+        if is_tradifi:
+            quantity = abs(signed_quantity)
+            position = db.scalar(
+                select(Position).where(
+                    Position.account_id == account.id,
+                    Position.market == "US",
+                    Position.symbol == base_asset,
+                )
+            )
+            if not position:
+                position = Position(
+                    account_id=account.id,
+                    market="US",
+                    symbol=base_asset,
+                    name=f"{base_asset}（Binance 合約）",
+                    quantity=quantity,
+                    average_cost=entry_price or mark_price,
+                    currency="USD",
+                )
+                db.add(position)
+            else:
+                position.quantity = quantity
+                position.average_cost = entry_price or position.average_cost
+                position.currency = "USD"
+                position.manual_price = None
+                position.archived = False
+            db.flush()
+            set_position_cost_status(db, position, "automatic")
+            seen_position_ids.add(position.id)
+            _upsert_price(
+                db,
+                "US",
+                base_asset,
+                date.today(),
+                mark_price,
+                "USD",
+                "Binance Futures",
+            )
+            continue
+
+        position_side = str(item.get("positionSide") or "BOTH").upper()
+        if position_side == "SHORT":
+            signed_quantity = -abs(signed_quantity)
+        elif position_side == "LONG":
+            signed_quantity = abs(signed_quantity)
+        storage_symbol = (
+            f"{raw_symbol}:{position_side}"
+            if position_side in {"LONG", "SHORT"}
+            else raw_symbol
+        )
         position = db.scalar(
             select(Position).where(
                 Position.account_id == account.id,
-                Position.market == "US",
-                Position.symbol == base_asset,
+                Position.market == BINANCE_FUTURES_MARKET,
+                Position.symbol == storage_symbol,
             )
         )
         if not position:
             position = Position(
                 account_id=account.id,
-                market="US",
-                symbol=base_asset,
-                name=f"{base_asset}（Binance 合約）",
-                quantity=quantity,
+                market=BINANCE_FUTURES_MARKET,
+                symbol=storage_symbol,
+                name=f"{base_asset} 永續合約",
+                quantity=signed_quantity,
                 average_cost=entry_price or mark_price,
                 currency="USD",
             )
             db.add(position)
         else:
-            position.quantity = quantity
+            position.quantity = signed_quantity
             position.average_cost = entry_price or position.average_cost
+            position.name = f"{base_asset} 永續合約"
             position.currency = "USD"
             position.manual_price = None
             position.archived = False
@@ -2879,8 +2973,8 @@ def sync_binance_account(
         seen_position_ids.add(position.id)
         _upsert_price(
             db,
-            "US",
-            base_asset,
+            BINANCE_FUTURES_MARKET,
+            storage_symbol,
             date.today(),
             mark_price,
             "USD",
@@ -2897,6 +2991,10 @@ def sync_binance_account(
     for position_id in previous_ids - seen_position_ids:
         position = db.get(Position, position_id)
         if not position or position.account_id != account.id:
+            continue
+        if position.market == BINANCE_FUTURES_MARKET and um_positions is None:
+            position.archived = False
+            seen_position_ids.add(position.id)
             continue
         if position.market == "US" and decimal_value(position.quantity) > 0:
             # Binance does not provide an authoritative positions endpoint for

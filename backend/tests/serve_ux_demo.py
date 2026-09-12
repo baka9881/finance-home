@@ -18,7 +18,7 @@ from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 from sqlalchemy.pool import StaticPool
 from app import main
-from app.database import Base, Account, Transaction, EmailCardRule, RecurringExpense, Category, get_db
+from app.database import Base, Account, Transaction, EmailCardRule, RecurringExpense, Category, FxRate, Position, PriceSnapshot, get_db
 from app.services import seed_defaults, create_balance_snapshot, transaction_fingerprint
 
 qa_engine = create_engine("sqlite://", connect_args={"check_same_thread": False}, poolclass=StaticPool)
@@ -28,11 +28,17 @@ with sessions() as db:
     seed_defaults(db)
     bank = Account(name="測試生活費帳戶", account_type="bank", nature="asset", currency="TWD", owner="me", is_liquid=True)
     card = Account(name="測試信用卡", account_type="credit_card", nature="liability", currency="TWD", owner="me")
+    crypto = Account(name="測試幣安帳戶", institution="Binance", account_type="crypto", nature="asset", currency="TWD", owner="me", balance_includes_positions=True)
     archived = Account(name="測試已封存信用卡", account_type="credit_card", nature="liability", currency="TWD", owner="me", archived=True)
-    db.add_all([bank, card, archived]); db.flush()
+    db.add_all([bank, card, crypto, archived]); db.flush()
     create_balance_snapshot(db, bank, 80000, date.today() - timedelta(days=35))
     create_balance_snapshot(db, card, 3000, date.today(), source="gmail_billing_cycle")
     create_balance_snapshot(db, archived, 1000, date.today())
+    create_balance_snapshot(db, crypto, 12500, date.today(), source="binance_sync")
+    btc_contract = Position(account_id=crypto.id, market="BINANCE_FUTURES", symbol="BTCUSDT", name="BTC 永續合約", quantity=Decimal("0.02"), average_cost=Decimal("55000"), currency="USD")
+    db.add(btc_contract)
+    db.add(PriceSnapshot(market="BINANCE_FUTURES", symbol="BTCUSDT", price_date=date.today(), price=Decimal("60000"), currency="USD", source="Binance Futures"))
+    db.add(FxRate(currency="USD", rate_date=date.today(), rate_to_twd=Decimal("32"), source="QA", manual=True))
     db.add(EmailCardRule(name="測試信用卡郵件", card_account_id=card.id, payment_account_id=bank.id, sender_pattern="bank.example.test", owner="me", payment_due_day=23, closing_day=5))
     db.add(EmailCardRule(name="測試封存暫停規則", card_account_id=archived.id, payment_account_id=bank.id, sender_pattern="bank.example.test", owner="me", payment_due_day=23))
     for index in range(237):

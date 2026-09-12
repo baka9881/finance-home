@@ -35,7 +35,7 @@ import { invalidateFinanceData } from "../appQueries";
 import { taipeiMonthInputValue } from "../date";
 import { ownerFilterLabels, useOwnerFilter } from "../ownerFilter";
 import type { Account, Category, Dashboard, HealthScore, IgnoredRecurringExpense, RecurringExpenseDefinition, SpendingAnalysis } from "../types";
-import { Badge, Button, Card, Dialog, EmptyState, Field, FormStep, Input, MonthInput, PageHeader, Select, Skeleton, money, number } from "../ui";
+import { Badge, Button, Card, Dialog, EmptyState, Field, FormOptions, Input, MonthInput, PageHeader, Select, Skeleton, money, number } from "../ui";
 
 const recurringPresets = ["房貸", "車貸", "信貸", "學貸", "房租", "保險", "健身房月費", "手機費", "網路費", "訂閱服務"];
 const recurringOwnerOptions = [
@@ -605,29 +605,11 @@ export default function AnalysisPage() {
             description="設定每月通常會發生的支出；這裡不會直接建立交易或扣款。"
           >
             <form className="space-y-5" onSubmit={submitRecurring}>
-              <FormStep number={1} title="這是什麼固定花費？" description="可選常見項目後再自行修改名稱。">
-                <div className="grid gap-4 sm:grid-cols-2">
-                  <Field label="常見項目">
-                    <Select
-                      value={recurringPresets.includes(recurringDraft.name) ? recurringDraft.name : ""}
-                      onChange={(event) => setRecurringDraft((draft) => ({ ...draft, name: event.target.value }))}
-                    >
-                      <option value="">選擇或自行輸入</option>
-                      {recurringPresets.map((preset) => <option key={preset}>{preset}</option>)}
-                    </Select>
-                  </Field>
-                  <Field label="顯示名稱" hint={recurringDraft.match_name ? `原始商家：${recurringDraft.match_name}；改名後仍會比對原始交易。` : undefined}>
-                    <Input
-                      value={recurringDraft.name}
-                      onChange={(event) => setRecurringDraft((draft) => ({ ...draft, name: event.target.value }))}
-                      placeholder="例如：汽車貸款"
-                      required
-                    />
-                  </Field>
-                </div>
-              </FormStep>
+              <Field label="名稱" hint={recurringDraft.match_name ? `原始商家：${recurringDraft.match_name}；改名後仍會比對原始交易。` : undefined}>
+                <Input list="recurring-name-presets" value={recurringDraft.name} onChange={(event) => setRecurringDraft((draft) => ({ ...draft, name: event.target.value }))} placeholder="例如：房租、手機費" required />
+                <datalist id="recurring-name-presets">{recurringPresets.map((preset) => <option key={preset} value={preset} />)}</datalist>
+              </Field>
 
-              <FormStep number={2} title="每月大約多少錢？" tone="blue">
                 <div className="grid gap-4 sm:grid-cols-2">
                   <Field label="每月金額（TWD）">
                     <Input
@@ -653,9 +635,9 @@ export default function AnalysisPage() {
                     />
                   </Field>
                 </div>
-              </FormStep>
 
-              <FormStep number={3} title="由誰支付、從哪裡扣？" tone="purple">
+
+              <FormOptions title="其他設定（帳戶、分類、備註）">
                 <div className="grid gap-4 sm:grid-cols-2">
                   <Field label="所有人">
                     <Select
@@ -695,7 +677,7 @@ export default function AnalysisPage() {
                     />
                   </Field>
                 </div>
-              </FormStep>
+              </FormOptions>
 
               {saveRecurring.isError && <p className="text-sm text-red-600">{(saveRecurring.error as Error).message}</p>}
               <div className="mobile-safe-actions sticky bottom-0 -mx-4 flex justify-end gap-2 border-t border-slate-100 bg-white/95 px-4 py-3 backdrop-blur sm:static sm:mx-0 sm:border-0 sm:bg-transparent sm:p-0">

@@ -34,6 +34,7 @@ import {
   cn,
   DateInput,
   FormStep,
+  Field,
   Input,
   PageHeader,
   Select,
@@ -1471,7 +1472,6 @@ export default function SettingsPage() {
             <input type="hidden" name="subject_pattern" value={editingEmailRule?.subject_pattern || ""} />
             <input type="hidden" name="card_last4" value={editingEmailRule?.card_last4 || ""} />
             <input type="hidden" name="lookback_days" value={editingEmailRule?.lookback_days || 90} />
-            <input type="hidden" name="closing_day" value={editingEmailRule?.closing_day || ""} />
             <div className="grid gap-3 lg:grid-cols-2">
               <FormStep number={1} title="信用卡">
                 <div className="space-y-3">
@@ -1493,6 +1493,11 @@ export default function SettingsPage() {
                       <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
                     ))}
                   </Select>
+                  <div className="grid grid-cols-2 gap-3">
+                  <Field label="每月結帳日">
+                    <Input name="closing_day" type="number" min={1} max={31} defaultValue={editingEmailRule?.closing_day || ""} placeholder="依帳單設定" />
+                  </Field>
+                  <Field label="每月繳款日">
                   <Input
                     name="payment_due_day"
                     type="number"
@@ -1501,6 +1506,8 @@ export default function SettingsPage() {
                     defaultValue={editingEmailRule?.payment_due_day || 23}
                     placeholder="每月繳款日"
                   />
+                  </Field>
+                  </div>
                   <label className="flex items-start gap-3 rounded-xl bg-slate-50 p-3 text-sm text-slate-600">
                     <input name="auto_pay" type="checkbox" defaultChecked={editingEmailRule?.auto_pay ?? true} className="mt-1" />
                     <span>到繳款日自動在財務居記錄扣款；餘額不足或金額不合理時先暫停並提醒。</span>
@@ -1692,21 +1699,21 @@ export default function SettingsPage() {
           </div>
           <form className="mt-5 space-y-4" onSubmit={submitRule}>
             <div className="grid gap-3 lg:grid-cols-3">
-              <FormStep number={1} title="看到什麼文字？">
+              <Field label="店家關鍵字">
                 <Input value={ruleKeyword} onChange={(event) => setRuleKeyword(event.target.value)} placeholder="例如：星巴克" required />
-              </FormStep>
-              <FormStep number={2} title="自動分到哪裡？" tone="blue">
+              </Field>
+              <Field label="分類">
                 <Select value={ruleCategoryId} onChange={(event) => setRuleCategoryId(event.target.value)} required>
                   <option value="">選擇分類</option>
                   {categories.data?.filter((category) => category.kind === ruleTransactionKind).map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}
                 </Select>
-              </FormStep>
-              <FormStep number={3} title="這是哪一種交易？" tone="purple">
+              </Field>
+              <Field label="交易類型">
                 <Select value={ruleTransactionKind} onChange={(event) => { setRuleTransactionKind(event.target.value); setRuleCategoryId(""); }}>
                   <option value="expense">支出</option>
                   <option value="income">收入</option>
                 </Select>
-              </FormStep>
+              </Field>
             </div>
             {saveRule.isError && (
               <p className="text-sm text-red-600">
@@ -1828,17 +1835,17 @@ export default function SettingsPage() {
                   <h3 className="font-bold text-ink">自訂匯率</h3>
                   <p className="mt-1 text-xs text-slate-400">可覆蓋指定日期的官方匯率。</p>
                   <form className="mt-5 space-y-4" onSubmit={submitManualFx}>
-                    <FormStep number={1} title="選擇幣別">
+                    <Field label="幣別">
                       <Select name="currency">
                         {["USD", "JPY", "EUR", "GBP", "CNY", "HKD", "AUD", "CAD", "SGD", "KRW"].map((item) => <option key={item}>{item}</option>)}
                       </Select>
-                    </FormStep>
-                    <FormStep number={2} title="匯率是哪一天的？" tone="blue">
+                    </Field>
+                    <Field label="日期">
                       <DateInput name="rate_date" defaultValue={taipeiDateInputValue()} />
-                    </FormStep>
-                    <FormStep number={3} title="1 單位可以換多少台幣？" tone="purple">
+                    </Field>
+                    <Field label="兌換台幣匯率">
                       <Input name="rate_to_twd" type="number" min="0.000001" step="any" placeholder="例如：32.5" required />
-                    </FormStep>
+                    </Field>
                     <Button type="submit" className="w-full">儲存自訂匯率</Button>
                   </form>
                 </div>

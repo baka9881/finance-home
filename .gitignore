@@ -17,5 +17,9 @@ frontend/vite.config.js
 frontend/vite.config.d.ts
 *.log
 
+# Local reports, statement previews, and finance backups
+/output/
+/tmp/
+
 # Local Netlify folder
 .netlify

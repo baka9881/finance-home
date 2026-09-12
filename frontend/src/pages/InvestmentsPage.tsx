@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bitcoin,
@@ -26,18 +26,13 @@ import {
   Dialog,
   EmptyState,
   Field,
-  FormContext,
-  FormStep,
+  FormActions,
   Input,
-  MobileWizardActions,
-  MobileWizardProgress,
-  MobileWizardStep,
   PageHeader,
   Select,
   Skeleton,
   money,
   number,
-  validateWizardStep,
 } from "../ui";
 
 const markets = [
@@ -130,6 +125,18 @@ export function investmentTradeValidation({
   return { hasValidAmount, quantityWithinHolding, valid: hasValidAmount && quantityWithinHolding };
 }
 
+export function investmentTotals(items: Position[]) {
+  return items.reduce(
+    (totals, item) => ({
+      value: totals.value + (item.asset_value_twd ?? item.market_value_twd),
+      cost: totals.cost + (item.included_in_totals === false ? 0 : item.cost_twd),
+      profit: totals.profit + item.profit_twd,
+      futures: totals.futures + (item.instrument_type === "futures" ? 1 : 0),
+    }),
+    { value: 0, cost: 0, profit: 0, futures: 0 },
+  );
+}
+
 export default function InvestmentsPage() {
   const client = useQueryClient();
   const [ownerFilter] = useOwnerFilter();
@@ -146,13 +153,13 @@ export default function InvestmentsPage() {
   const [tradeQuantity, setTradeQuantity] = useState("");
   const [tradeTotalAmount, setTradeTotalAmount] = useState("");
   const [refreshMessage, setRefreshMessage] = useState("");
-  const [tradeStep, setTradeStep] = useState(1);
+
   const [adjustingPosition, setAdjustingPosition] = useState<Position | null>(null);
   const [adjustQuantity, setAdjustQuantity] = useState("");
   const [adjustAverageCost, setAdjustAverageCost] = useState("");
   const [adjustTotalCost, setAdjustTotalCost] = useState("");
   const [adjustCostInput, setAdjustCostInput] = useState<"unit" | "total">("total");
-  const tradeFormRef = useRef<HTMLFormElement>(null);
+
 
   const positions = useQuery({
     queryKey: ["positions", ownerFilter],
@@ -332,7 +339,7 @@ export default function InvestmentsPage() {
         ["brokerage", "crypto"].includes(account.account_type),
     );
   const assetOptions = assetPresets[selectedMarket] || [];
-  const sellPositions = positions.data || [];
+  const sellPositions = (positions.data || []).filter((position) => position.instrument_type !== "futures");
   const selectedSellPosition = positions.data?.find((position) => String(position.id) === selectedPositionId);
   const selectedHoldingAccount = investmentAccounts.find((account) => String(account.id) === selectedAccountId);
   const selectedCashAccount = assetAccounts.find((account) => String(account.id) === selectedCashAccountId);
@@ -387,9 +394,10 @@ export default function InvestmentsPage() {
           : tradeSide === "buy"
             ? "記錄買入"
             : "記錄賣出";
-  const totalValue = positions.data?.reduce((sum, item) => sum + item.market_value_twd, 0) || 0;
-  const totalCost = positions.data?.reduce((sum, item) => sum + item.cost_twd, 0) || 0;
-  const totalProfit = totalValue - totalCost;
+  const totals = investmentTotals(positions.data || []);
+  const totalValue = totals.value;
+  const totalCost = totals.cost;
+  const totalProfit = totals.profit;
 
   useEffect(() => {
     if (!createOpen) return;
@@ -438,17 +446,17 @@ export default function InvestmentsPage() {
 
   function openTradeDialog(side: "buy" | "sell") {
     setTradeSide(side);
-    const firstPosition = side === "sell" ? positions.data?.[0] : undefined;
+    const firstPosition = side === "sell" ? sellPositions[0] : undefined;
     const initialAccount =
       investmentAccounts.find((account) => account.id === firstPosition?.account_id) || investmentAccounts[0];
     resetTradeDraft(initialAccount, firstPosition);
-    setTradeStep(1);
+
     setCreateOpen(true);
   }
 
   function closeTradeDialog() {
     setCreateOpen(false);
-    setTradeStep(1);
+
   }
 
   function changeMarket(nextMarket: string) {
@@ -465,7 +473,7 @@ export default function InvestmentsPage() {
       setSelectedCashAccountId(nextAccountId);
     }
     if (tradeSide === "sell") {
-      const firstPosition = positions.data?.find((position) => String(position.account_id) === nextAccountId);
+      const firstPosition = sellPositions.find((position) => String(position.account_id) === nextAccountId);
       setSelectedPositionId(firstPosition ? String(firstPosition.id) : "");
       if (firstPosition) {
         setSelectedCurrency(firstPosition.currency);
@@ -511,7 +519,7 @@ export default function InvestmentsPage() {
               <RefreshCw size={16} className={refresh.isPending ? "animate-spin" : ""} />
               更新行情
             </Button>
-            <Button variant="secondary" onClick={() => openTradeDialog("sell")} disabled={!positions.data?.length}>
+            <Button variant="secondary" onClick={() => openTradeDialog("sell")} disabled={!sellPositions.length}>
               賣出
             </Button>
             <Button onClick={() => openTradeDialog("buy")}>
@@ -566,14 +574,16 @@ export default function InvestmentsPage() {
         <>
       <div className="mb-6 grid gap-4 sm:grid-cols-3">
         <Card className="p-5">
-          <p className="text-sm text-slate-500">投資總市值（折合 TWD）</p>
+          <p className="text-sm text-slate-500">現貨與股票市值（折合 TWD）</p>
           <p className="mt-2 text-2xl font-bold text-ink">{money(totalValue)}</p>
-          <p className="mt-3 text-xs text-slate-400">{positions.data?.length || 0} 項持倉</p>
+          <p className="mt-3 text-xs text-slate-400">
+            {positions.data?.length || 0} 項持倉{totals.futures ? `，含 ${totals.futures} 項合約` : ""}
+          </p>
         </Card>
         <Card className="p-5">
-          <p className="text-sm text-slate-500">投入成本（折合 TWD）</p>
+          <p className="text-sm text-slate-500">現貨與股票成本（折合 TWD）</p>
           <p className="mt-2 text-2xl font-bold text-ink">{money(totalCost)}</p>
-          <p className="mt-3 text-xs text-slate-400">依每單位成本與目前匯率</p>
+          <p className="mt-3 text-xs text-slate-400">合約名目價值不計入成本與總市值</p>
         </Card>
         <Card className="p-5">
           <p className="text-sm text-slate-500">未實現損益（折合 TWD）</p>
@@ -581,7 +591,11 @@ export default function InvestmentsPage() {
             {totalProfit >= 0 ? "+" : ""}{money(totalProfit)}
           </p>
           <p className="mt-3 text-xs text-slate-400">
-            {totalCost ? `${totalProfit >= 0 ? "+" : ""}${number((totalProfit / totalCost) * 100, 2)}%` : "尚無成本資料"}
+            {totals.futures
+              ? "含幣安合約未實現損益"
+              : totalCost
+                ? `${totalProfit >= 0 ? "+" : ""}${number((totalProfit / totalCost) * 100, 2)}%`
+                : "尚無成本資料"}
           </p>
         </Card>
       </div>
@@ -601,24 +615,34 @@ export default function InvestmentsPage() {
               <details key={position.id} className="group px-4 py-4">
                 <summary className="cursor-pointer list-none">
                   <div className="flex items-start gap-3">
-                    <div className={`grid size-11 shrink-0 place-items-center rounded-xl ${position.market === "CRYPTO" ? "bg-amber-50 text-amber-600" : "bg-blue-50 text-blue-700"}`}>
-                      {position.market === "CRYPTO" ? <Bitcoin size={19} /> : <LineChart size={19} />}
+                    <div className={`grid size-11 shrink-0 place-items-center rounded-xl ${position.market === "CRYPTO" || position.instrument_type === "futures" ? "bg-amber-50 text-amber-600" : "bg-blue-50 text-blue-700"}`}>
+                      {position.market === "CRYPTO" || position.instrument_type === "futures" ? <Bitcoin size={19} /> : <LineChart size={19} />}
                     </div>
                     <div className="min-w-0 flex-1">
                       <div className="flex items-start justify-between gap-3">
                         <div className="min-w-0">
-                          <p className="truncate font-semibold text-slate-800">{position.symbol}</p>
+                          <p className="truncate font-semibold text-slate-800">{position.symbol.split(":")[0]}</p>
                           <p className="mt-0.5 truncate text-xs text-slate-400">{position.name || position.market}</p>
+                          {position.instrument_type === "futures" && (
+                            <Badge tone={position.direction === "short" ? "red" : "green"}>
+                              合約 · {position.direction === "short" ? "做空" : "做多"}
+                            </Badge>
+                          )}
                         </div>
                         <div className="shrink-0 text-right">
-                          <p className="font-bold text-slate-800">{money(position.market_value_twd)}</p>
+                          <p className="font-bold text-slate-800">
+                            {position.instrument_type === "futures" ? "名目 " : ""}{money(position.market_value_twd)}
+                          </p>
                           <p className={`mt-0.5 text-xs font-semibold ${position.profit_twd >= 0 ? "text-emerald-700" : "text-red-600"}`}>
-                            {position.profit_twd >= 0 ? "+" : ""}{money(position.profit_twd)} · {number(position.profit_pct || 0, 2)}%
+                            {position.profit_twd >= 0 ? "+" : ""}{money(position.profit_twd)}
+                            {position.instrument_type !== "futures" ? ` · ${number(position.profit_pct || 0, 2)}%` : ""}
                           </p>
                         </div>
                       </div>
                       <div className="mt-3 flex items-center justify-between gap-3 text-xs text-slate-500">
-                        <span>持有 {number(position.quantity, 8)}</span>
+                        <span>
+                          {position.instrument_type === "futures" ? "合約數量" : "持有"} {number(position.display_quantity ?? Math.abs(position.quantity), 8)}
+                        </span>
                         <span className="flex items-center gap-1">查看細項 <ChevronDown size={14} className="transition group-open:rotate-180" /></span>
                       </div>
                     </div>
@@ -626,15 +650,17 @@ export default function InvestmentsPage() {
                 </summary>
                 <div className="mt-4 grid grid-cols-2 gap-3 border-t border-slate-100 pt-4 text-sm">
                   <div className="rounded-xl bg-slate-50 p-3">
-                    <p className="text-xs text-slate-400">目前價格</p>
+                    <p className="text-xs text-slate-400">{position.instrument_type === "futures" ? "標記價格" : "目前價格"}</p>
                     <p className="mt-1 font-semibold text-slate-800">{money(position.price, position.currency)}</p>
                   </div>
                   <div className="rounded-xl bg-slate-50 p-3">
-                    <p className="text-xs text-slate-400">平均成本</p>
+                    <p className="text-xs text-slate-400">{position.instrument_type === "futures" ? "進場價格" : "平均成本"}</p>
                     <p className="mt-1 font-semibold text-slate-800">{money(position.average_cost, position.currency)}</p>
                     <div className="mt-2">
                       <Badge tone={position.cost_status === "estimated" ? "amber" : position.cost_status === "missing" ? "red" : "green"}>
-                        {position.cost_status === "estimated"
+                        {position.instrument_type === "futures"
+                          ? "幣安合約同步"
+                          : position.cost_status === "estimated"
                           ? "成本待確認"
                           : position.cost_status === "missing"
                             ? "尚未填成本"
@@ -653,7 +679,11 @@ export default function InvestmentsPage() {
                     <div className="mt-1"><Badge tone={position.stale ? "amber" : "green"}>{position.price_source}</Badge></div>
                     <p className="mt-1 text-xs text-slate-400">{position.price_date || "尚無行情"}</p>
                   </div>
-                  <div className="col-span-2 flex justify-end gap-2">
+                  {position.instrument_type === "futures" ? (
+                    <div className="col-span-2 rounded-xl bg-amber-50 p-3 text-xs text-amber-800">
+                      名目價值只表示合約曝險，不會重複計入投資總市值。持倉由幣安同步管理。
+                    </div>
+                  ) : <div className="col-span-2 flex justify-end gap-2">
                     <Button
                       variant="secondary"
                       className="h-11"
@@ -673,7 +703,7 @@ export default function InvestmentsPage() {
                     >
                       <Trash2 size={15} /> 刪除持倉
                     </Button>
-                  </div>
+                  </div>}
                 </div>
               </details>
             ))}
@@ -683,9 +713,9 @@ export default function InvestmentsPage() {
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/80 text-left text-xs font-semibold uppercase tracking-wider text-slate-400">
                   <th className="px-5 py-4">標的</th>
-                  <th className="px-4 py-4">數量</th>
-                  <th className="px-4 py-4 text-right">目前價格</th>
-                  <th className="px-4 py-4 text-right">市值（折合 TWD）</th>
+                  <th className="px-4 py-4">數量／方向</th>
+                  <th className="px-4 py-4 text-right">目前／標記價格</th>
+                  <th className="px-4 py-4 text-right">市值／名目價值</th>
                   <th className="px-4 py-4 text-right">損益（折合 TWD）</th>
                   <th className="px-5 py-4">資料狀態</th>
                   <th className="w-14 px-3 py-4" />
@@ -696,25 +726,42 @@ export default function InvestmentsPage() {
                   <tr key={position.id} className="hover:bg-slate-50/60">
                     <td className="px-5 py-4">
                       <div className="flex items-center gap-3">
-                        <div className={`grid size-10 place-items-center rounded-xl ${position.market === "CRYPTO" ? "bg-amber-50 text-amber-600" : "bg-blue-50 text-blue-700"}`}>
-                          {position.market === "CRYPTO" ? <Bitcoin size={18} /> : <LineChart size={18} />}
+                        <div className={`grid size-10 place-items-center rounded-xl ${position.market === "CRYPTO" || position.instrument_type === "futures" ? "bg-amber-50 text-amber-600" : "bg-blue-50 text-blue-700"}`}>
+                          {position.market === "CRYPTO" || position.instrument_type === "futures" ? <Bitcoin size={18} /> : <LineChart size={18} />}
                         </div>
                         <div>
-                          <p className="font-semibold text-slate-800">{position.symbol}</p>
+                          <p className="font-semibold text-slate-800">{position.symbol.split(":")[0]}</p>
                           <p className="mt-1 text-xs text-slate-400">{position.name || position.market}</p>
+                          {position.instrument_type === "futures" && (
+                            <Badge tone={position.direction === "short" ? "red" : "green"}>
+                              合約 · {position.direction === "short" ? "做空" : "做多"}
+                            </Badge>
+                          )}
                         </div>
                       </div>
                     </td>
-                    <td className="px-4 py-4 text-sm text-slate-600">{number(position.quantity, 8)}</td>
+                    <td className="px-4 py-4 text-sm text-slate-600">
+                      {number(position.display_quantity ?? Math.abs(position.quantity), 8)}
+                      {position.instrument_type === "futures" && (
+                        <p className={`mt-1 text-xs font-semibold ${position.direction === "short" ? "text-red-600" : "text-emerald-700"}`}>
+                          {position.direction === "short" ? "做空" : "做多"}
+                        </p>
+                      )}
+                    </td>
                     <td className="px-4 py-4 text-right">
                       <p className="text-sm font-semibold text-slate-800">{money(position.price, position.currency)}</p>
-                      <p className="mt-1 text-xs text-slate-400">每單位成本 {money(position.average_cost, position.currency)}</p>
-                      {(position.cost_status === "estimated" || position.cost_status === "missing") && (
+                      <p className="mt-1 text-xs text-slate-400">
+                        {position.instrument_type === "futures" ? "進場價" : "每單位成本"} {money(position.average_cost, position.currency)}
+                      </p>
+                      {position.instrument_type !== "futures" && (position.cost_status === "estimated" || position.cost_status === "missing") && (
                         <p className="mt-1 text-xs font-medium text-amber-600">成本待確認</p>
                       )}
                     </td>
                     <td className="px-4 py-4 text-right">
                       <p className="text-sm font-bold text-slate-800">{money(position.market_value_twd)}</p>
+                      {position.instrument_type === "futures" && (
+                        <p className="mt-1 text-xs font-medium text-amber-700">名目價值，不計入總市值</p>
+                      )}
                       {position.currency !== "TWD" && (
                         <p className="mt-1 text-xs text-slate-400">原幣 {money(position.market_value, position.currency)}</p>
                       )}
@@ -723,7 +770,7 @@ export default function InvestmentsPage() {
                       <p className={`text-sm font-bold ${position.profit_twd >= 0 ? "text-emerald-700" : "text-red-600"}`}>
                         {position.profit_twd >= 0 ? "+" : ""}{money(position.profit_twd)}
                       </p>
-                      {position.profit_pct !== undefined && (
+                      {position.instrument_type !== "futures" && position.profit_pct !== undefined && (
                         <p className={`mt-1 inline-flex items-center gap-1 text-xs ${position.profit_twd >= 0 ? "text-emerald-600" : "text-red-500"}`}>
                           {position.profit_twd >= 0 ? <TrendingUp size={12} /> : <TrendingDown size={12} />}
                           {number(position.profit_pct, 2)}%
@@ -738,6 +785,7 @@ export default function InvestmentsPage() {
                       <p className="mt-1.5 text-xs text-slate-400">{position.price_date || "尚無行情"}</p>
                     </td>
                     <td className="px-3 py-4 text-right">
+                      {position.instrument_type !== "futures" && <>
                       <Button
                         variant="ghost"
                         className="size-9 px-0 text-slate-500 hover:text-forest"
@@ -761,6 +809,7 @@ export default function InvestmentsPage() {
                       >
                         <Trash2 size={15} />
                       </Button>
+                      </>}
                     </td>
                   </tr>
                 ))}
@@ -888,27 +937,19 @@ export default function InvestmentsPage() {
         open={createOpen}
         onClose={closeTradeDialog}
         title={tradeSide === "buy" ? "買入投資" : "賣出投資"}
-        description="依照三個步驟填寫，儲存前可以先確認帳戶與持倉會怎麼變化。"
+        description="記錄標的、成交金額與帳戶。"
       >
-        <form ref={tradeFormRef} className="space-y-4" onSubmit={submitTrade}>
+        <form className="space-y-4" onSubmit={submitTrade}>
           {investmentAccounts.length === 0 && (
             <div className="rounded-xl border border-amber-200 bg-amber-50 px-4 py-3 text-sm text-amber-800">
               請先到「帳戶」建立證券或加密貨幣帳戶。
             </div>
           )}
-          <FormContext
-            value={tradeSide === "buy" ? "買入投資" : "賣出投資"}
-            action={(
-              <Button type="button" variant="ghost" className="h-9" onClick={() => openTradeDialog(tradeSide === "buy" ? "sell" : "buy")}>
-                改成{tradeSide === "buy" ? "賣出" : "買入"}
-              </Button>
-            )}
-          />
+          <div className="flex justify-end">
+            <Button variant="ghost" className="h-8 px-2 text-xs" disabled={createTrade.isPending} onClick={() => openTradeDialog(tradeSide === "buy" ? "sell" : "buy")}>改成{tradeSide === "buy" ? "賣出" : "買入"}</Button>
+          </div>
 
-          <MobileWizardProgress current={tradeStep} labels={["選擇標的", "交易金額", "帳戶與確認"]} />
-
-          <MobileWizardStep step={1} current={tradeStep}>
-          <FormStep number={1} title={tradeSide === "buy" ? "要買什麼？" : "要賣哪一筆？"}>
+          <div className="space-y-3">
             {tradeSide === "buy" ? (
               <>
                 <div className="grid gap-4 sm:grid-cols-2">
@@ -961,11 +1002,10 @@ export default function InvestmentsPage() {
                 )}
               </Field>
             )}
-          </FormStep>
-          </MobileWizardStep>
+          </div>
 
-          <MobileWizardStep step={2} current={tradeStep}>
-          <FormStep number={2} title="這次交易多少？" tone="blue">
+
+          <div className="space-y-3">
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label={tradeSide === "buy" ? "買入數量" : "賣出數量"}>
                 <Input
@@ -979,7 +1019,6 @@ export default function InvestmentsPage() {
                   inputMode="decimal"
                   placeholder="0"
                   required
-                  autoFocus={tradeStep === 2}
                 />
               </Field>
               <Field label="成交總額" hint={tradeSide === "buy" ? "這次總共付多少" : "這次總共拿回多少"}>
@@ -1004,11 +1043,10 @@ export default function InvestmentsPage() {
             {estimatedUnitPrice > 0 && (
               <p className="text-xs text-slate-500">推算成交單價：{money(estimatedUnitPrice, selectedCurrency)}</p>
             )}
-          </FormStep>
-          </MobileWizardStep>
+          </div>
 
-          <MobileWizardStep step={3} current={tradeStep}>
-          <FormStep number={3} title="錢和持倉放哪裡？" tone="purple">
+
+          <div className="space-y-3">
             <div className="grid gap-4 sm:grid-cols-2">
               <Field label={tradeSide === "buy" ? "從哪個帳戶扣款" : "賣出的錢進哪個帳戶"}>
                 <Select value={selectedCashAccountId} onChange={(event) => setSelectedCashAccountId(event.target.value)} required>
@@ -1034,7 +1072,7 @@ export default function InvestmentsPage() {
                 </div>
               )}
             </div>
-          </FormStep>
+          </div>
 
           <details className="group rounded-2xl border border-slate-200 px-4 py-3">
             <summary className="cursor-pointer list-none text-sm font-medium text-slate-600">其他設定（日期、手動價格）</summary>
@@ -1070,21 +1108,8 @@ export default function InvestmentsPage() {
             </div>
           )}
           {createTrade.isError && <p className="text-sm text-red-600">{(createTrade.error as Error).message}</p>}
-          </MobileWizardStep>
-          <MobileWizardActions
-            current={tradeStep}
-            total={3}
-            onPrevious={() => setTradeStep((step) => Math.max(1, step - 1))}
-            onNext={() => {
-              if (validateWizardStep(tradeFormRef.current, tradeStep)) {
-                setTradeStep((step) => Math.min(3, step + 1));
-              }
-            }}
-            onCancel={closeTradeDialog}
-            submitLabel={submitButtonText}
-            pending={createTrade.isPending}
-            submitDisabled={submitDisabled}
-          />
+
+          <FormActions onCancel={closeTradeDialog} label={submitButtonText} pending={createTrade.isPending} disabled={submitDisabled} />
         </form>
       </Dialog>
     </>

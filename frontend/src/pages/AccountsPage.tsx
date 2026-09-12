@@ -1,10 +1,11 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
 import {
   Banknote,
   Bitcoin,
   Building2,
+  ChevronDown,
   CreditCard,
   Landmark,
   Plus,
@@ -15,7 +16,7 @@ import {
   Wallet,
 } from "lucide-react";
 import { api } from "../api";
-import CreditCardCycles from "../CreditCardCycles";
+import CreditCardCycles, { type Cycle } from "../CreditCardCycles";
 import { invalidateFinanceData } from "../appQueries";
 import { daysBetweenDateValues, taipeiDateInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
@@ -29,14 +30,12 @@ import {
   EmptyState,
   Field,
   FormContext,
+  FormOptions,
+  FormActions,
   FormStep,
   Input,
-  MobileWizardActions,
-  MobileWizardProgress,
-  MobileWizardStep,
   PageHeader,
   Select,
-  validateWizardStep,
   money,
 } from "../ui";
 
@@ -167,8 +166,6 @@ export default function AccountsPage() {
   const [customInstitution, setCustomInstitution] = useState("");
   const [accountName, setAccountName] = useState("");
   const [useCustomAccountName, setUseCustomAccountName] = useState(false);
-  const [accountStep, setAccountStep] = useState(1);
-  const accountFormRef = useRef<HTMLFormElement>(null);
 
   useEffect(() => {
     const quickAction = searchParams.get("quick");
@@ -176,7 +173,6 @@ export default function AccountsPage() {
       setBalancePickerOpen(true);
     } else if (quickAction === "create") {
       setCreateOpen(true);
-      setAccountStep(1);
     } else if (quickAction === "loan") {
       setAccountType("loan");
       setNature("liability");
@@ -184,7 +180,6 @@ export default function AccountsPage() {
       setCustomInstitution("");
       setAccountName("貸款");
       setUseCustomAccountName(false);
-      setAccountStep(1);
       setCreateOpen(true);
     } else {
       return;
@@ -213,13 +208,11 @@ export default function AccountsPage() {
 
   function openCreateDialog() {
     resetAccountDraft();
-    setAccountStep(1);
     setCreateOpen(true);
   }
 
   function closeCreateDialog() {
     setCreateOpen(false);
-    setAccountStep(1);
   }
 
   function shouldReplaceDraftName() {
@@ -363,6 +356,11 @@ export default function AccountsPage() {
   const assetAccounts = visibleAccounts.filter((item) => item.nature === "asset");
   const liabilityAccounts = visibleAccounts.filter((item) => item.nature === "liability");
   const archivedAccounts = (accounts.data || []).filter((item) => item.archived);
+  const cardCycles = useQuery({
+    queryKey: ["credit-card-cycles"],
+    queryFn: () => api<Cycle[]>("/email/card-cycles"),
+    enabled: visibleAccounts.some((account) => account.account_type === "credit_card"),
+  });
 
   return (
     <>
@@ -421,6 +419,7 @@ export default function AccountsPage() {
               title="負債帳戶"
               subtitle={`${liabilityAccounts.length} 個帳戶`}
               accounts={liabilityAccounts}
+              cardCycles={cardCycles.data}
               onBalance={setBalanceAccount}
               onDetail={setDetailAccount}
               onDelete={setArchiveTarget}
@@ -431,25 +430,33 @@ export default function AccountsPage() {
 
       <CreditCardCycles accountIds={visibleAccounts.filter((item) => item.account_type === "credit_card").map((item) => item.id)} />
       {archivedAccounts.length > 0 && (
-        <Card className="mt-6 p-5">
-          <h2 className="font-bold">已封存帳戶（{archivedAccounts.length}）</h2>
-          <p className="mt-1 text-sm text-slate-500">這些帳戶不列入總資產，歷史交易仍可查詢。若信用卡不見了，可從這裡恢復。</p>
-          <div className="mt-4 space-y-3">
+        <details className="group mt-6 rounded-xl border border-slate-200 bg-white">
+          <summary className="flex cursor-pointer list-none items-center gap-3 rounded-xl px-4 py-3.5 text-slate-600 transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 focus-visible:ring-offset-2 [&::-webkit-details-marker]:hidden">
+            <span className="min-w-0 flex-1">
+              <span className="flex items-center gap-2 text-sm font-semibold">
+                已封存帳戶
+                <span className="rounded-md bg-slate-100 px-1.5 py-0.5 text-xs font-medium tabular-nums text-slate-500">{archivedAccounts.length}</span>
+              </span>
+              <span className="mt-1 block text-xs font-normal leading-5 text-slate-500">不列入總資產，歷史交易保留；展開可恢復。</span>
+            </span>
+            <ChevronDown size={17} aria-hidden="true" className="shrink-0 text-slate-400 transition-transform group-open:rotate-180" />
+          </summary>
+          <ul className="divide-y divide-slate-100 border-t border-slate-100 px-4">
             {archivedAccounts.map((account) => (
-              <div key={account.id} className="flex flex-wrap items-center justify-between gap-3 rounded-xl border border-slate-200 p-3">
-                <div className="min-w-0">
-                  <p className="font-semibold break-words">{account.name}</p>
-                  <p className="text-xs text-slate-500">{account.owner_label} · {account.currency} {account.balance.toLocaleString()}</p>
-                  {!!account.linked_email_rules?.length && <p className="mt-1 text-sm text-amber-700">信用卡同步已暫停：{account.linked_email_rules.join("、")}</p>}
+              <li key={account.id} className="flex items-center justify-between gap-3 py-3">
+                <div className="min-w-0 flex-1">
+                  <p className="break-words text-sm font-medium text-slate-700">{account.name}</p>
+                  <p className="mt-1 text-xs tabular-nums text-slate-500">{account.owner_label} · {account.currency} {account.balance.toLocaleString()}</p>
+                  {!!account.linked_email_rules?.length && <p className="mt-1 text-xs text-amber-700">信用卡同步已暫停</p>}
                 </div>
-                <Button variant="secondary" disabled={restoreAccount.isPending} onClick={() => restoreAccount.mutate(account.id)}>
-                  {restoreAccount.isPending && restoreAccount.variables === account.id ? "恢復中…" : "恢復帳戶"}
+                <Button variant="ghost" className="shrink-0 px-3 text-emerald-700 hover:bg-emerald-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600" aria-label={`恢復${account.name}`} disabled={restoreAccount.isPending} onClick={() => restoreAccount.mutate(account.id)}>
+                  {restoreAccount.isPending && restoreAccount.variables === account.id ? "恢復中…" : "恢復"}
                 </Button>
-              </div>
+              </li>
             ))}
-          </div>
-          {restoreAccount.isError && <p role="alert" className="mt-3 text-sm text-red-600">恢復失敗：{restoreAccount.error.message}</p>}
-        </Card>
+          </ul>
+          {restoreAccount.isError && <p role="alert" className="px-4 pb-3 text-sm text-red-600">恢復失敗：{restoreAccount.error.message}</p>}
+        </details>
       )}
 
       <Dialog open={Boolean(archiveTarget)} onClose={() => { if (!deleteAccount.isPending) setArchiveTarget(null); }} title="封存帳戶" description="不刪除歷史交易，可以隨時恢復。">
@@ -469,155 +476,48 @@ export default function AccountsPage() {
         description="帳戶餘額和交易明細分開記錄。"
         size="lg"
       >
-        <form ref={accountFormRef} className="space-y-5" onSubmit={submitAccount}>
-          <FormContext value="建立新的財務帳戶" />
-          <MobileWizardProgress current={accountStep} labels={["帳戶類型", "名稱與銀行", "餘額與所有人"]} />
-          <MobileWizardStep step={1} current={accountStep}>
-          <FormStep number={1} title="這個帳戶怎麼分類？" tone="blue">
-          <div className="grid gap-4 sm:grid-cols-2">
+        <form className="space-y-4" onSubmit={submitAccount}>
+          <div className="grid grid-cols-2 gap-3">
             <Field label="帳戶類型">
-              <Select
-                name="account_type"
-                value={accountType}
-                onChange={(event) => changeAccountType(event.target.value)}
-              >
-                {accountTypes.map((item) => (
-                  <option key={item.value} value={item.value}>
-                    {item.label}
-                  </option>
-                ))}
+              <Select name="account_type" value={accountType} onChange={(event) => changeAccountType(event.target.value)}>
+                {accountTypes.map((item) => <option key={item.value} value={item.value}>{item.label}</option>)}
               </Select>
             </Field>
-            <Field label="帳戶性質">
-              <Select name="nature" value={nature} onChange={(event) => setNature(event.target.value)}>
-                <option value="asset">資產</option>
-                <option value="liability">負債</option>
-              </Select>
-            </Field>
-          </div>
-          </FormStep>
-          </MobileWizardStep>
-          <MobileWizardStep step={2} current={accountStep}>
-          <FormStep number={2} title="這是什麼帳戶？" description="先選常用名稱與金融機構，清單沒有也可以自訂。">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="帳戶名稱" hint="清單沒有的話選「其他 / 自訂」。">
-              <Select
-                value={accountNameSelectValue}
-                onChange={(event) => changeAccountNameChoice(event.target.value)}
-                required
-                autoFocus
-              >
-                <option value="">選擇常用名稱</option>
-                {nameOptions.map((name) => (
-                  <option key={name} value={name}>
-                    {name}
-                  </option>
-                ))}
-                <option value={customAccountNameValue}>其他 / 自訂</option>
-              </Select>
-              {showCustomAccountName && (
-                <Input
-                  className="mt-2"
-                  name="name"
-                  value={accountName}
-                  onChange={(event) => setAccountName(event.target.value)}
-                  placeholder="輸入你的帳戶名稱"
-                  required
-                />
-              )}
-            </Field>
-            <Field label="金融機構" hint="清單沒有的話選「其他 / 自訂」。">
-              <Select
-                value={institutionChoice}
-                onChange={(event) => changeInstitutionChoice(event.target.value)}
-              >
-                <option value="">先不指定</option>
-                {institutionOptions.map((institution) => (
-                  <option key={institution} value={institution}>
-                    {institution}
-                  </option>
-                ))}
+            <Field label="金融機構">
+              <Select value={institutionChoice} onChange={(event) => changeInstitutionChoice(event.target.value)}>
+                <option value="">不指定</option>
+                {institutionOptions.map((institution) => <option key={institution}>{institution}</option>)}
                 <option value={customInstitutionValue}>其他 / 自訂</option>
               </Select>
-              {institutionChoice === customInstitutionValue && (
-                <Input
-                  className="mt-2"
-                  value={customInstitution}
-                  onChange={(event) => changeCustomInstitution(event.target.value)}
-                  placeholder="輸入你的銀行、券商或交易所"
-                />
-              )}
             </Field>
           </div>
-          </FormStep>
-          </MobileWizardStep>
-          <MobileWizardStep step={3} current={accountStep}>
-          <FormStep number={3} title="目前有多少錢？" description="這會成為第一筆餘額紀錄。" tone="purple">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="幣別">
-              <Select name="currency" defaultValue="TWD">
-                {currencies.map((currency) => (
-                  <option key={currency}>{currency}</option>
-                ))}
-              </Select>
-            </Field>
-            <Field label="目前餘額">
-              <Input name="opening_balance" type="number" inputMode="decimal" step="any" placeholder="0" />
-            </Field>
-          </div>
-          <Field label="餘額日期">
-            <DateInput name="opening_date" defaultValue={taipeiDateInputValue()} />
-          </Field>
-          <Field label="所有人">
-            <Select name="owner" defaultValue={ownerFilter === "all" ? "me" : ownerFilter}>
-              {accountOwnerOptions.map((option) => (
-                <option key={option.value} value={option.value}>
-                  {option.label}
-                </option>
-              ))}
+          {institutionChoice === customInstitutionValue && <Field label="自訂金融機構"><Input value={customInstitution} onChange={(event) => changeCustomInstitution(event.target.value)} placeholder="銀行、券商或交易所" /></Field>}
+          <Field label="帳戶名稱">
+            <Select value={accountNameSelectValue} onChange={(event) => changeAccountNameChoice(event.target.value)} required>
+              <option value="">選擇名稱</option>
+              {nameOptions.map((name) => <option key={name}>{name}</option>)}
+              <option value={customAccountNameValue}>其他 / 自訂</option>
             </Select>
+            {showCustomAccountName && <Input name="name" value={accountName} onChange={(event) => setAccountName(event.target.value)} placeholder="輸入帳戶名稱" required />}
           </Field>
-          </FormStep>
-          </MobileWizardStep>
-          <MobileWizardStep step={3} current={accountStep}>
-          <details className="rounded-2xl border border-slate-200 px-4 py-3">
-            <summary className="cursor-pointer list-none text-sm font-medium text-slate-600">其他設定（流動資產、持倉計算）</summary>
-            <div className="mt-4 space-y-3">
-              <label className="flex items-start gap-3 rounded-xl bg-slate-50 p-4">
-                <input name="is_liquid" type="checkbox" className="mt-1 accent-emerald-600" />
-                <span>
-                  <span className="block text-sm font-medium text-slate-700">列入流動資產</span>
-                  <span className="mt-1 block text-xs leading-5 text-slate-400">可快速使用的現金或存款，會用於計算緊急預備金。</span>
-                </span>
-              </label>
-              {["brokerage", "crypto"].includes(accountType) && (
-                <label className="flex items-start gap-3 rounded-xl border border-emerald-100 bg-emerald-50/70 p-4">
-                  <input name="balance_includes_positions" type="checkbox" className="mt-1 accent-emerald-600" defaultChecked />
-                  <span>
-                    <span className="block text-sm font-medium text-slate-700">餘額已包含投資持倉</span>
-                    <span className="mt-1 block text-xs leading-5 text-slate-500">如果你輸入的是交易所或券商顯示的總資產，請保持勾選，避免持倉市值被重複加總。</span>
-                  </span>
-                </label>
-              )}
+          <div className="grid grid-cols-[minmax(0,1fr)_6rem] gap-3">
+            <Field label={nature === "liability" ? "目前負債" : "目前餘額"}><Input name="opening_balance" type="number" inputMode="decimal" step="any" placeholder="選填" /></Field>
+            <Field label="幣別"><Select name="currency" defaultValue="TWD">{currencies.map((currency) => <option key={currency}>{currency}</option>)}</Select></Field>
+          </div>
+          {["brokerage", "crypto"].includes(accountType) && <label className="flex items-start gap-2 text-sm text-slate-600">
+            <input name="balance_includes_positions" type="checkbox" className="mt-1 accent-emerald-600" defaultChecked />
+            <span>餘額已包含投資持倉<span className="mt-1 block text-xs text-slate-500">輸入券商或交易所總資產時勾選，避免重複計算。</span></span>
+          </label>}
+          <FormOptions title="其他設定（日期、所有人、資產性質）">
+            <div className="grid grid-cols-2 gap-3">
+              <Field label="餘額日期"><DateInput name="opening_date" defaultValue={taipeiDateInputValue()} /></Field>
+              <Field label="所有人"><Select name="owner" defaultValue={ownerFilter === "all" ? "me" : ownerFilter}>{accountOwnerOptions.map((option) => <option key={option.value} value={option.value}>{option.label}</option>)}</Select></Field>
             </div>
-          </details>
-          </MobileWizardStep>
-          {createAccount.isError && (
-            <p className="text-sm text-red-600">{(createAccount.error as Error).message}</p>
-          )}
-          <MobileWizardActions
-            current={accountStep}
-            total={3}
-            onPrevious={() => setAccountStep((step) => Math.max(1, step - 1))}
-            onNext={() => {
-              if (validateWizardStep(accountFormRef.current, accountStep)) {
-                setAccountStep((step) => Math.min(3, step + 1));
-              }
-            }}
-            onCancel={closeCreateDialog}
-            submitLabel={createAccount.isPending ? "建立中…" : "建立帳戶"}
-            pending={createAccount.isPending}
-          />
+            <Field label="帳戶性質"><Select name="nature" value={nature} onChange={(event) => setNature(event.target.value)}><option value="asset">資產</option><option value="liability">負債</option></Select></Field>
+            <label className="flex items-center gap-2 text-sm text-slate-600"><input name="is_liquid" type="checkbox" className="accent-emerald-600" />列入流動資產（可立即使用的現金或存款）</label>
+          </FormOptions>
+          {createAccount.isError && <p role="alert" className="text-sm text-red-600">{createAccount.error.message}</p>}
+          <FormActions onCancel={closeCreateDialog} pending={createAccount.isPending} label="建立帳戶" />
         </form>
       </Dialog>
 
@@ -783,6 +683,7 @@ function AccountGroup({
   onBalance,
   onDetail,
   onDelete,
+  cardCycles = [],
 }: {
   title: string;
   subtitle: string;
@@ -790,6 +691,7 @@ function AccountGroup({
   onBalance: (account: Account) => void;
   onDetail: (account: Account) => void;
   onDelete: (account: Account) => void;
+  cardCycles?: Cycle[];
 }) {
   return (
     <section>
@@ -800,6 +702,8 @@ function AccountGroup({
       <div className="grid gap-5 md:grid-cols-2 xl:grid-cols-3">
         {accounts.map((account) => {
           const Icon = iconFor(account.account_type);
+          const isCreditCard = account.account_type === "credit_card";
+          const cycle = cardCycles.find((item) => item.card_account_id === account.id);
           const staleDays = daysBetweenDateValues(account.balance_date);
           const snapshotIsStale = staleDays !== null && staleDays >= 7;
           return (
@@ -824,14 +728,20 @@ function AccountGroup({
                 </div>
                 <div className="mt-7">
                   <p className="text-xs font-medium text-slate-400">
-                    {account.nature === "asset" ? "帳戶總價值" : "目前負債"}
+                    {account.nature === "asset" ? "帳戶總價值" : isCreditCard ? "未償還負債" : "目前負債"}
                   </p>
                   <p className={`mt-1 text-2xl font-bold ${account.nature === "liability" ? "text-red-600" : "text-ink"}`}>
                     {money(Math.abs(account.total_twd))}
                   </p>
                 </div>
+                {isCreditCard && <div className="mt-3 space-y-1 text-xs text-slate-500">
+                  {cycle && <p>{cycle.closing_day ? `每月 ${cycle.closing_day} 日結帳 · ` : "結帳日尚未設定 · "}每月 {cycle.payment_due_day} 日繳款</p>}
+                  {cycle?.current_cycle && <p>本帳期匯入消費 {money(cycle.current_cycle.amount, cycle.currency)}<span className="mt-1 block">{cycle.current_cycle.period_start}～{cycle.current_cycle.period_end}</span></p>}
+                  <p>負債依消費與繳款記錄更新，不會在結帳日自動歸零。</p>
+                  <a href="#card-cycles" className="inline-block py-1 font-medium text-emerald-700">查看帳單與繳款紀錄 →</a>
+                </div>}
                 <div className="mt-6 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
-                  <span>餘額更新 {account.balance_date || "尚未建立"}</span>
+                  <span>{isCreditCard ? "資料更新" : "餘額更新"} {account.balance_date || "尚未建立"}</span>
                   <div className="flex flex-wrap items-center gap-2">
                     {!account.balance_date && <Badge tone="amber">尚未更新</Badge>}
                     {snapshotIsStale && <Badge tone="amber">{staleDays} 天未更新</Badge>}

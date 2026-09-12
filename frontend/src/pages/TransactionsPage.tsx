@@ -1,4 +1,4 @@
-import { FormEvent, type ReactNode, type SetStateAction, useEffect, useMemo, useRef, useState } from "react";
+import { FormEvent, type SetStateAction, useEffect, useMemo, useRef, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useNavigate, useSearchParams } from "react-router-dom";
 import {
@@ -39,18 +39,14 @@ import {
   Dialog,
   EmptyState,
   Field,
-  FormContext,
-  FormStep,
+  FormActions,
+  FormOptions,
   Input,
   MonthInput,
-  MobileWizardActions,
-  MobileWizardProgress,
-  MobileWizardStep,
   PageHeader,
   Select,
   Skeleton,
   money,
-  validateWizardStep,
 } from "../ui";
 
 interface TransferSuggestion {
@@ -83,20 +79,6 @@ const kindLabels: Record<string, string> = {
 };
 
 type ManualScenario = "income" | "expense" | "transfer" | "loan_payment";
-
-const scenarioLabels: Record<ManualScenario, string> = {
-  income: "收錢",
-  expense: "花錢",
-  transfer: "帳戶互轉",
-  loan_payment: "貸款",
-};
-
-const scenarioDescriptions: Record<ManualScenario, string> = {
-  income: "薪水、退款、獎金或其他收入。",
-  expense: "餐飲、交通、娛樂、帳單等日常支出。",
-  transfer: "自己的帳戶之間移動錢，不列入收入或支出。",
-  loan_payment: "還款時一次填本金與利息，系統會同步降低貸款負債。",
-};
 
 export function categoriesForTransactionKind(categories: Category[], kind: string) {
   if (kind === "income") return categories.filter((category) => category.kind === "income");
@@ -193,10 +175,7 @@ export default function TransactionsPage() {
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   useEffect(() => { setSelectedIds([]); }, [month, accountFilter, ownerFilter, searchQuery, page, excluded]);
   const toggleSelected = (id: number) => setSelectedIds((ids) => ids.includes(id) ? ids.filter((value) => value !== id) : [...ids, id]);
-  const [manualStep, setManualStep] = useState(1);
-  const [accountTransferStep, setAccountTransferStep] = useState(1);
-  const manualFormRef = useRef<HTMLFormElement>(null);
-  const accountTransferFormRef = useRef<HTMLFormElement>(null);
+
 
   useEffect(() => {
     const quickAction = searchParams.get("quick");
@@ -206,10 +185,10 @@ export default function TransactionsPage() {
       setManualScenario(quickAction);
       setManualKind(quickAction);
       setLoanAccountId("");
-      setManualStep(1);
+
       setManualOpen(true);
     } else if (quickAction === "transfer") {
-      setAccountTransferStep(1);
+
       setAccountTransferOpen(true);
     } else if (quickAction === "import") {
       setImportOpen(true);
@@ -430,12 +409,12 @@ export default function TransactionsPage() {
   });
 
   function openManualDialog() {
-    setManualScenario(null);
+    setManualScenario("expense");
     setManualKind("expense");
     setLoanAccountId("");
     createTransaction.reset();
     createLoanPayment.reset();
-    setManualStep(1);
+
     setManualOpen(true);
   }
 
@@ -446,17 +425,17 @@ export default function TransactionsPage() {
     setLoanAccountId("");
     createTransaction.reset();
     createLoanPayment.reset();
-    setManualStep(1);
+
   }
 
   function chooseManualScenario(scenario: ManualScenario) {
     if (scenario === "transfer") {
       closeManualDialog();
-      setAccountTransferStep(1);
+
       setAccountTransferOpen(true);
       return;
     }
-    setManualStep(1);
+
     setManualScenario(scenario);
     setManualKind(scenario);
     setLoanAccountId("");
@@ -464,7 +443,7 @@ export default function TransactionsPage() {
 
   function closeAccountTransferDialog() {
     setAccountTransferOpen(false);
-    setAccountTransferStep(1);
+
     setTransferFromAccountId("");
     setTransferToAccountId("");
     createAccountTransfer.reset();
@@ -597,7 +576,7 @@ export default function TransactionsPage() {
             ))}
           </Select>
         </div>
-        <div className="mt-3 flex flex-wrap gap-2 text-sm">
+        <div className="mt-3 flex flex-wrap gap-2 text-sm [&>button]:h-8 [&>button]:px-3">
           <Button variant="ghost" onClick={() => setMonth(currentMonth)}>本月</Button>
           <Button variant="ghost" onClick={() => setMonth("")}>所有月份</Button>
           <Button variant={excluded ? "secondary" : "ghost"} onClick={() => setFilters((value) => ({ ...value, excluded: !excluded, onlyUnclassified: false, page: 1 }))}>{excluded ? "返回一般交易" : "查看已排除"}</Button>
@@ -664,14 +643,6 @@ export default function TransactionsPage() {
         </div>
       </div>
 
-      {(transactions.data?.total || 0) > 50 && (
-        <nav aria-label="交易分頁" className="mb-4 flex items-center justify-between gap-3">
-          <Button variant="secondary" disabled={transactions.isFetching || (transactions.data?.page || 1) <= 1} onClick={() => updateFilter("page", (transactions.data?.page || 1) - 1)}>上一頁</Button>
-          <span className="text-sm text-slate-500">第 {transactions.data?.page || 1} / {Math.ceil((transactions.data?.total || 0) / 50)} 頁</span>
-          <Button variant="secondary" disabled={transactions.isFetching || (transactions.data?.page || 1) * 50 >= (transactions.data?.total || 0)} onClick={() => updateFilter("page", (transactions.data?.page || 1) + 1)}>下一頁</Button>
-        </nav>
-      )}
-
       {(classificationMessage || reclassifyTransactions.isError) && (
         <div className={`mb-5 rounded-xl px-4 py-3 text-sm ${
           reclassifyTransactions.isError
@@ -684,7 +655,18 @@ export default function TransactionsPage() {
         </div>
       )}
 
-      {!excluded && <BatchClassification rows={filteredTransactions} categories={categories.data || []} selected={selectedIds} onSelect={setSelectedIds} active={batchMode} onToggle={() => { setBatchMode(!batchMode); setSelectedIds([]); }} onSaved={() => { if (onlyUnclassified) { setOnlyUnclassified(false); setClassificationMessage("批次分類完成，已返回交易清單。"); } }} />}
+      {(!excluded || (transactions.data?.total || 0) > 50) && <div className="mb-4 flex flex-wrap items-start justify-between gap-3">
+        {!excluded && <div className={`${batchMode ? "w-full" : "min-w-0 flex-1"} [&>section]:mb-0`}>
+          <BatchClassification rows={filteredTransactions} categories={categories.data || []} selected={selectedIds} onSelect={setSelectedIds} active={batchMode} onToggle={() => { setBatchMode(!batchMode); setSelectedIds([]); }} onSaved={() => { if (onlyUnclassified) { setOnlyUnclassified(false); setClassificationMessage("批次分類完成，已返回交易清單。"); } }} />
+        </div>}
+        {(transactions.data?.total || 0) > 50 && (
+          <nav aria-label="交易分頁" className="ml-auto flex items-center gap-2">
+            <Button variant="ghost" className="px-2" aria-label="上一頁" disabled={transactions.isFetching || (transactions.data?.page || 1) <= 1} onClick={() => updateFilter("page", (transactions.data?.page || 1) - 1)}><ChevronLeft size={16} /></Button>
+            <span className="whitespace-nowrap text-xs tabular-nums text-slate-500">第 {transactions.data?.page || 1} / {Math.ceil((transactions.data?.total || 0) / 50)} 頁</span>
+            <Button variant="ghost" className="px-2" aria-label="下一頁" disabled={transactions.isFetching || (transactions.data?.page || 1) * 50 >= (transactions.data?.total || 0)} onClick={() => updateFilter("page", (transactions.data?.page || 1) + 1)}><ChevronRight size={16} /></Button>
+          </nav>
+        )}
+      </div>}
       <Card className="overflow-hidden" aria-busy={transactions.isFetching}>
         {transactions.isError && transactions.data && <p role="alert" className="p-4 text-sm text-amber-700">更新失敗，保留上次載入的交易。<Button onClick={() => transactions.refetch()}>重試</Button></p>}
         {transactions.isError && !transactions.data ? (
@@ -782,9 +764,10 @@ export default function TransactionsPage() {
                       </div>
                     </div>
                   </div>
-                  <Field label="分類">
+                  <div className="space-y-2">
+                    <p className="text-xs text-slate-500">分類</p>
                     <TransactionCategory transaction={transaction} categories={categories.data || []} onSaved={onCategorySaved} />
-                  </Field>
+                  </div>
                   {transaction.currency !== "TWD" && (
                     <p className="rounded-xl bg-slate-50 px-3 py-2 text-xs text-slate-500">
                       原幣金額：{money(Math.abs(transaction.amount), transaction.currency)}
@@ -797,52 +780,46 @@ export default function TransactionsPage() {
             ))}
           </div>
           <div className="hidden overflow-x-auto md:block">
-            <table className="w-full min-w-[850px]">
+            <table className="w-full min-w-[680px] table-fixed">
+              <colgroup>
+                {batchMode && !excluded && <col className="w-12" />}
+                <col />
+                <col className="w-[23%]" />
+                <col className="w-[17%]" />
+                <col className="w-[18%]" />
+                <col className="w-16" />
+              </colgroup>
               <thead>
                 <tr className="border-b border-slate-100 bg-slate-50/80 text-left text-xs font-semibold uppercase tracking-wider text-slate-400">
                   {batchMode && !excluded && <th className="px-3 py-4">選取</th>}
                   <th className="px-5 py-4">日期與摘要</th>
                   <th className="px-4 py-4">帳戶</th>
                   <th className="px-4 py-4">分類</th>
-                  <th className="px-4 py-4">類型</th>
                   <th className="px-5 py-4 text-right">金額</th>
-                  <th className="px-4 py-4 text-right">操作</th>
+                  <th className="px-3 py-4 text-right"><span className="sr-only">操作</span></th>
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
                 {filteredTransactions.map((transaction) => (
                   <tr key={transaction.id} className="group hover:bg-slate-50/60">
                     {batchMode && !excluded && <td className="px-3">{transaction.can_correct && <input type="checkbox" aria-label={`選取 ${transaction.description}`} checked={selectedIds.includes(transaction.id)} onChange={() => toggleSelected(transaction.id)} />}</td>}
-                    <td className="px-5 py-4">
+                    <td className="px-5 py-3">
                       <div className="flex items-center gap-3">
-                        <div
-                          className={`grid size-9 shrink-0 place-items-center rounded-xl ${
-                            transaction.base_amount >= 0
-                              ? "bg-emerald-50 text-emerald-700"
-                              : "bg-orange-50 text-orange-700"
-                          }`}
-                        >
-                          {transaction.base_amount >= 0 ? <ArrowDownLeft size={16} /> : <ArrowUpRight size={16} />}
-                        </div>
-                        <div>
-                          <p className="max-w-xs truncate text-sm font-semibold text-slate-800">{transaction.description}</p>
-                          <p className="mt-1 text-xs text-slate-400">
+                        <div className="min-w-0">
+                          <p title={transaction.description} className="truncate text-sm font-semibold text-slate-800">{transaction.description}</p>
+                          <p className="mt-1 flex flex-wrap items-center gap-x-1 text-xs text-slate-500">
                             {transaction.transaction_date} · {transactionSourceLabel(transaction.source)}
+                            <span>· {kindLabels[transaction.transaction_kind] || transaction.transaction_kind}</span>
                             {transaction.fx_estimated ? " · 估算匯率" : ""}
                           </p>
                         </div>
                       </div>
                     </td>
-                    <td className="px-4 py-4 text-sm text-slate-600">{transaction.account_name}</td>
-                    <td className="px-4 py-4">
+                    <td className="px-4 py-3 text-sm text-slate-500"><span title={transaction.account_name} className="block truncate">{transaction.account_name}</span></td>
+                    <td className="px-4 py-3">
                       <TransactionCategory transaction={transaction} categories={categories.data || []} onSaved={onCategorySaved} />
                     </td>
-                    <td className="px-4 py-4">
-                      <Badge tone={transaction.transaction_kind === "transfer" ? "blue" : transaction.base_amount >= 0 ? "green" : "slate"}>
-                        {kindLabels[transaction.transaction_kind] || transaction.transaction_kind}
-                      </Badge>
-                    </td>
-                    <td className={`px-5 py-4 text-right text-sm font-bold ${transaction.base_amount >= 0 ? "text-emerald-700" : "text-slate-800"}`}>
+                    <td className={`whitespace-nowrap px-5 py-3 text-right text-sm font-semibold tabular-nums ${transaction.base_amount >= 0 ? "text-emerald-700" : "text-slate-800"}`}>
                       {transaction.base_amount >= 0 ? "+" : "−"}
                       {money(Math.abs(transaction.base_amount))}
                       {transaction.currency !== "TWD" && (
@@ -851,8 +828,8 @@ export default function TransactionsPage() {
                         </div>
                       )}
                     </td>
-                    <td className="px-4 py-4 text-right">
-                      {transaction.can_correct && <Button variant="ghost" className="h-10 px-2 text-xs" onClick={() => setCorrecting(transaction)}>{transaction.excluded ? "查看／復原" : "更正／排除"}</Button>}
+                    <td className="px-3 py-3 text-right">
+                      {transaction.can_correct && <Button variant="ghost" aria-label={`${transaction.excluded ? "查看／復原" : "更正／排除"}：${transaction.description}`} className="h-9 px-1 text-xs font-medium" onClick={() => setCorrecting(transaction)}>{transaction.excluded ? "復原" : "編輯"}</Button>}
                     </td>
                   </tr>
                 ))}
@@ -868,76 +845,19 @@ export default function TransactionsPage() {
         open={manualOpen}
         onClose={closeManualDialog}
         title="新增交易"
-        description="先選這筆交易的情境，系統只顯示需要填的欄位。"
+        description="記錄一筆收入、支出或帳戶轉帳。"
       >
-        {!manualScenario ? (
-          <div className="space-y-5">
-            <p className="text-sm font-medium text-slate-700">這筆交易是哪一種？</p>
-            <div className="grid gap-3 sm:grid-cols-2">
-              <ScenarioCard
-                icon={<ArrowDownLeft size={18} />}
-                title={scenarioLabels.income}
-                description={scenarioDescriptions.income}
-                tone="bg-emerald-50 text-emerald-700"
-                onClick={() => chooseManualScenario("income")}
-              />
-              <ScenarioCard
-                icon={<ArrowUpRight size={18} />}
-                title={scenarioLabels.expense}
-                description={scenarioDescriptions.expense}
-                tone="bg-orange-50 text-orange-700"
-                onClick={() => chooseManualScenario("expense")}
-              />
-              <ScenarioCard
-                icon={<ArrowRightLeft size={18} />}
-                title={scenarioLabels.transfer}
-                description={scenarioDescriptions.transfer}
-                tone="bg-blue-50 text-blue-700"
-                onClick={() => chooseManualScenario("transfer")}
-              />
-              <ScenarioCard
-                icon={<Check size={18} />}
-                title={scenarioLabels.loan_payment}
-                description={scenarioDescriptions.loan_payment}
-                tone="bg-purple-50 text-purple-700"
-                onClick={() => chooseManualScenario("loan_payment")}
-              />
-            </div>
-            <p className="rounded-xl bg-slate-50 p-4 text-xs leading-5 text-slate-500">
-              如果只是自己的帳戶之間移動錢，選「帳戶互轉」；它不會被算成收入或支出。
-            </p>
-          </div>
-        ) : manualScenario === "income" || manualScenario === "expense" ? (
+        <div className="mb-4 grid grid-cols-4 gap-1 rounded-xl bg-slate-100 p-1" role="group" aria-label="交易類型">
+          {(["expense", "income", "transfer", "loan_payment"] as const).map((kind) => <Button key={kind} variant="ghost" className={`px-1 text-xs ${manualScenario === kind ? "bg-white text-emerald-700 shadow-sm" : ""}`} aria-pressed={manualScenario === kind} disabled={createTransaction.isPending || createLoanPayment.isPending} onClick={() => chooseManualScenario(kind)}>{({ expense: "支出", income: "收入", transfer: "轉帳", loan_payment: "還款" })[kind]}</Button>)}
+        </div>
+        {manualScenario === "income" || manualScenario === "expense" ? (
           accounts.isLoading ? <p role="status">正在載入帳戶…</p> : accounts.isError ? <div role="alert">無法載入帳戶<Button onClick={() => accounts.refetch()}>重試</Button></div> : (
             <QuickTransactionForm key={`${ownerFilter}-${manualScenario}`} kind={manualScenario} accounts={accounts.data || []} categories={categories.data || []} owner={ownerFilter} pending={createTransaction.isPending} error={createTransaction.error?.message} onSubmit={submitManual} onCancel={closeManualDialog} />
           )
         ) : (
-          <form ref={manualFormRef} className="space-y-5" onSubmit={submitManual}>
+          <form className="space-y-5" onSubmit={submitManual}>
             <input type="hidden" name="transaction_kind" value={manualKind} />
-            <FormContext
-              label="目前情境"
-              value={scenarioLabels[manualScenario]}
-              action={(
-                <Button
-                  type="button"
-                  variant="ghost"
-                  className="h-9"
-                  onClick={() => {
-                    setManualScenario(null);
-                    setManualKind("expense");
-                    setLoanAccountId("");
-                    setManualStep(1);
-                  }}
-                >
-                  重選
-                </Button>
-              )}
-            />
-
-            <MobileWizardProgress current={manualStep} labels={["帳戶與日期", "交易摘要", "金額與確認"]} />
-
-            <MobileWizardStep step={1} current={manualStep}>
-            <FormStep number={1} title="使用哪個帳戶？">
+            <div className="space-y-3">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label={manualKind === "income" ? "入帳帳戶" : "付款帳戶"}>
                   <Select name="account_id" required>
@@ -951,11 +871,10 @@ export default function TransactionsPage() {
                   <DateInput name="transaction_date" defaultValue={taipeiDateInputValue()} required />
                 </Field>
               </div>
-            </FormStep>
-            </MobileWizardStep>
+            </div>
 
-            <MobileWizardStep step={2} current={manualStep}>
-            <FormStep number={2} title="這筆交易是什麼？" tone="blue">
+
+            <div className="space-y-3">
               <Field label="摘要">
                 <Input
                   name="description"
@@ -967,14 +886,12 @@ export default function TransactionsPage() {
                           : "例如：午餐、房租"
                   }
                   required
-                  autoFocus={manualStep === 2}
                 />
               </Field>
-            </FormStep>
-            </MobileWizardStep>
+            </div>
 
-            <MobileWizardStep step={3} current={manualStep}>
-            <FormStep number={3} title={manualKind === "loan_payment" ? "本金和利息是多少？" : "這次金額是多少？"} tone="purple">
+
+            <div className="space-y-3">
               {manualKind === "loan_payment" ? (
               <>
                 <div className="grid gap-4">
@@ -1064,7 +981,7 @@ export default function TransactionsPage() {
                 </Field>
               </>
               )}
-            </FormStep>
+            </div>
 
             {manualKind !== "loan_payment" && (
               <details className="rounded-2xl border border-slate-200 px-4 py-3">
@@ -1082,27 +999,8 @@ export default function TransactionsPage() {
                 {((createTransaction.error || createLoanPayment.error) as Error).message}
               </p>
             )}
-            </MobileWizardStep>
-            <MobileWizardActions
-              current={manualStep}
-              total={3}
-              onPrevious={() => setManualStep((step) => Math.max(1, step - 1))}
-              onNext={() => {
-                if (validateWizardStep(manualFormRef.current, manualStep)) {
-                  setManualStep((step) => Math.min(3, step + 1));
-                }
-              }}
-              onCancel={closeManualDialog}
-              submitLabel={
-                manualKind === "income"
-                  ? "儲存收入"
-                  : manualKind === "loan_payment"
-                      ? "儲存還款"
-                      : "儲存支出"
-              }
-              pending={createTransaction.isPending || createLoanPayment.isPending}
-              submitDisabled={manualKind === "loan_payment" && loanAccountOptions.length === 0}
-            />
+
+            <FormActions onCancel={closeManualDialog} label={manualKind === "loan_payment" ? "儲存還款" : manualKind === "income" ? "儲存收入" : "儲存支出"} pending={createTransaction.isPending || createLoanPayment.isPending} disabled={manualKind === "loan_payment" && loanAccountOptions.length === 0} />
           </form>
         )}
       </Dialog>
@@ -1113,11 +1011,9 @@ export default function TransactionsPage() {
         title="帳戶轉帳"
         description="從一個帳戶扣款、另一個帳戶入款；系統會標記為轉帳，不列入收入或支出。"
       >
-        <form ref={accountTransferFormRef} className="space-y-5" onSubmit={submitAccountTransfer}>
-          <FormContext value="自己的帳戶之間移動資金" />
-          <MobileWizardProgress current={accountTransferStep} labels={["選擇帳戶", "轉帳金額", "用途與確認"]} />
-          <MobileWizardStep step={1} current={accountTransferStep}>
-          <FormStep number={1} title="從哪裡轉到哪裡？">
+        <form className="space-y-5" onSubmit={submitAccountTransfer}>
+
+          <div className="space-y-3">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="轉出帳戶">
               <Select
@@ -1153,10 +1049,10 @@ export default function TransactionsPage() {
           {transferFromAccountId && transferFromAccountId === transferToAccountId && (
             <p className="text-sm text-red-600">轉出與轉入帳戶不能相同。</p>
           )}
-          </FormStep>
-          </MobileWizardStep>
-          <MobileWizardStep step={2} current={accountTransferStep}>
-          <FormStep number={2} title="這次轉多少？" tone="blue">
+          </div>
+
+
+          <div className="space-y-3">
           <div className="grid gap-4 sm:grid-cols-2">
             <Field label="轉帳日期">
               <DateInput name="transfer_date" defaultValue={taipeiDateInputValue()} required />
@@ -1175,43 +1071,18 @@ export default function TransactionsPage() {
               <Input name="to_amount" type="number" inputMode="decimal" min="0" step="any" placeholder="不填則自動估算" />
             </Field>
           )}
-          </FormStep>
-          </MobileWizardStep>
-          <MobileWizardStep step={3} current={accountTransferStep}>
-          <FormStep number={3} title="這筆轉帳的用途？" description="方便之後辨認，沒有也可以留空。" tone="purple">
-            <Field label="說明">
-              <Input name="description" placeholder="例如：轉到交易所、現金存入銀行" />
-            </Field>
-          </FormStep>
-          <details className="rounded-2xl border border-slate-200 px-4 py-3">
-            <summary className="cursor-pointer list-none text-sm font-medium text-slate-600">其他設定（備註）</summary>
-            <div className="mt-4"><Field label="備註"><Input name="note" placeholder="選填" /></Field></div>
-          </details>
+          </div>
+
+
+          <FormOptions title="用途與備註（選填）">
+            <Field label="說明"><Input name="description" placeholder="例如：轉到交易所" /></Field>
+            <Field label="備註"><Input name="note" placeholder="選填" /></Field>
+          </FormOptions>
           {createAccountTransfer.isError && (
             <p className="text-sm text-red-600">{(createAccountTransfer.error as Error).message}</p>
           )}
-          </MobileWizardStep>
-          <MobileWizardActions
-            current={accountTransferStep}
-            total={3}
-            onPrevious={() => setAccountTransferStep((step) => Math.max(1, step - 1))}
-            onNext={() => {
-              if (
-                transferFromAccountId !== transferToAccountId &&
-                validateWizardStep(accountTransferFormRef.current, accountTransferStep)
-              ) {
-                setAccountTransferStep((step) => Math.min(3, step + 1));
-              }
-            }}
-            onCancel={closeAccountTransferDialog}
-            submitLabel={createAccountTransfer.isPending ? "建立中…" : "建立轉帳"}
-            pending={
-              createAccountTransfer.isPending ||
-              !transferFromAccountId ||
-              !transferToAccountId ||
-              transferFromAccountId === transferToAccountId
-            }
-          />
+
+          <FormActions onCancel={closeAccountTransferDialog} label="建立轉帳" pending={createAccountTransfer.isPending} disabled={!transferFromAccountId || !transferToAccountId || transferFromAccountId === transferToAccountId} />
         </form>
       </Dialog>
 
@@ -1445,32 +1316,6 @@ export default function TransactionsPage() {
         )}
       </Dialog>
     </>
-  );
-}
-
-function ScenarioCard({
-  icon,
-  title,
-  description,
-  tone,
-  onClick,
-}: {
-  icon: ReactNode;
-  title: string;
-  description: string;
-  tone: string;
-  onClick: () => void;
-}) {
-  return (
-    <button
-      type="button"
-      className="group rounded-2xl border border-slate-200 bg-white p-4 text-left transition hover:-translate-y-0.5 hover:border-emerald-300 hover:shadow-soft"
-      onClick={onClick}
-    >
-      <span className={`mb-3 grid size-10 place-items-center rounded-xl ${tone}`}>{icon}</span>
-      <span className="block text-base font-semibold text-slate-800 group-hover:text-emerald-800">{title}</span>
-      <span className="mt-1 block text-xs leading-5 text-slate-500">{description}</span>
-    </button>
   );
 }
 

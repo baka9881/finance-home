@@ -21,7 +21,12 @@ it("refreshes an already loaded analysis after saving a category", async () => {
   }
   render(<QueryClientProvider client={new QueryClient({ defaultOptions: { queries: { retry: false, staleTime: 300000 } } })}><AnalysisProbe /><TransactionCategory transaction={{ id: 1, description: "早餐", amount: -50, transaction_kind: "expense" } as Transaction} categories={[{id: 1, name: "餐飲", kind: "expense"}] as Category[]} /></QueryClientProvider>);
   await screen.findByText("餐飲合計：0");
-  await userEvent.setup().selectOptions(screen.getByRole("combobox"), "1");
+  const user = userEvent.setup();
+  await user.click(screen.getByRole("button", { name: "變更分類：早餐（未分類）" }));
+  await user.selectOptions(screen.getByRole("combobox"), "1");
+  expect(screen.getByText("餐飲合計：0")).toBeTruthy();
+  expect(vi.mocked(api).mock.calls.some(([, options]) => options?.method === "PATCH")).toBe(false);
+  await user.click(screen.getByRole("button", { name: "儲存分類" }));
   await screen.findByText("餐飲合計：50");
 });
 it("restores the matching page scroll only when rows are ready", () => {

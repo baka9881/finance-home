@@ -259,12 +259,16 @@ def gmail_status(db: Session) -> dict[str, Any]:
         last_result = None
     issues = []
     for record in db.scalars(select(EmailImportRecord).where(EmailImportRecord.status == "error")
-                             .order_by(EmailImportRecord.updated_at.desc()).limit(20)).all():
+                             .order_by(EmailImportRecord.updated_at.desc())):
+        if _is_deposit_statement(record.subject or ""):
+            continue
         password_problem = bool(re.search(r"password|decrypt|encrypted|密碼", record.error or "", re.I))
         issues.append({"id": record.id, "rule_id": record.rule_id,
             "subject": record.subject or "信用卡郵件", "message_date": record.message_date,
             "reason": "電子帳單需要正確的 PDF 密碼" if password_problem else "這封郵件尚未成功讀取",
             "action": "password" if password_problem else "retry"})
+        if len(issues) == 20:
+            break
     latest_transaction = db.scalar(select(func.max(Transaction.transaction_date)).where(Transaction.source == "gmail"))
     return {
         "configured": bool(client_id and client_secret),
@@ -450,6 +454,7 @@ def discover_gmail_card_candidates(
             continue
         subjects: list[str] = []
         senders: list[str] = []
+        card_message_count = 0
         latest_message_at: str | None = None
         for item in messages:
             message_id = str(item.get("id") or "")
@@ -466,6 +471,10 @@ def discover_gmail_card_candidates(
             headers = _headers(metadata.get("payload") or {})
             sender = parseaddr(headers.get("from", ""))[1] or headers.get("from", "")
             subject = headers.get("subject", "").strip()
+            messages_scanned += 1
+            if _is_deposit_statement(subject):
+                continue
+            card_message_count += 1
             if sender:
                 senders.append(sender)
             if subject:
@@ -474,14 +483,15 @@ def discover_gmail_card_candidates(
             message_label = message_date.isoformat()
             if not latest_message_at or message_label > latest_message_at:
                 latest_message_at = message_label
-            messages_scanned += 1
+        if not card_message_count:
+            continue
         candidates.append(
             {
                 "key": provider["key"],
                 "institution": provider["institution"],
                 "account_name": provider["account_name"],
                 "sender_pattern": provider["sender_pattern"],
-                "matched_messages": len(messages),
+                "matched_messages": card_message_count,
                 "latest_message_at": latest_message_at,
                 "sample_sender": senders[0] if senders else None,
                 "sample_subject": subjects[0] if subjects else None,
@@ -775,9 +785,18 @@ def parse_card_email(
     return result
 
 
+def _is_deposit_statement(subject: str) -> bool:
+    """Deposit passbooks from a card issuer are not credit-card statements."""
+    compact = re.sub(r"\s+", "", subject)
+    return any(label in compact for label in ("電子存摺", "電子存折", "电子存折"))
+
+
 def _rule_matches(
     rule: EmailCardRule, sender: str, subject: str, text: str | None
 ) -> bool:
+    # Reject known non-card mail before downloading/decrypting its attachments.
+    if _is_deposit_statement(subject):
+        return False
     sender_match = not rule.sender_pattern or rule.sender_pattern.casefold() in sender.casefold()
     subject_match = not rule.subject_pattern or rule.subject_pattern.casefold() in subject.casefold()
     last4_match = text is None or not rule.card_last4 or rule.card_last4 in text
@@ -1460,6 +1479,25 @@ def serialize_card_cycle(
         "period_end": None,
         "transaction_count": 0,
     }
+    current_cycle = None
+    if rule.closing_day:
+        cycle_end = _month_day(as_of, 0, rule.closing_day)
+        if as_of > cycle_end:
+            cycle_end = _month_day(as_of, 1, rule.closing_day)
+        cycle_start = _month_day(cycle_end, -1, rule.closing_day) + timedelta(days=1)
+        cycle_rows = db.scalars(select(Transaction).where(
+            Transaction.account_id == rule.card_account_id,
+            Transaction.transaction_date >= cycle_start,
+            Transaction.transaction_date <= min(as_of, cycle_end),
+            Transaction.source == "gmail",
+            Transaction.excluded.is_(False),
+        )).all()
+        current_cycle = {
+            "amount": float(max(ZERO, -sum((decimal_value(item.amount) for item in cycle_rows), ZERO))),
+            "period_start": cycle_start,
+            "period_end": cycle_end,
+            "transaction_count": len(cycle_rows),
+        }
     return {
         "rule_id": rule.id,
         "rule_name": rule.name,
@@ -1468,6 +1506,7 @@ def serialize_card_cycle(
         "currency": rule.card_account.currency,
         "closing_day": rule.closing_day,
         "payment_due_day": rule.payment_due_day,
+        "current_cycle": current_cycle,
         "unbilled": empty_cycle if current_bill else open_cycle,
         "current_bill": serialize_card_bill(current_bill) if current_bill else None,
         "last_paid_bill": serialize_card_bill(last_paid) if last_paid else None,

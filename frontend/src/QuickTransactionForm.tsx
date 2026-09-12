@@ -2,7 +2,7 @@ import { type FormEvent, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import type { Account, Category } from "./types";
 import { taipeiDateInputValue } from "./date";
-import { Button, DateInput, Field, Input, Select } from "./ui";
+import { Button, DateInput, Field, FormOptions, Input, Select } from "./ui";
 
 const recentKey = (owner: string) => `finance.recent-transaction-account.${owner}`;
 const draftKey = (owner: string, kind: string) => `finance.quick-draft.${owner}.${kind}`;
@@ -43,9 +43,11 @@ export default function QuickTransactionForm({ kind, accounts, categories, owner
         setCurrency(accounts.find((item) => String(item.id) === event.target.value)?.currency || "TWD");
       }}><option value="">選擇帳戶</option>{accounts.map((item) => <option key={item.id} value={item.id}>{item.name}（{item.owner_label}）</option>)}</Select>
     </Field>
-    <Field label="日期"><DateInput name="transaction_date" value={draft.transaction_date} onChange={(event) => setDraft({ ...draft, transaction_date: event.target.value })} required /></Field>
     <Field label="摘要"><Input name="description" required maxLength={300} value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} placeholder={kind === "expense" ? "例如：早餐、房租" : "例如：薪水、退款"} /></Field>
+    <FormOptions title={`日期與分類（${draft.transaction_date}）`}>
+    <Field label="日期"><DateInput name="transaction_date" value={draft.transaction_date} onChange={(event) => setDraft({ ...draft, transaction_date: event.target.value })} required /></Field>
     <Field label="分類"><Select name="category_id" value={draft.category_id} onChange={(event) => setDraft({ ...draft, category_id: event.target.value })}><option value="">自動分類</option>{categories.filter((category) => category.kind === kind).map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</Select></Field>
+    </FormOptions>
     {(draft.amount || draft.description) && <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500"><span>尚未記帳；關閉後暫存草稿，僅限本次瀏覽。</span><Button variant="ghost" className="h-8 px-2 text-xs" disabled={pending} onClick={() => { setDraft({ amount: "", description: "", transaction_date: taipeiDateInputValue(), category_id: "" }); }}>清空草稿</Button></div>}
     {currency !== "TWD" && <details className="text-sm text-slate-500"><summary className="cursor-pointer">自訂匯率（選填）</summary><Input name="fx_rate" type="number" min="0.00000001" step="any" placeholder="1 單位外幣可換多少 TWD" className="mt-2" /></details>}
     {error && <p role="alert" className="text-sm text-red-700">尚未儲存：{error}</p>}

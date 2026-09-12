@@ -5,7 +5,7 @@ import { Badge, Button, Card, money } from "./ui";
 
 interface Bill { amount_due: number; due_date: string; status: string; period_start?: string; period_end?: string }
 interface CycleAmount { amount: number; transaction_count: number; period_start?: string; period_end?: string }
-interface Cycle { rule_id: number; rule_name: string; card_account_id: number; currency: string; closing_day?: number; payment_due_day: number; unbilled: CycleAmount; next_cycle: CycleAmount; current_bill?: Bill; last_paid_bill?: Bill }
+export interface Cycle { rule_id: number; rule_name: string; card_account_id: number; currency: string; closing_day?: number; payment_due_day: number; current_cycle?: CycleAmount | null; unbilled: CycleAmount; next_cycle: CycleAmount; current_bill?: Bill; last_paid_bill?: Bill }
 export default function CreditCardCycles({ accountIds }: { accountIds: number[] }) {
   const cycles = useQuery({ queryKey: ["credit-card-cycles"], queryFn: () => api<Cycle[]>("/email/card-cycles"), enabled: Boolean(accountIds.length) });
   const visible = cycles.data?.filter((cycle) => accountIds.includes(cycle.card_account_id)) || [];

@@ -466,7 +466,7 @@ export function Field({
   hint?: string;
 }) {
   return (
-    <label className="block min-w-0 max-w-full space-y-2">
+    <label className="block min-w-0 max-w-full space-y-1.5">
       <span className="text-sm font-medium text-slate-700">{label}</span>
       {children}
       {hint && <span className="block text-xs text-slate-400">{hint}</span>}
@@ -475,11 +475,9 @@ export function Field({
 }
 
 export function FormStep({
-  number,
   title,
   description,
   children,
-  tone = "green",
 }: {
   number: number;
   title: string;
@@ -487,25 +485,31 @@ export function FormStep({
   children: ReactNode;
   tone?: "green" | "blue" | "purple";
 }) {
-  const tones = {
-    green: "bg-emerald-100 text-emerald-700",
-    blue: "bg-blue-100 text-blue-700",
-    purple: "bg-purple-100 text-purple-700",
-  };
   return (
-    <section className="min-w-0 max-w-full space-y-4 rounded-2xl border border-slate-200 p-4 sm:p-5">
-      <div className="flex items-start gap-3">
-        <span className={cn("flex size-7 shrink-0 items-center justify-center rounded-full text-sm font-bold", tones[tone])}>
-          {number}
-        </span>
-        <div>
-          <p className="font-semibold text-slate-800">{title}</p>
-          {description && <p className="mt-1 text-xs leading-5 text-slate-400">{description}</p>}
-        </div>
+    <section className="min-w-0 max-w-full space-y-3">
+      <div>
+        <p className="text-sm font-semibold text-slate-800">{title}</p>
+        {description && <p className="mt-1 text-xs leading-5 text-slate-500">{description}</p>}
       </div>
       {children}
     </section>
   );
+}
+
+export function FormOptions({ title = "其他設定", children }: { title?: string; children: ReactNode }) {
+  return <details className="min-w-0 border-t border-slate-200 pt-3" onInvalidCapture={(event) => { event.currentTarget.open = true; }}>
+    <summary className="cursor-pointer rounded-md py-1 text-sm font-medium text-slate-500 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-500">{title}</summary>
+    <div className="mt-3 space-y-3">{children}</div>
+  </details>;
+}
+
+export function FormActions({ onCancel, pending = false, disabled = false, label }: {
+  onCancel: () => void; pending?: boolean; disabled?: boolean; label: string;
+}) {
+  return <div className="mobile-safe-actions sticky bottom-0 z-10 -mx-4 flex justify-end gap-2 border-t border-slate-100 bg-white px-4 py-3 sm:-mx-6 sm:px-6">
+    <Button variant="ghost" onClick={onCancel} disabled={pending}>取消</Button>
+    <Button type="submit" disabled={pending || disabled}>{pending ? "儲存中…" : label}</Button>
+  </div>;
 }
 
 export function FormContext({
