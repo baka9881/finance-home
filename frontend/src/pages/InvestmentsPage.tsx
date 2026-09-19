@@ -308,7 +308,7 @@ export default function InvestmentsPage() {
       let exchangeError: string | undefined;
       try {
         exchange = await api<ExchangeSyncSummary>(
-          "/exchanges/sync?force=true",
+          "/exchanges/sync",
           { method: "POST" },
         );
       } catch (error) {
