@@ -1,7 +1,8 @@
-import { type FormEvent, lazy, Suspense, useEffect, useRef, useState } from "react";
+import { type ChangeEvent, type FormEvent, lazy, Suspense, useEffect, useRef, useState } from "react";
 import {
   ArrowLeftRight,
   BarChart3,
+  Camera,
   ChevronLeft,
   Cloud,
   LayoutDashboard,
@@ -28,16 +29,59 @@ const InvestmentsPage = lazy(() => import("./pages/InvestmentsPage"));
 const AnalysisPage = lazy(() => import("./pages/AnalysisPage"));
 const SettingsPage = lazy(() => import("./pages/SettingsPage"));
 
-const navigation = [
+const primaryNavigation = [
   { to: "/", label: "總覽", icon: LayoutDashboard },
   { to: "/accounts", label: "帳戶", icon: WalletCards },
   { to: "/transactions", label: "交易", icon: ArrowLeftRight },
   { to: "/investments", label: "投資", icon: PieChart },
+];
+
+const secondaryNavigation = [
   { to: "/analysis", label: "財務分析", icon: BarChart3 },
   { to: "/settings", label: "設定", icon: Settings },
 ];
 
 const globalOwnerPaths = new Set(["/", "/accounts", "/transactions", "/investments", "/analysis"]);
+const PROFILE_AVATAR_STORAGE_KEY = "finance.profile-avatar";
+
+function readProfileAvatar() {
+  try {
+    return localStorage.getItem(PROFILE_AVATAR_STORAGE_KEY) || "";
+  } catch {
+    return "";
+  }
+}
+
+function resizeProfileAvatar(file: File): Promise<string> {
+  return new Promise((resolve, reject) => {
+    if (!file.type.startsWith("image/")) {
+      reject(new Error("請選擇圖片檔"));
+      return;
+    }
+    const reader = new FileReader();
+    reader.onerror = () => reject(new Error("照片讀取失敗"));
+    reader.onload = () => {
+      const image = new Image();
+      image.onerror = () => reject(new Error("照片格式無法使用"));
+      image.onload = () => {
+        const maxSize = 512;
+        const scale = Math.min(1, maxSize / Math.max(image.width, image.height));
+        const canvas = document.createElement("canvas");
+        canvas.width = Math.max(1, Math.round(image.width * scale));
+        canvas.height = Math.max(1, Math.round(image.height * scale));
+        const context = canvas.getContext("2d");
+        if (!context) {
+          reject(new Error("照片處理失敗"));
+          return;
+        }
+        context.drawImage(image, 0, 0, canvas.width, canvas.height);
+        resolve(canvas.toDataURL("image/jpeg", 0.86));
+      };
+      image.src = String(reader.result);
+    };
+    reader.readAsDataURL(file);
+  });
+}
 
 function useShowGlobalOwnerFilter() {
   const location = useLocation();
@@ -105,6 +149,24 @@ function Sidebar({
   onToggle: () => void;
   onMobileClose: () => void;
 }) {
+  const [avatar, setAvatar] = useState(readProfileAvatar);
+  const [avatarError, setAvatarError] = useState("");
+  const avatarInputRef = useRef<HTMLInputElement>(null);
+
+  async function handleAvatarChange(event: ChangeEvent<HTMLInputElement>) {
+    const file = event.currentTarget.files?.[0];
+    event.currentTarget.value = "";
+    if (!file) return;
+    try {
+      const nextAvatar = await resizeProfileAvatar(file);
+      localStorage.setItem(PROFILE_AVATAR_STORAGE_KEY, nextAvatar);
+      setAvatar(nextAvatar);
+      setAvatarError("");
+    } catch (error) {
+      setAvatarError(error instanceof Error ? error.message : "照片無法使用");
+    }
+  }
+
   return (
     <>
       {mobileOpen && (
@@ -142,8 +204,8 @@ function Sidebar({
           </button>
         </div>
 
-        <nav className="flex-1 space-y-1 px-3 py-3">
-          {navigation.map(({ to, label, icon: Icon }) => (
+        <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-3">
+          {primaryNavigation.map(({ to, label, icon: Icon }) => (
             <NavLink
               key={to}
               to={to}
@@ -163,19 +225,57 @@ function Sidebar({
               {!compact && <span>{label}</span>}
             </NavLink>
           ))}
+          <div className="my-3 border-t border-white/10" />
+          {secondaryNavigation.map(({ to, label, icon: Icon }) => (
+            <NavLink
+              key={to}
+              to={to}
+              onClick={onMobileClose}
+              className={({ isActive }) =>
+                cn(
+                  "group flex h-11 items-center gap-3 rounded-xl px-4 text-sm font-medium transition",
+                  isActive
+                    ? "bg-white text-forest shadow-sm"
+                    : "text-emerald-50/70 hover:bg-white/10 hover:text-white",
+                  compact && "lg:justify-center lg:px-0",
+                )
+              }
+            >
+              <Icon size={18} className="shrink-0" />
+              {!compact && <span>{label}</span>}
+            </NavLink>
+          ))}
         </nav>
 
         <div className="border-t border-white/10 p-3">
-          <div className={cn("rounded-2xl bg-white/8 p-4", compact && "lg:hidden")}>
+          <div className={cn("rounded-2xl border border-white/10 bg-white/5 p-3", compact && "lg:hidden")}>
+            <input
+              ref={avatarInputRef}
+              type="file"
+              accept="image/*"
+              className="sr-only"
+              onChange={handleAvatarChange}
+              aria-label="選擇大頭照"
+            />
             <div className="flex items-center gap-3">
-              <div className="grid size-9 place-items-center rounded-full bg-emerald-200 text-sm font-bold text-forest">
-                我
-              </div>
-              <div>
-                <p className="text-sm font-semibold">{AUTH_REQUIRED ? "雲端財務資料" : "本機財務資料"}</p>
-                <p className="text-xs text-emerald-100/55">{AUTH_REQUIRED ? "已使用密碼保護" : "僅儲存在這台電腦"}</p>
+              <button
+                type="button"
+                className="group relative grid size-11 shrink-0 place-items-center overflow-hidden rounded-full bg-emerald-200 text-sm font-bold text-forest ring-2 ring-emerald-100/20 transition hover:ring-emerald-100/70 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-white"
+                onClick={() => avatarInputRef.current?.click()}
+                aria-label="更換大頭照"
+                title="更換大頭照"
+              >
+                {avatar ? <img src={avatar} alt="我的大頭照" className="size-full object-cover" /> : "我"}
+                <span className="absolute inset-0 grid place-items-center bg-slate-950/45 text-white opacity-0 transition group-hover:opacity-100 group-focus-visible:opacity-100">
+                  <Camera size={16} />
+                </span>
+              </button>
+              <div className="min-w-0">
+                <p className="truncate text-sm font-semibold">{AUTH_REQUIRED ? "雲端財務資料" : "本機財務資料"}</p>
+                <p className="truncate text-xs text-emerald-100/55">{AUTH_REQUIRED ? "已使用密碼保護" : "僅儲存在這台電腦"}</p>
               </div>
             </div>
+            {avatarError && <p role="alert" className="mt-2 text-xs text-amber-200">{avatarError}</p>}
             {AUTH_REQUIRED && (
               <button
                 className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 py-2 text-xs font-medium text-emerald-50/80 hover:bg-white/10"

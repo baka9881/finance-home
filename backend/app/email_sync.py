@@ -678,6 +678,22 @@ def _month_day(reference: date, month_delta: int, day: int) -> date:
     return date(year, month, min(day, monthrange(year, month)[1]))
 
 
+def effective_card_closing_day(rule: EmailCardRule) -> int | None:
+    """Use the payment day as the cycle boundary until a real closing day is known."""
+    return rule.closing_day or rule.payment_due_day
+
+
+def card_cycle_bounds(as_of: date, closing_day: int) -> tuple[date, date]:
+    """Return the inclusive start and end dates for the cycle containing ``as_of``."""
+    cycle_end = _month_day(as_of, 0, closing_day)
+    if as_of > cycle_end:
+        cycle_start = cycle_end + timedelta(days=1)
+        cycle_end = _month_day(as_of, 1, closing_day)
+    else:
+        cycle_start = _month_day(cycle_end, -1, closing_day) + timedelta(days=1)
+    return cycle_start, cycle_end
+
+
 def _due_date_after(statement_date: date, due_day: int) -> date:
     candidate = _month_day(statement_date, 0, due_day)
     return candidate if candidate > statement_date else _month_day(statement_date, 1, due_day)
@@ -709,12 +725,13 @@ def parse_card_email(
         statement_date = (
             _parse_date(statement_match.group(1), message_date)
             if statement_match
-            else message_date
+            else None
         )
+        statement_anchor = statement_date or message_date
         due_date = (
             _parse_date(due_match.group(1), message_date)
             if due_match
-            else _due_date_after(statement_date, int(default_due_day))
+            else _due_date_after(statement_anchor, int(default_due_day))
         )
         amount_due = _money(bill_amount_match.group(1))
         if due_date and amount_due and amount_due > 0:
@@ -900,11 +917,12 @@ def gmail_card_balance_value(
     latest_statement = max(statement_dates) if statement_dates else None
     if latest_statement:
         open_cycle_start = latest_statement + timedelta(days=1)
-    elif rule.closing_day:
-        current_close = _month_day(as_of, 0, rule.closing_day)
-        open_cycle_start = _month_day(current_close, -1, rule.closing_day) + timedelta(days=1)
     else:
-        open_cycle_start = as_of.replace(day=1)
+        closing_day = effective_card_closing_day(rule)
+        if closing_day:
+            open_cycle_start, _ = card_cycle_bounds(as_of, closing_day)
+        else:
+            open_cycle_start = as_of.replace(day=1)
     rows = db.scalars(
         select(Transaction).where(
             Transaction.account_id == rule.card_account_id,
@@ -964,7 +982,7 @@ def rebuild_card_billing_periods(db: Session, rule: EmailCardRule) -> None:
         if not period_end:
             continue
         expected_previous = _month_day(
-            period_end, -1, rule.closing_day or period_end.day
+            period_end, -1, effective_card_closing_day(rule) or period_end.day
         )
         if previous_end and 20 <= (period_end - previous_end).days <= 40:
             period_start = previous_end + timedelta(days=1)
@@ -1393,7 +1411,7 @@ def serialize_email_rule(rule: EmailCardRule) -> dict[str, Any]:
         "subject_pattern": rule.subject_pattern,
         "card_last4": rule.card_last4,
         "lookback_days": rule.lookback_days,
-        "closing_day": rule.closing_day,
+        "closing_day": rule.closing_day or rule.payment_due_day,
         "payment_due_day": rule.payment_due_day,
         "auto_pay": rule.auto_pay,
         "active": rule.active,
@@ -1441,18 +1459,16 @@ def serialize_card_cycle(
     last_paid = next((item for item in bills if item.status == "paid"), None)
     statement_dates = [item.statement_date for item in bills if item.statement_date]
     latest_statement = max(statement_dates) if statement_dates else None
+    closing_day = effective_card_closing_day(rule)
     if latest_statement:
         open_start = latest_statement + timedelta(days=1)
-    elif rule.closing_day:
-        current_close = _month_day(as_of, 0, rule.closing_day)
-        open_start = _month_day(current_close, -1, rule.closing_day) + timedelta(days=1)
+        open_end = _month_day(open_start, 0, closing_day) if closing_day else None
+        if open_end and open_end < open_start:
+            open_end = _month_day(open_start, 1, closing_day)
+    elif closing_day:
+        open_start, open_end = card_cycle_bounds(as_of, closing_day)
     else:
         open_start = as_of.replace(day=1)
-    if rule.closing_day:
-        open_end = _month_day(open_start, 0, rule.closing_day)
-        if open_end < open_start:
-            open_end = _month_day(open_start, 1, rule.closing_day)
-    else:
         open_end = None
     activity_end = min(as_of, open_end) if open_end else as_of
     open_rows = db.scalars(
@@ -1480,11 +1496,8 @@ def serialize_card_cycle(
         "transaction_count": 0,
     }
     current_cycle = None
-    if rule.closing_day:
-        cycle_end = _month_day(as_of, 0, rule.closing_day)
-        if as_of > cycle_end:
-            cycle_end = _month_day(as_of, 1, rule.closing_day)
-        cycle_start = _month_day(cycle_end, -1, rule.closing_day) + timedelta(days=1)
+    if closing_day:
+        cycle_start, cycle_end = card_cycle_bounds(as_of, closing_day)
         cycle_rows = db.scalars(select(Transaction).where(
             Transaction.account_id == rule.card_account_id,
             Transaction.transaction_date >= cycle_start,
@@ -1504,7 +1517,7 @@ def serialize_card_cycle(
         "card_account_id": rule.card_account_id,
         "card_account_name": rule.card_account.name,
         "currency": rule.card_account.currency,
-        "closing_day": rule.closing_day,
+        "closing_day": closing_day,
         "payment_due_day": rule.payment_due_day,
         "current_cycle": current_cycle,
         "unbilled": empty_cycle if current_bill else open_cycle,

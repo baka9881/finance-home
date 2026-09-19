@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Position } from "../types";
-import { investmentTotals } from "./InvestmentsPage";
+import { exchangeSyncWarnings, investmentTotals } from "./InvestmentsPage";
 
 function position(overrides: Partial<Position>): Position {
   return {
@@ -53,5 +53,20 @@ describe("investmentTotals", () => {
     ]);
 
     expect(totals).toEqual({ value: 3_840, cost: 3_200, profit: 3_840, futures: 1 });
+  });
+});
+
+describe("exchangeSyncWarnings", () => {
+  it("surfaces nested Binance warnings on the investments refresh", () => {
+    expect(exchangeSyncWarnings({
+      connected: 1,
+      updated: 1,
+      skipped: 0,
+      errors: [],
+      results: [
+        { warnings: ["暫時無法讀取合約錢包持倉"] },
+        { warnings: ["合約 API 權限不足"] },
+      ],
+    })).toEqual(["暫時無法讀取合約錢包持倉", "合約 API 權限不足"]);
   });
 });

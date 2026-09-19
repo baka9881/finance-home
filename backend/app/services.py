@@ -2193,7 +2193,7 @@ def _binance_signed_query(
 
 
 def _binance_wallet_total(payload: Any) -> Decimal | None:
-    if not isinstance(payload, list):
+    if not isinstance(payload, list) or not payload:
         return None
     active_wallets = [
         decimal_value(item.get("balance"))
@@ -2201,6 +2201,63 @@ def _binance_wallet_total(payload: Any) -> Decimal | None:
         if isinstance(item, dict) and item.get("activate") is not False
     ]
     return sum(active_wallets, ZERO) if active_wallets else ZERO
+
+
+def _binance_wallet_asset_balances(payload: Any) -> list[dict[str, Any]] | None:
+    """Aggregate per-asset balances across every active Binance wallet.
+
+    The wallet balance endpoint only includes ``assetBalances`` when
+    ``needBalanceDetail=true`` is accepted.  ``None`` therefore means the
+    response is not authoritative enough to remove an existing holding.
+    """
+    if not isinstance(payload, list):
+        return None
+
+    totals: dict[str, dict[str, Any]] = {}
+    saw_balance_details = False
+    for wallet in payload:
+        if not isinstance(wallet, dict) or wallet.get("activate") is False:
+            continue
+        rows = wallet.get("assetBalances")
+        if not isinstance(rows, list):
+            return None
+        saw_balance_details = True
+        wallet_name = str(wallet.get("walletName") or "").strip()
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            asset = str(item.get("asset") or "").upper()
+            if not asset:
+                continue
+            quantity = sum(
+                (
+                    decimal_value(item.get("free")),
+                    decimal_value(item.get("locked")),
+                    decimal_value(item.get("freeze")),
+                    decimal_value(item.get("withdrawing")),
+                ),
+                ZERO,
+            )
+            if quantity <= 0:
+                continue
+            row = totals.setdefault(
+                asset,
+                {
+                    "asset": asset,
+                    "free": ZERO,
+                    "locked": ZERO,
+                    "freeze": ZERO,
+                    "withdrawing": ZERO,
+                    "_wallet_names": [],
+                },
+            )
+            row["free"] += quantity
+            if wallet_name and wallet_name not in row["_wallet_names"]:
+                row["_wallet_names"].append(wallet_name)
+
+    if not saw_balance_details:
+        return None
+    return list(totals.values())
 
 
 def _binance_spot_average_cost(
@@ -2263,6 +2320,7 @@ def _fetch_binance_spot_snapshot(
     dict[str, str],
     list[dict[str, Any]],
     list[dict[str, Any]] | None,
+    list[dict[str, Any]] | None,
     list[str],
 ]:
     api_key = _clean_binance_credential(api_key)
@@ -2291,18 +2349,25 @@ def _fetch_binance_spot_snapshot(
         account_payload = _binance_response_payload(account_response)
 
         wallet_total_usdt: Decimal | None = None
+        wallet_asset_balances: list[dict[str, Any]] | None = None
         wallet_warnings: list[str] = []
         try:
             wallet_query = _binance_signed_query(
                 api_secret,
                 timestamp,
                 ("quoteAsset", "USDT"),
+                ("needBalanceDetail", "true"),
             )
             wallet_response = client.get(
                 f"https://api.binance.com/sapi/v1/asset/wallet/balance?{wallet_query}",
             )
             wallet_payload = _binance_response_payload(wallet_response)
             wallet_total_usdt = _binance_wallet_total(wallet_payload)
+            wallet_asset_balances = _binance_wallet_asset_balances(wallet_payload)
+            if wallet_asset_balances is None:
+                wallet_warnings.append(
+                    "暫時無法讀取所有錢包的資產明細，已保留上次的合約錢包持倉"
+                )
         except (ValueError, httpx.HTTPError):
             wallet_warnings.append(
                 "暫時無法讀取資金與合約等錢包總額，本次先以現貨資產估算"
@@ -2543,6 +2608,21 @@ def _fetch_binance_spot_snapshot(
                     f"暫時無法讀取 {asset} 的現貨成交紀錄，成本維持原值"
                 )
 
+        if wallet_asset_balances is not None:
+            spot_by_asset = {
+                str(item.get("asset") or "").upper(): item
+                for item in account_payload.get("balances", [])
+                if isinstance(item, dict) and item.get("asset")
+            }
+            for item in wallet_asset_balances:
+                spot_item = spot_by_asset.get(str(item.get("asset") or "").upper())
+                if not spot_item:
+                    continue
+                if spot_item.get("_average_cost"):
+                    item["_average_cost"] = spot_item["_average_cost"]
+                if spot_item.get("_cost_status"):
+                    item["_cost_status"] = spot_item["_cost_status"]
+
     balances = account_payload.get("balances", []) if isinstance(account_payload, dict) else []
     prices = {
         str(item.get("symbol")): decimal_value(item.get("price"))
@@ -2557,6 +2637,7 @@ def _fetch_binance_spot_snapshot(
         equity_asset_map,
         equity_trades,
         um_positions,
+        wallet_asset_balances,
         wallet_warnings,
     )
 
@@ -2645,6 +2726,7 @@ def sync_binance_account(
             equity_asset_map,
             equity_trades,
             um_positions,
+            wallet_asset_balances,
             wallet_warnings,
         ) = _fetch_binance_spot_snapshot(
             api_key,
@@ -2672,7 +2754,10 @@ def sync_binance_account(
     cash_usd = ZERO
     positions_twd = ZERO
     seen_position_ids: set[int] = set()
-    for item in balances:
+    balances_to_sync = (
+        wallet_asset_balances if wallet_asset_balances is not None else balances
+    )
+    for item in balances_to_sync:
         asset = str(item.get("asset") or "").upper()
         quantity = decimal_value(item.get("free")) + decimal_value(item.get("locked"))
         if not asset or quantity <= 0:
@@ -2681,17 +2766,14 @@ def sync_binance_account(
             cash_usd += quantity
             continue
 
+        if asset in equity_asset_map:
+            continue
+
         pair = f"{asset}USDT"
         price = prices.get(pair)
         if not price:
             warnings.append(f"{asset} 暫時沒有 USDT 報價，未列入總值")
             continue
-        position_value_twd = quantity * price * usd_rate
-        if position_value_twd < BINANCE_MIN_POSITION_VALUE_TWD:
-            continue
-        positions_twd += position_value_twd
-        synced_average_cost = decimal_value(item.get("_average_cost"))
-        synced_cost_status = str(item.get("_cost_status") or "estimated")
         symbol = BINANCE_ASSET_SYMBOLS.get(asset, f"binance-{asset.lower()}")
         position = db.scalar(
             select(Position).where(
@@ -2700,6 +2782,17 @@ def sync_binance_account(
                 Position.symbol == symbol,
             )
         )
+        if wallet_asset_balances is None and position:
+            # Spot is only one slice of the account. If the all-wallet detail
+            # request failed, a lower Spot quantity cannot prove that coins
+            # held in Futures/Portfolio Margin disappeared.
+            quantity = max(quantity, decimal_value(position.quantity))
+        position_value_twd = quantity * price * usd_rate
+        if position_value_twd < BINANCE_MIN_POSITION_VALUE_TWD:
+            continue
+        positions_twd += position_value_twd
+        synced_average_cost = decimal_value(item.get("_average_cost"))
+        synced_cost_status = str(item.get("_cost_status") or "estimated")
         if not position:
             position = Position(
                 account_id=account.id,
@@ -2993,6 +3086,10 @@ def sync_binance_account(
         if not position or position.account_id != account.id:
             continue
         if position.market == BINANCE_FUTURES_MARKET and um_positions is None:
+            position.archived = False
+            seen_position_ids.add(position.id)
+            continue
+        if position.market == "CRYPTO" and wallet_asset_balances is None:
             position.archived = False
             seen_position_ids.add(position.id)
             continue

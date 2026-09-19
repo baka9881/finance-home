@@ -171,6 +171,7 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
         {"asset": "DUST", "free": "1", "locked": "0"},
     ]
     wallet = {"total_usdt": services_module.Decimal("30500")}
+    wallet_balances = [dict(item) for item in balances]
     cost_detail_requests: list[bool] = []
 
     def fake_binance_snapshot(_key, _secret, *, include_cost_details=True):
@@ -186,6 +187,7 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
             {},
             [],
             [],
+            wallet_balances,
             [],
         )
 
@@ -223,6 +225,8 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
 
     balances.clear()
     balances.append({"asset": "USDT", "free": "125", "locked": "0"})
+    wallet_balances.clear()
+    wallet_balances.append({"asset": "USDT", "free": "125", "locked": "0"})
     wallet["total_usdt"] = services_module.Decimal("125")
     refreshed = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
     assert refreshed.status_code == 200, refreshed.text
@@ -236,6 +240,143 @@ def test_binance_spot_sync_updates_holdings_without_double_counting(
     assert account["investments_twd"] == 3200
     assert account["auto_balance_base_twd"] is None
     assert account["valuation_mode"] == "manual_total"
+
+
+def test_binance_all_wallet_details_keep_bitcoin_visible_after_futures_transfer(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
+    client.post(
+        "/api/fx/manual",
+        json={
+            "currency": "USD",
+            "rate_date": date.today().isoformat(),
+            "rate_to_twd": 32,
+        },
+    )
+    account_response = client.post(
+        "/api/accounts",
+        json={
+            "name": "幣安交易所",
+            "institution": "Binance",
+            "account_type": "crypto",
+            "nature": "asset",
+            "currency": "TWD",
+            "is_liquid": True,
+            "opening_balance": 0,
+            "opening_date": date.today().isoformat(),
+        },
+    )
+    account_id = account_response.json()["id"]
+    spot_balances = [
+        {"asset": "BTC", "free": "0.25", "locked": "0"},
+        {"asset": "USDT", "free": "50", "locked": "0"},
+    ]
+    wallet_details: dict[str, list[dict] | None] = {
+        "value": [
+            {"asset": "BTC", "free": services_module.Decimal("0.25"), "locked": 0},
+            {"asset": "USDT", "free": services_module.Decimal("50"), "locked": 0},
+        ]
+    }
+
+    def fake_binance_snapshot(_key, _secret, **_kwargs):
+        return (
+            spot_balances,
+            {"BTCUSDT": services_module.Decimal("60000")},
+            services_module.Decimal("15050"),
+            [],
+            {},
+            [],
+            [],
+            wallet_details["value"],
+            [],
+        )
+
+    monkeypatch.setattr(
+        services_module,
+        "_fetch_binance_spot_snapshot",
+        fake_binance_snapshot,
+    )
+    connected = client.post(
+        "/api/exchanges/binance/connect",
+        json={
+            "account_id": account_id,
+            "api_key": "read-only-key",
+            "api_secret": "read-only-secret",
+        },
+    )
+    assert connected.status_code == 200, connected.text
+    original = client.get("/api/positions").json()[0]
+    assert original["symbol"] == "bitcoin"
+    assert original["quantity"] == 0.25
+    original_cost = original["average_cost"]
+
+    # Moving BTC out of Spot and into the Futures wallet must keep the same
+    # aggregate crypto holding and its existing cost basis. Restore the row too
+    # if an older release already archived it during that transfer.
+    archived = client.post(f"/api/positions/{original['id']}/archive")
+    assert archived.status_code == 200, archived.text
+    spot_balances[:] = [{"asset": "USDT", "free": "50", "locked": "0"}]
+    moved = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert moved.status_code == 200, moved.text
+    bitcoin = client.get("/api/positions").json()[0]
+    assert bitcoin["symbol"] == "bitcoin"
+    assert bitcoin["quantity"] == 0.25
+    assert bitcoin["average_cost"] == original_cost
+
+    # A partial wallet-detail failure cannot be treated as proof that BTC was
+    # sold or withdrawn.
+    wallet_details["value"] = None
+    spot_balances[:] = [
+        {"asset": "BTC", "free": "0.10", "locked": "0"},
+        {"asset": "USDT", "free": "50", "locked": "0"},
+    ]
+    partial = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert partial.status_code == 200, partial.text
+    partial_positions = client.get("/api/positions").json()
+    assert [item["symbol"] for item in partial_positions] == ["bitcoin"]
+    assert partial_positions[0]["quantity"] == 0.25
+
+    # A complete all-wallet response with no BTC is authoritative.
+    spot_balances[:] = [{"asset": "USDT", "free": "50", "locked": "0"}]
+    wallet_details["value"] = [
+        {"asset": "USDT", "free": services_module.Decimal("50"), "locked": 0}
+    ]
+    empty = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert empty.status_code == 200, empty.text
+    assert client.get("/api/positions").json() == []
+
+
+def test_binance_wallet_asset_balances_aggregate_wallets():
+    result = services_module._binance_wallet_asset_balances(
+        [
+            {
+                "activate": True,
+                "walletName": "Spot",
+                "assetBalances": [
+                    {"asset": "BTC", "free": "0.10", "locked": "0.01"},
+                ],
+            },
+            {
+                "activate": True,
+                "walletName": "USD-M Futures",
+                "assetBalances": [
+                    {"asset": "BTC", "free": "0.20", "locked": "0.02"},
+                    {"asset": "USDT", "free": "50", "locked": "0"},
+                ],
+            },
+        ]
+    )
+    assert result is not None
+    by_asset = {item["asset"]: item for item in result}
+    assert by_asset["BTC"]["free"] == services_module.Decimal("0.33")
+    assert by_asset["BTC"]["_wallet_names"] == ["Spot", "USD-M Futures"]
+    assert by_asset["USDT"]["free"] == services_module.Decimal("50")
+    assert services_module._binance_wallet_asset_balances(
+        [{"activate": True, "walletName": "Spot"}]
+    ) is None
+    assert services_module._binance_wallet_asset_balances([]) is None
 
 
 def test_binance_portfolio_margin_updates_tradfi_position(
@@ -300,6 +441,7 @@ def test_binance_portfolio_margin_updates_tradfi_position(
                     "positionSide": "BOTH",
                 }
             ],
+            None,
             [],
         ),
     )
@@ -373,6 +515,7 @@ def test_binance_contract_sync_keeps_crypto_futures_out_of_asset_totals(
             {},
             [],
             contract_positions,
+            None,
             [],
         )
 
@@ -447,7 +590,23 @@ def test_binance_contract_fetch_falls_back_to_regular_usdm_api(
         if path == "/api/v3/account":
             return real_response(200, json={"balances": []}, request=request)
         if path == "/sapi/v1/asset/wallet/balance":
-            return real_response(200, json=[], request=request)
+            assert request.url.params["needBalanceDetail"] == "true"
+            return real_response(
+                200,
+                json=[{
+                    "activate": True,
+                    "balance": "1200",
+                    "walletName": "USD-M Futures",
+                    "assetBalances": [{
+                        "asset": "BTC",
+                        "free": "0.02",
+                        "locked": "0",
+                        "freeze": "0",
+                        "withdrawing": "0",
+                    }],
+                }],
+                request=request,
+            )
         if path == "/sapi/v1/asset/get-funding-asset":
             return real_response(200, json=[], request=request)
         if host == "papi.binance.com" and path == "/papi/v1/um/positionRisk":
@@ -514,6 +673,9 @@ def test_binance_contract_fetch_falls_back_to_regular_usdm_api(
         "contractType": "PERPETUAL",
         "underlyingType": "COIN",
     }]
+    assert snapshot[7] is not None
+    assert snapshot[7][0]["asset"] == "BTC"
+    assert snapshot[7][0]["free"] == services_module.Decimal("0.02")
 
 
 def test_position_cost_can_be_confirmed_with_average_cost_patch(client: TestClient):
@@ -604,6 +766,7 @@ def test_binance_funding_wallet_updates_existing_stock_position(
             {"MSTR": "MSTR"},
             [],
             [],
+            None,
             [],
         ),
     )
@@ -682,6 +845,7 @@ def test_binance_light_sync_preserves_and_repairs_managed_stock_position(
             {"MSTR": "MSTR"},
             [],
             [],
+            None,
             [],
         ),
     )
@@ -786,6 +950,7 @@ def test_binance_stock_trades_apply_only_new_fills_after_baseline(
             {},
             stock_trades,
             [],
+            None,
             [],
         ),
     )

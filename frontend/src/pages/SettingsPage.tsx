@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { api, apiBlob } from "../api";
 import { invalidateFinanceData } from "../appQueries";
+import { COMMON_CURRENCIES } from "../currencies";
 import { taipeiDateInputValue } from "../date";
 import { type AppTheme, getStoredTheme, saveTheme } from "../theme";
 import type { Account, Category } from "../types";
@@ -298,6 +299,16 @@ function utcDate(value?: string) {
 
 export function friendlyExchangeMessage(message?: string) {
   if (!message) return "";
+  if (/幣安限流暫停中|幣安暫時限制同步/.test(message)) return message;
+  if (/所有錢包的資產明細/.test(message)) {
+    return "目前讀不到 Binance 所有錢包的資產明細；已保留上次持倉，請稍後重試。";
+  }
+  if (/無法讀取合約持倉/.test(message)) {
+    return "目前讀不到 Binance 合約持倉；已保留上次資料，請檢查 API 金鑰的合約唯讀權限。";
+  }
+  if (/無法讀取資金與合約等錢包總額/.test(message)) {
+    return "目前讀不到 Binance 錢包總額；本次先沿用可取得的資產資料。";
+  }
   const bannedUntil = message.match(/banned until\s+(\d{10,13})/i)?.[1];
   if (/way too much request|request weight|ip banned/i.test(message)) {
     const timestamp = bannedUntil ? Number(bannedUntil) : 0;
@@ -452,14 +463,20 @@ export default function SettingsPage() {
   });
   const connectBinance = useMutation({
     mutationFn: (payload: { account_id: number; api_key: string; api_secret: string }) =>
-      api("/exchanges/binance/connect", {
+      api<{ warnings?: string[] }>("/exchanges/binance/connect", {
         method: "POST",
         body: JSON.stringify(payload),
       }),
-    onSuccess: () => {
+    onSuccess: (result) => {
       invalidateFinanceData(client, ["binance-connections","accounts","positions","dashboard","automation-status"]);
       setExchangeSettingsOpen(false);
-      setMessage("幣安已連接，交易所餘額與持倉已同步。");
+      const warnings = [...new Set((result.warnings || []).map(friendlyExchangeMessage))];
+      setMessage(
+        warnings.length
+          ? `幣安已連接；${warnings.join("、")}`
+          : "幣安已連接，交易所餘額與持倉已同步。",
+        warnings.length ? "warning" : "success",
+      );
     },
     onError: (error) => showError(friendlySettingsMessage((error as Error).message, "操作尚未完成，輸入內容已保留，請稍後再試。")),
   });
@@ -471,7 +488,9 @@ export default function SettingsPage() {
       ),
     onSuccess: (result) => {
       invalidateFinanceData(client, ["binance-connections","accounts","positions","dashboard"]);
-      const warnings = result.results.flatMap((item) => item.warnings || []).map(friendlyExchangeMessage);
+      const warnings = [...new Set(
+        result.results.flatMap((item) => item.warnings || []).map(friendlyExchangeMessage),
+      )];
       const errors = result.errors.map(friendlyExchangeMessage);
       setMessage(
         errors.length
@@ -1837,7 +1856,7 @@ export default function SettingsPage() {
                   <form className="mt-5 space-y-4" onSubmit={submitManualFx}>
                     <Field label="幣別">
                       <Select name="currency">
-                        {["USD", "JPY", "EUR", "GBP", "CNY", "HKD", "AUD", "CAD", "SGD", "KRW"].map((item) => <option key={item}>{item}</option>)}
+                        {COMMON_CURRENCIES.filter((item) => item !== "TWD").map((item) => <option key={item}>{item}</option>)}
                       </Select>
                     </Field>
                     <Field label="日期">

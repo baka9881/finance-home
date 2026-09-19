@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useMemo, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   Bitcoin,
@@ -15,6 +15,7 @@ import {
 } from "lucide-react";
 import { api } from "../api";
 import { invalidateFinanceData } from "../appQueries";
+import { COMMON_CURRENCIES } from "../currencies";
 import { taipeiDateInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
 import type { Account, Position } from "../types";
@@ -137,6 +138,18 @@ export function investmentTotals(items: Position[]) {
   );
 }
 
+type ExchangeSyncSummary = {
+  connected: number;
+  updated: number;
+  skipped: number;
+  errors: string[];
+  results?: Array<{ warnings?: string[] }>;
+};
+
+export function exchangeSyncWarnings(exchange?: ExchangeSyncSummary) {
+  return [...new Set(exchange?.results?.flatMap((item) => item.warnings || []) || [])];
+}
+
 export default function InvestmentsPage() {
   const client = useQueryClient();
   const [ownerFilter] = useOwnerFilter();
@@ -153,6 +166,7 @@ export default function InvestmentsPage() {
   const [tradeQuantity, setTradeQuantity] = useState("");
   const [tradeTotalAmount, setTradeTotalAmount] = useState("");
   const [refreshMessage, setRefreshMessage] = useState("");
+  const [positionFilter, setPositionFilter] = useState<"all" | "spot" | "futures">("all");
 
   const [adjustingPosition, setAdjustingPosition] = useState<Position | null>(null);
   const [adjustQuantity, setAdjustQuantity] = useState("");
@@ -169,6 +183,19 @@ export default function InvestmentsPage() {
     queryKey: ["accounts", ownerFilter],
     queryFn: () => api<Account[]>(`/accounts?owner=${ownerFilter}`),
   });
+
+  const positionFilterOptions = useMemo(() => {
+    const items = positions.data || [];
+    return [
+      { value: "all" as const, label: "全部", count: items.length },
+      { value: "spot" as const, label: "現貨與股票", count: items.filter((item) => item.instrument_type !== "futures").length },
+      { value: "futures" as const, label: "合約", count: items.filter((item) => item.instrument_type === "futures").length },
+    ];
+  }, [positions.data]);
+  const displayPositions = useMemo(
+    () => (positions.data || []).filter((position) => positionFilter === "all" || (positionFilter === "futures" ? position.instrument_type === "futures" : position.instrument_type !== "futures")),
+    [positionFilter, positions.data],
+  );
 
   const createTrade = useMutation({
     mutationFn: (payload: Record<string, unknown>) =>
@@ -277,15 +304,13 @@ export default function InvestmentsPage() {
         warnings?: string[];
         errors: string[];
       }>("/market/refresh?force=true", { method: "POST" });
-      let exchange: { connected: number; updated: number; skipped: number; errors: string[] } | undefined;
+      let exchange: ExchangeSyncSummary | undefined;
       let exchangeError: string | undefined;
       try {
-        exchange = await api<{
-          connected: number;
-          updated: number;
-          skipped: number;
-          errors: string[];
-        }>("/exchanges/sync?force=true", { method: "POST" });
+        exchange = await api<ExchangeSyncSummary>(
+          "/exchanges/sync?force=true",
+          { method: "POST" },
+        );
       } catch (error) {
         exchangeError = (error as Error).message;
       }
@@ -295,7 +320,8 @@ export default function InvestmentsPage() {
       invalidateFinanceData(client, ["positions","accounts","dashboard","binance-connections"]);
       const warnings = result.warnings || [];
       const exchangeErrors = result.exchange?.errors || [];
-      if (result.updated === 0 && result.errors.length === 0 && warnings.length === 0 && !result.exchange?.updated && !exchangeErrors.length && !result.exchangeError) {
+      const exchangeWarnings = exchangeSyncWarnings(result.exchange);
+      if (result.updated === 0 && result.errors.length === 0 && warnings.length === 0 && !result.exchange?.updated && !exchangeErrors.length && !exchangeWarnings.length && !result.exchangeError) {
         setRefreshMessage("目前行情已是最新，暫時不需要再次呼叫外部服務。");
         return;
       }
@@ -312,7 +338,12 @@ export default function InvestmentsPage() {
       if (result.manual_items?.length) {
         summary.push(`手動價格未更新：${result.manual_items.join("、")}`);
       }
-      if (result.exchange?.updated) summary.push("幣安帳戶與合約持倉已同步");
+      if (result.exchange?.updated && !exchangeWarnings.length && !exchangeErrors.length) {
+        summary.push("幣安帳戶與合約持倉已同步");
+      } else if (result.exchange?.updated) {
+        summary.push("已更新可取得的幣安資料");
+      }
+      if (exchangeWarnings.length) summary.push(`幣安同步提醒：${exchangeWarnings.join("、")}`);
       if (exchangeErrors.length) summary.push(`幣安同步未完成：${exchangeErrors.join("、")}`);
       if (result.exchangeError) summary.push(`幣安同步未完成：${result.exchangeError}`);
       if (warnings.length > 0) summary.push(warnings.join("、"));
@@ -629,8 +660,35 @@ export default function InvestmentsPage() {
           />
         ) : (
           <>
+          <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-100 bg-slate-50/60 px-4 py-3 sm:px-5">
+            <div>
+              <p className="text-sm font-semibold text-slate-700">持倉分類</p>
+              <p className="mt-0.5 text-xs text-slate-400">把現貨與合約分開查看，避免混淆市值與名目價值。</p>
+            </div>
+            <div className="flex flex-wrap gap-1 rounded-xl bg-white p-1 shadow-sm ring-1 ring-slate-200/80" role="tablist" aria-label="持倉類型">
+              {positionFilterOptions.map((option) => (
+                <button
+                  key={option.value}
+                  type="button"
+                  role="tab"
+                  aria-selected={positionFilter === option.value}
+                  className={`rounded-lg px-3 py-1.5 text-xs font-semibold transition ${positionFilter === option.value ? "bg-forest text-white" : "text-slate-500 hover:bg-slate-50 hover:text-slate-700"}`}
+                  onClick={() => setPositionFilter(option.value)}
+                >
+                  {option.label} <span className={positionFilter === option.value ? "text-emerald-100" : "text-slate-400"}>({option.count})</span>
+                </button>
+              ))}
+            </div>
+          </div>
+          {!displayPositions.length ? (
+            <EmptyState
+              icon={<Bitcoin size={26} />}
+              title="這個分類目前沒有持倉"
+              description="切換其他分類，或新增一筆投資紀錄。"
+            />
+          ) : <>
           <div className="divide-y divide-slate-100 md:hidden">
-            {positions.data.map((position) => (
+            {displayPositions.map((position) => (
               <details key={position.id} className="group px-4 py-4">
                 <summary className="cursor-pointer list-none">
                   <div className="flex items-start gap-3">
@@ -741,7 +799,7 @@ export default function InvestmentsPage() {
                 </tr>
               </thead>
               <tbody className="divide-y divide-slate-100">
-                {positions.data.map((position) => (
+                {displayPositions.map((position) => (
                   <tr key={position.id} className="hover:bg-slate-50/60">
                     <td className="px-5 py-4">
                       <div className="flex items-center gap-3">
@@ -835,6 +893,7 @@ export default function InvestmentsPage() {
               </tbody>
             </table>
           </div>
+          </>}
           </>
         )}
       </Card>
@@ -1043,7 +1102,7 @@ export default function InvestmentsPage() {
               <Field label="成交總額" hint={tradeSide === "buy" ? "這次總共付多少" : "這次總共拿回多少"}>
                 <div className="flex gap-2">
                   <Select className="w-28 shrink-0" value={selectedCurrency} onChange={(event) => setSelectedCurrency(event.target.value)}>
-                    {["TWD", "USD", "JPY", "EUR"].map((currency) => <option key={currency}>{currency}</option>)}
+                    {COMMON_CURRENCIES.map((currency) => <option key={currency}>{currency}</option>)}
                   </Select>
                   <Input
                     name="total_amount"

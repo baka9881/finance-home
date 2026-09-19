@@ -101,6 +101,20 @@ def test_statement_without_due_date_uses_configured_payment_day() -> None:
     assert parsed["bill"]["due_date"] == date(2026, 8, 23)
 
 
+def test_statement_without_closing_date_keeps_cycle_boundary_unset() -> None:
+    parsed = parse_card_email(
+        """
+        國泰世華信用卡電子帳單
+        本期應繳金額：NT$ 13,797
+        """,
+        date(2026, 8, 24),
+        default_due_day=23,
+    )
+
+    assert parsed["bill"]["statement_date"] is None
+    assert parsed["bill"]["due_date"] == date(2026, 9, 23)
+
+
 def test_parse_cathay_consumption_digest_table() -> None:
     text = _plain_html(
         """
@@ -323,6 +337,7 @@ def test_gmail_card_balance_uses_current_month_without_old_statements() -> None:
         card_account_id=card.id,
         payment_account_id=payment.id,
         sender_pattern="cathaybk.com.tw",
+        closing_day=1,
         auto_pay=True,
         active=True,
     )
@@ -364,6 +379,62 @@ def test_gmail_card_balance_uses_current_month_without_old_statements() -> None:
     latest = get_latest_balance(db, card.id)
     assert decimal_amount(latest) == Decimal("6458")
     assert latest.source == "gmail_billing_cycle"
+    db.close()
+
+
+def test_missing_closing_day_uses_payment_day_for_current_cycle() -> None:
+    db = make_session()
+    payment = Account(name="生活費帳戶", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([payment, card])
+    db.flush()
+    rule = EmailCardRule(
+        name="信用卡",
+        card_account_id=card.id,
+        payment_account_id=payment.id,
+        payment_due_day=23,
+        active=True,
+    )
+    db.add(rule)
+    db.add_all([
+        Transaction(
+            account_id=card.id,
+            transaction_date=date(2026, 8, 23),
+            description="上一期最後一天",
+            amount=Decimal("-100"),
+            currency="TWD",
+            fx_rate=Decimal("1"),
+            base_amount=Decimal("-100"),
+            transaction_kind="expense",
+            fingerprint="cycle-before-boundary",
+            source="gmail",
+        ),
+        Transaction(
+            account_id=card.id,
+            transaction_date=date(2026, 8, 24),
+            description="本期第一天",
+            amount=Decimal("-200"),
+            currency="TWD",
+            fx_rate=Decimal("1"),
+            base_amount=Decimal("-200"),
+            transaction_kind="expense",
+            fingerprint="cycle-after-boundary",
+            source="gmail",
+        ),
+    ])
+    db.commit()
+
+    cycle = serialize_card_cycle(db, rule, date(2026, 9, 19))
+    balance = _refresh_current_gmail_card_balance(db, rule, date(2026, 9, 19))
+
+    assert cycle["closing_day"] == 23
+    assert cycle["current_cycle"] == {
+        "amount": 200.0,
+        "period_start": date(2026, 8, 24),
+        "period_end": date(2026, 9, 23),
+        "transaction_count": 1,
+    }
+    assert balance == Decimal("200")
     db.close()
 
 

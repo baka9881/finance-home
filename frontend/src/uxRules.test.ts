@@ -48,4 +48,9 @@ describe("exchange error messages", () => {
     expect(result).toContain("系統會自動重試");
     expect(result).not.toContain("request weight");
   });
+
+  it("explains an unavailable all-wallet detail response", () => {
+    expect(friendlyExchangeMessage("暫時無法讀取所有錢包的資產明細，已保留上次的合約錢包持倉"))
+      .toContain("已保留上次持倉");
+  });
 });

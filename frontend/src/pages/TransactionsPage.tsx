@@ -17,6 +17,7 @@ import {
   RefreshCw,
   Search,
   Sparkles,
+  SlidersHorizontal,
   Trash2,
   Upload,
 } from "lucide-react";
@@ -24,6 +25,7 @@ import { api } from "../api";
 import TransactionCategory from "../TransactionCategory";
 import TransactionCorrection from "../TransactionCorrection";
 import BatchClassification from "../BatchClassification";
+import { COMMON_CURRENCIES } from "../currencies";
 import { useTransactionScroll } from "../useTransactionScroll";
 import QuickTransactionForm, { clearQuickDraft, rememberTransactionAccount } from "../QuickTransactionForm";
 import { invalidateFinanceData } from "../appQueries";
@@ -172,6 +174,7 @@ export default function TransactionsPage() {
   const [classificationMessage, setClassificationMessage] = useState("");
   const [correcting, setCorrecting] = useState<Transaction | null>(null);
   const [batchMode, setBatchMode] = useState(false);
+  const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
   useEffect(() => { setSelectedIds([]); }, [month, accountFilter, ownerFilter, searchQuery, page, excluded]);
   const toggleSelected = (id: number) => setSelectedIds((ids) => ids.includes(id) ? ids.filter((value) => value !== id) : [...ids, id]);
@@ -266,6 +269,7 @@ export default function TransactionsPage() {
   );
   const unclassifiedCount = excluded ? 0 : transactions.data?.unclassified_count || 0;
   const transferCount = transactions.data?.transfer_count || 0;
+  const activeAdvancedFilterCount = Number(Boolean(onlyUnclassified)) + Number(Boolean(showTransfers)) + Number(Boolean(excluded));
 
   const createTransaction = useMutation({
     mutationFn: (payload: Record<string, unknown>) =>
@@ -552,7 +556,7 @@ export default function TransactionsPage() {
       )}
 
       <Card className="mb-5 p-4">
-        <div className="grid min-w-0 gap-3 sm:grid-cols-3">
+        <div className="grid min-w-0 gap-3 sm:grid-cols-3 lg:grid-cols-[minmax(0,1.4fr)_minmax(0,1fr)_minmax(0,1fr)_auto]">
           <div className="relative min-w-0">
             <Search className="absolute left-3 top-3.5 text-slate-400" size={16} />
             <Input
@@ -575,14 +579,23 @@ export default function TransactionsPage() {
               </option>
             ))}
           </Select>
+          <Button
+            variant={advancedFiltersOpen || activeAdvancedFilterCount ? "secondary" : "ghost"}
+            className="justify-center whitespace-nowrap"
+            onClick={() => setAdvancedFiltersOpen((value) => !value)}
+            aria-expanded={advancedFiltersOpen}
+          >
+            <SlidersHorizontal size={16} />
+            更多篩選{activeAdvancedFilterCount > 0 ? `（${activeAdvancedFilterCount}）` : ""}
+          </Button>
         </div>
-        <div className="mt-3 flex flex-wrap gap-2 text-sm [&>button]:h-8 [&>button]:px-3">
+        {advancedFiltersOpen && <div className="mt-3 flex flex-wrap gap-2 border-t border-slate-100 pt-3 text-sm [&>button]:h-8 [&>button]:px-3">
           <Button variant="ghost" onClick={() => setMonth(currentMonth)}>本月</Button>
           <Button variant="ghost" onClick={() => setMonth("")}>所有月份</Button>
           <Button variant={excluded ? "secondary" : "ghost"} onClick={() => setFilters((value) => ({ ...value, excluded: !excluded, onlyUnclassified: false, page: 1 }))}>{excluded ? "返回一般交易" : "查看已排除"}</Button>
           {(search || accountFilter || onlyUnclassified) && <Button variant="ghost" onClick={() => setFilters((value) => ({ ...value, search: "", account: "", onlyUnclassified: false, page: 1 }))}>清除篩選</Button>}
           {!month && <span className="self-center text-slate-500">目前搜尋所有月份</span>}
-        </div>
+        </div>}
         {(transactions.isFetching || search !== searchQuery) && (
           <div
             className="mt-3 flex items-center gap-2 rounded-xl bg-emerald-50 px-3 py-2 text-sm font-medium text-emerald-700"
@@ -605,6 +618,15 @@ export default function TransactionsPage() {
           )}
         </p>
         <div className="flex flex-wrap gap-2">
+          {!advancedFiltersOpen && unclassifiedCount > 0 && (
+            <Button
+              variant={onlyUnclassified ? "secondary" : "ghost"}
+              onClick={() => setOnlyUnclassified((current) => !current)}
+            >
+              <CircleAlert size={16} /> 待分類 {unclassifiedCount} 筆
+            </Button>
+          )}
+          {advancedFiltersOpen && <>
           {transferCount > 0 && (
             <Button
               variant="ghost"
@@ -640,6 +662,7 @@ export default function TransactionsPage() {
           <Button variant="ghost" disabled={excluded} onClick={() => setTransferOpen(true)}>
             <Link2 size={16} /> 尋找帳戶間轉帳
           </Button>
+          </>}
         </div>
       </div>
 
@@ -965,7 +988,7 @@ export default function TransactionsPage() {
                   </Field>
                   <Field label="幣別">
                     <Select name="currency" defaultValue="TWD">
-                      {["TWD", "USD", "JPY", "EUR", "GBP", "CNY", "HKD"].map((currency) => (
+                      {COMMON_CURRENCIES.map((currency) => (
                         <option key={currency}>{currency}</option>
                       ))}
                     </Select>

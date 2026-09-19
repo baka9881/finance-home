@@ -18,6 +18,7 @@ import {
 import { api } from "../api";
 import CreditCardCycles, { type Cycle } from "../CreditCardCycles";
 import { invalidateFinanceData } from "../appQueries";
+import { COMMON_CURRENCIES } from "../currencies";
 import { daysBetweenDateValues, taipeiDateInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
 import type { Account } from "../types";
@@ -50,7 +51,6 @@ const accountTypes = [
   { value: "other", label: "其他", icon: Wallet },
 ];
 
-const currencies = ["TWD", "USD", "JPY", "EUR", "GBP", "CNY", "HKD", "AUD", "CAD", "SGD", "KRW"];
 const ownerOptions = [
   { value: "all", label: "全部" },
   { value: "me", label: "我" },
@@ -502,7 +502,7 @@ export default function AccountsPage() {
           </Field>
           <div className="grid grid-cols-[minmax(0,1fr)_6rem] gap-3">
             <Field label={nature === "liability" ? "目前負債" : "目前餘額"}><Input name="opening_balance" type="number" inputMode="decimal" step="any" placeholder="選填" /></Field>
-            <Field label="幣別"><Select name="currency" defaultValue="TWD">{currencies.map((currency) => <option key={currency}>{currency}</option>)}</Select></Field>
+            <Field label="幣別"><Select name="currency" defaultValue="TWD">{COMMON_CURRENCIES.map((currency) => <option key={currency}>{currency}</option>)}</Select></Field>
           </div>
           {["brokerage", "crypto"].includes(accountType) && <label className="flex items-start gap-2 text-sm text-slate-600">
             <input name="balance_includes_positions" type="checkbox" className="mt-1 accent-emerald-600" defaultChecked />
