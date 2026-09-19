@@ -379,6 +379,34 @@ def test_binance_wallet_asset_balances_aggregate_wallets():
     assert services_module._binance_wallet_asset_balances([]) is None
 
 
+def test_binance_futures_wallet_balance_overlays_spot_remainder():
+    rows = [
+        {
+            "asset": "BTC",
+            "free": services_module.Decimal("0.00202797"),
+            "locked": services_module.Decimal("0"),
+            "_wallet_names": ["Spot"],
+        }
+    ]
+    merged = services_module._merge_binance_futures_wallet_balances(
+        rows,
+        rows,
+        [
+            {
+                "asset": "BTC",
+                "free": services_module.Decimal("0.012"),
+                "locked": services_module.Decimal("0"),
+                "_wallet_names": ["COIN-M Futures"],
+                "_futures_wallet": True,
+            }
+        ],
+    )
+    assert merged is rows
+    assert merged[0]["free"] == services_module.Decimal("0.012")
+    assert merged[0]["_futures_wallet"] is True
+    assert merged[0]["_spot_quantity"] == services_module.Decimal("0.00202797")
+
+
 def test_binance_portfolio_margin_updates_tradfi_position(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
@@ -627,6 +655,10 @@ def test_binance_contract_fetch_falls_back_to_regular_usdm_api(
                 }],
                 request=request,
             )
+        if host == "fapi.binance.com" and path in {"/fapi/v3/balance", "/fapi/v2/balance"}:
+            return real_response(200, json=[], request=request)
+        if host == "dapi.binance.com" and path == "/dapi/v1/balance":
+            return real_response(200, json=[], request=request)
         if host == "fapi.binance.com" and path == "/fapi/v1/exchangeInfo":
             return real_response(
                 200,

@@ -2260,6 +2260,143 @@ def _binance_wallet_asset_balances(payload: Any) -> list[dict[str, Any]] | None:
     return list(totals.values())
 
 
+def _binance_futures_balance_rows(
+    client: httpx.Client,
+    api_secret: str,
+    server_time_offset: int,
+    *,
+    host: str,
+    path: str,
+    wallet_name: str,
+) -> list[dict[str, Any]] | None:
+    """Read one Binance derivatives wallet balance endpoint.
+
+    The all-wallet SAPI response is not consistently populated for assets
+    transferred into a derivatives wallet.  USDⓈ-M and COIN-M each expose a
+    signed account-balance endpoint, so use those rows as the authoritative
+    balance for an asset held in the corresponding contract wallet.
+    """
+    try:
+        timestamp = int(time.time() * 1000) + server_time_offset
+        query = _binance_signed_query(api_secret, timestamp)
+        response = client.get(f"https://{host}{path}?{query}")
+        payload = _binance_response_payload(response)
+    except (ValueError, httpx.HTTPError):
+        return None
+
+    if isinstance(payload, dict):
+        for key in ("assets", "balances", "data", "rows"):
+            candidate = payload.get(key)
+            if isinstance(candidate, list):
+                payload = candidate
+                break
+    if not isinstance(payload, list):
+        return None
+
+    rows: list[dict[str, Any]] = []
+    for item in payload:
+        if not isinstance(item, dict):
+            continue
+        asset = str(item.get("asset") or "").upper()
+        if not asset:
+            continue
+        # USDⓈ-M returns ``balance``; Portfolio/COIN-M variants may expose
+        # ``walletBalance`` instead.  Do not use available balance because
+        # margin locked in an open position is still part of the holding.
+        quantity = decimal_value(
+            item.get("balance")
+            if item.get("balance") is not None
+            else item.get("walletBalance")
+        )
+        if quantity <= ZERO:
+            continue
+        rows.append(
+            {
+                "asset": asset,
+                "free": quantity,
+                "locked": ZERO,
+                "_wallet_names": [wallet_name],
+                "_futures_wallet": True,
+            }
+        )
+    return rows
+
+
+def _merge_binance_futures_wallet_balances(
+    wallet_asset_balances: list[dict[str, Any]] | None,
+    spot_balances: list[dict[str, Any]],
+    futures_rows: list[dict[str, Any]],
+) -> list[dict[str, Any]] | None:
+    """Overlay derivatives-wallet quantities onto the imported asset rows.
+
+    A derivatives wallet is a separate Binance account balance, not an open
+    contract position.  When a dedicated futures endpoint returns an asset,
+    prefer that quantity over the spot/all-wallet row so a transfer does not
+    leave the app showing only the old spot remainder.
+    """
+    if not futures_rows:
+        return wallet_asset_balances
+
+    if wallet_asset_balances is None:
+        # A failed all-wallet detail call still leaves the Spot account data.
+        # Build a temporary authoritative list so the dedicated futures rows
+        # can be represented alongside it.
+        wallet_asset_balances = []
+        for item in spot_balances:
+            if not isinstance(item, dict):
+                continue
+            asset = str(item.get("asset") or "").upper()
+            quantity = decimal_value(item.get("free")) + decimal_value(item.get("locked"))
+            if not asset or quantity <= ZERO:
+                continue
+            wallet_asset_balances.append(
+                {
+                    "asset": asset,
+                    "free": quantity,
+                    "locked": ZERO,
+                    "_wallet_names": ["Spot"],
+                }
+            )
+
+    by_asset = {
+        str(item.get("asset") or "").upper(): item
+        for item in wallet_asset_balances
+        if isinstance(item, dict) and item.get("asset")
+    }
+    for futures_row in futures_rows:
+        asset = str(futures_row.get("asset") or "").upper()
+        quantity = decimal_value(futures_row.get("free")) + decimal_value(
+            futures_row.get("locked")
+        )
+        if not asset or quantity <= ZERO:
+            continue
+        row = by_asset.get(asset)
+        if row is None:
+            row = {
+                "asset": asset,
+                "free": ZERO,
+                "locked": ZERO,
+                "_wallet_names": [],
+            }
+            wallet_asset_balances.append(row)
+            by_asset[asset] = row
+        # Contract-wallet balances are authoritative for the account the user
+        # selected. Keep the old spot value only as metadata for diagnostics.
+        row["_spot_quantity"] = decimal_value(row.get("free")) + decimal_value(
+            row.get("locked")
+        )
+        if asset in BINANCE_CASH_ASSETS:
+            # Stablecoin cash can legitimately exist in both wallets; retain
+            # both slices for the account total instead of replacing Spot cash.
+            row["free"] = row["_spot_quantity"] + quantity
+        else:
+            row["free"] = quantity
+        row["locked"] = ZERO
+        row["freeze"] = ZERO
+        row["withdrawing"] = ZERO
+        row["_wallet_names"] = list(futures_row.get("_wallet_names") or [])
+        row["_futures_wallet"] = True
+    return wallet_asset_balances
 def _binance_spot_average_cost(
     trades: Any,
     asset: str,
@@ -2554,6 +2691,53 @@ def _fetch_binance_spot_snapshot(
                     "合約代號資料暫時無法更新，已使用持倉代號繼續同步"
                 )
 
+        # The universal wallet endpoint is not reliable for coins transferred
+        # into derivatives accounts. Ask the dedicated USDⓈ-M and COIN-M
+        # balance endpoints on every sync and use their asset quantities for
+        # the imported row when they are available.
+        futures_wallet_rows: list[dict[str, Any]] = []
+        usdm_rows = _binance_futures_balance_rows(
+            client,
+            api_secret,
+            server_time_offset,
+            host="fapi.binance.com",
+            path="/fapi/v3/balance",
+            wallet_name="USDⓈ-M Futures",
+        )
+        if usdm_rows is None:
+            usdm_rows = _binance_futures_balance_rows(
+                client,
+                api_secret,
+                server_time_offset,
+                host="fapi.binance.com",
+                path="/fapi/v2/balance",
+                wallet_name="USDⓈ-M Futures",
+            )
+        if usdm_rows:
+            futures_wallet_rows.extend(usdm_rows)
+
+        coinm_rows = _binance_futures_balance_rows(
+            client,
+            api_secret,
+            server_time_offset,
+            host="dapi.binance.com",
+            path="/dapi/v1/balance",
+            wallet_name="COIN-M Futures",
+        )
+        if coinm_rows:
+            futures_wallet_rows.extend(coinm_rows)
+
+        if futures_wallet_rows:
+            wallet_asset_balances = _merge_binance_futures_wallet_balances(
+                wallet_asset_balances,
+                account_payload.get("balances", []),
+                futures_wallet_rows,
+            )
+        elif wallet_asset_balances is None:
+            wallet_warnings.append(
+                "暫時無法讀取 USDⓈ-M 或 COIN-M 合約錢包餘額，已保留上次同步資料"
+            )
+
         prices_response = client.get("https://data-api.binance.vision/api/v3/ticker/price")
         prices_payload = _binance_response_payload(prices_response)
 
@@ -2760,6 +2944,7 @@ def sync_binance_account(
     for item in balances_to_sync:
         asset = str(item.get("asset") or "").upper()
         quantity = decimal_value(item.get("free")) + decimal_value(item.get("locked"))
+        is_futures_wallet_asset = bool(item.get("_futures_wallet"))
         if not asset or quantity <= 0:
             continue
         if asset in BINANCE_CASH_ASSETS:
@@ -2798,7 +2983,7 @@ def sync_binance_account(
                 account_id=account.id,
                 market="CRYPTO",
                 symbol=symbol,
-                name=asset,
+                name=f"{asset}（合約錢包）" if is_futures_wallet_asset else asset,
                 quantity=quantity,
                 average_cost=synced_average_cost or price,
                 currency="USD",
@@ -2808,7 +2993,10 @@ def sync_binance_account(
             set_position_cost_status(db, position, synced_cost_status)
         else:
             position.quantity = quantity
-            position.name = position.name or asset
+            if is_futures_wallet_asset:
+                position.name = f"{asset}（合約錢包）"
+            else:
+                position.name = position.name or asset
             position.currency = "USD"
             position.manual_price = None
             position.archived = False
