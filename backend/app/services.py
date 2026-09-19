@@ -2281,6 +2281,10 @@ def _binance_futures_balance_rows(
         query = _binance_signed_query(api_secret, timestamp)
         response = client.get(f"https://{host}{path}?{query}")
         payload = _binance_response_payload(response)
+    except BinanceRateLimitError:
+        # A dedicated balance endpoint being rate-limited must not put the
+        # whole account sync into the global backoff path.
+        return []
     except (ValueError, httpx.HTTPError):
         return None
 
