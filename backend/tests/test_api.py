@@ -821,6 +821,107 @@ def test_binance_funding_wallet_updates_existing_stock_position(
     assert positions[0]["price"] == 94.64
 
 
+def test_binance_bstock_alias_archives_legacy_crypto_duplicate(
+    client: TestClient,
+    monkeypatch: pytest.MonkeyPatch,
+):
+    monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
+    client.post(
+        "/api/fx/manual",
+        json={
+            "currency": "USD",
+            "rate_date": date.today().isoformat(),
+            "rate_to_twd": 32,
+        },
+    )
+    account_response = client.post(
+        "/api/accounts",
+        json={
+            "name": "幣安交易所",
+            "institution": "Binance",
+            "account_type": "crypto",
+            "nature": "asset",
+            "currency": "TWD",
+            "is_liquid": True,
+            "opening_balance": 0,
+            "opening_date": date.today().isoformat(),
+        },
+    )
+    account_id = account_response.json()["id"]
+    client.post(
+        "/api/positions",
+        json={
+            "account_id": account_id,
+            "market": "US",
+            "symbol": "MSTR",
+            "name": "微策略",
+            "quantity": 9.3523,
+            "average_cost": 101.72,
+            "currency": "USD",
+            "manual_price": 153.92,
+        },
+    )
+    duplicate_response = client.post(
+        "/api/positions",
+        json={
+            "account_id": account_id,
+            "market": "CRYPTO",
+            "symbol": "binance-mstrb",
+            "name": "MSTRB",
+            "quantity": 9.3523,
+            "average_cost": 154.11,
+            "currency": "USD",
+            "manual_price": 153.92,
+        },
+    )
+    duplicate_id = duplicate_response.json()["id"]
+
+    monkeypatch.setattr(
+        services_module,
+        "_fetch_binance_spot_snapshot",
+        lambda _key, _secret, **_kwargs: (
+            [{"asset": "USDT", "free": "100", "locked": "0"}],
+            {},
+            services_module.Decimal("1661.16"),
+            [
+                {
+                    "asset": "MSTRB",
+                    "free": "9.3523",
+                    "locked": "0",
+                    "freeze": "0",
+                    "withdrawing": "0",
+                }
+            ],
+            {},
+            [],
+            [],
+            [
+                {"asset": "USDT", "free": "100", "locked": "0"},
+                {"asset": "MSTRB", "free": "9.3523", "locked": "0"},
+            ],
+            [],
+        ),
+    )
+
+    connected = client.post(
+        "/api/exchanges/binance/connect",
+        json={
+            "account_id": account_id,
+            "api_key": "read-only-key",
+            "api_secret": "read-only-secret",
+        },
+    )
+    assert connected.status_code == 200, connected.text
+
+    positions = client.get("/api/positions").json()
+    assert [item["symbol"] for item in positions] == ["MSTR"]
+    assert positions[0]["quantity"] == 9.3523
+
+    archived = client.get("/api/positions?include_archived=true").json()
+    archived_duplicate = next(item for item in archived if item["id"] == duplicate_id)
+    assert archived_duplicate["symbol"] == "binance-mstrb"
+
+
 def test_binance_light_sync_preserves_and_repairs_managed_stock_position(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,

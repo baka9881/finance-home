@@ -5,6 +5,7 @@
 
 [build.environment]
   NODE_VERSION = "22"
+  VITE_DEPLOYMENT = "cloud"
   VITE_AUTH_REQUIRED = "true"
 
 [[redirects]]

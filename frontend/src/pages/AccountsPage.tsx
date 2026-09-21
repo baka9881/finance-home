@@ -1,4 +1,4 @@
-import { FormEvent, useEffect, useRef, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
 import {
@@ -59,94 +59,6 @@ const ownerOptions = [
 const accountOwnerOptions = ownerOptions.filter((option) => option.value !== "all");
 const customInstitutionValue = "__custom__";
 const customAccountNameValue = "__custom_account_name__";
-
-function AccountNamePicker({
-  value,
-  options,
-  onChange,
-}: {
-  value: string;
-  options: string[];
-  onChange: (value: string) => void;
-}) {
-  const [open, setOpen] = useState(false);
-  const wrapperRef = useRef<HTMLDivElement>(null);
-  const choices = [
-    { value: "", label: "選擇名稱" },
-    ...options.map((option) => ({ value: option, label: option })),
-    { value: customAccountNameValue, label: "其他 / 自訂" },
-  ];
-  const selected = choices.find((choice) => choice.value === value);
-
-  useEffect(() => {
-    if (!open) return;
-    const closeWhenOutside = (event: MouseEvent) => {
-      if (!wrapperRef.current?.contains(event.target as Node)) setOpen(false);
-    };
-    const closeWithEscape = (event: KeyboardEvent) => {
-      if (event.key === "Escape") setOpen(false);
-    };
-    document.addEventListener("mousedown", closeWhenOutside);
-    document.addEventListener("keydown", closeWithEscape);
-    return () => {
-      document.removeEventListener("mousedown", closeWhenOutside);
-      document.removeEventListener("keydown", closeWithEscape);
-    };
-  }, [open]);
-
-  return (
-    <div ref={wrapperRef} className="relative">
-      <button
-        type="button"
-        className="flex h-11 w-full items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-3 text-left text-sm text-slate-800 outline-none transition hover:border-slate-300 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10"
-        aria-haspopup="listbox"
-        aria-expanded={open}
-        aria-label="帳戶名稱"
-        onClick={() => setOpen((current) => !current)}
-        onKeyDown={(event) => {
-          if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
-            event.preventDefault();
-            setOpen(true);
-          }
-        }}
-      >
-        <span className={!selected?.value ? "text-slate-400" : undefined}>{selected?.label || "選擇名稱"}</span>
-        <ChevronDown size={17} aria-hidden="true" className={`shrink-0 text-slate-500 transition-transform ${open ? "rotate-180" : ""}`} />
-      </button>
-      {open && (
-        <div
-          role="listbox"
-          aria-label="帳戶名稱選項"
-          className="absolute inset-x-0 top-full z-30 mt-2 max-h-64 overflow-auto rounded-2xl border border-slate-200 bg-white p-1.5 shadow-xl shadow-slate-900/10"
-        >
-          {choices.map((choice) => {
-            const isSelected = choice.value === value;
-            return (
-              <button
-                key={choice.value || "empty"}
-                type="button"
-                role="option"
-                aria-selected={isSelected}
-                className={`flex w-full items-center justify-between rounded-xl px-3 py-2.5 text-left text-sm transition ${
-                  isSelected
-                    ? "bg-emerald-50 font-semibold text-emerald-800"
-                    : "text-slate-700 hover:bg-slate-50"
-                }`}
-                onClick={() => {
-                  onChange(choice.value);
-                  setOpen(false);
-                }}
-              >
-                <span>{choice.label}</span>
-                {isSelected && <span aria-hidden="true" className="text-emerald-600">✓</span>}
-              </button>
-            );
-          })}
-        </div>
-      )}
-    </div>
-  );
-}
 
 const institutionPresets: Record<string, string[]> = {
   bank: [
@@ -581,7 +493,11 @@ export default function AccountsPage() {
           </div>
           {institutionChoice === customInstitutionValue && <Field label="自訂金融機構"><Input value={customInstitution} onChange={(event) => changeCustomInstitution(event.target.value)} placeholder="銀行、券商或交易所" /></Field>}
           <Field label="帳戶名稱">
-            <AccountNamePicker value={accountNameSelectValue} options={nameOptions} onChange={changeAccountNameChoice} />
+            <Select value={accountNameSelectValue} onChange={(event) => changeAccountNameChoice(event.target.value)} required>
+              <option value="">選擇名稱</option>
+              {nameOptions.map((name) => <option key={name}>{name}</option>)}
+              <option value={customAccountNameValue}>其他 / 自訂</option>
+            </Select>
             {showCustomAccountName && <Input name="name" value={accountName} onChange={(event) => setAccountName(event.target.value)} placeholder="輸入帳戶名稱" required />}
           </Field>
           <div className="grid grid-cols-[minmax(0,1fr)_6rem] gap-3">
@@ -819,8 +735,10 @@ function AccountGroup({
                   </p>
                 </div>
                 {isCreditCard && <div className="mt-3 space-y-1 text-xs text-slate-500">
-                  {cycle && <p>{cycle.closing_day ? `每月 ${cycle.closing_day} 日結帳 · ` : "結帳日尚未設定 · "}每月 {cycle.payment_due_day} 日繳款</p>}
-                  {cycle?.current_cycle && <p>本帳期匯入消費 {money(cycle.current_cycle.amount, cycle.currency)}<span className="mt-1 block">{cycle.current_cycle.period_start}～{cycle.current_cycle.period_end}</span></p>}
+                  {cycle && <p>{cycle.cycle_boundary_known ? `每月 ${cycle.closing_day} 日結帳 · ` : "結帳日未知（不以繳款日推算） · "}每月 {cycle.payment_due_day} 日繳款</p>}
+                  {cycle?.current_bill && <p>本期正式帳單 {money(cycle.current_bill.amount_due, cycle.currency)} · 繳款日 {cycle.current_bill.due_date}</p>}
+                  {cycle && <p>未出帳消費 {money(cycle.unbilled.amount, cycle.currency)}{!cycle.cycle_boundary_known && <span className="mt-1 block">帳期範圍等待正式帳單確認</span>}</p>}
+                  {cycle?.last_paid_bill && <p>最近已記錄繳款 {money(cycle.last_paid_bill.amount_due, cycle.currency)}</p>}
                   <p>負債依消費與繳款記錄更新，不會在結帳日自動歸零。</p>
                   <a href="#card-cycles" className="inline-block py-1 font-medium text-emerald-700">查看帳單與繳款紀錄 →</a>
                 </div>}

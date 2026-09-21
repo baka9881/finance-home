@@ -8,7 +8,7 @@ import { taipeiDateInputValue } from "./date";
 afterEach(() => { cleanup(); sessionStorage.clear(); localStorage.clear(); });
 it("remembers account and preserves amount on close without submitting", async () => {
   const accounts = [{ id: 1, name: "現金", currency: "TWD" }, { id: 2, name: "生活費", currency: "TWD" }] as Account[];
-  rememberTransactionAccount("me", 2);
+  rememberTransactionAccount("me", "expense", 2);
   const submit = vi.fn();
   const mount = () => render(<QuickTransactionForm accounts={accounts} categories={[]} kind="expense" owner="me" pending={false} onCancel={vi.fn()} onSubmit={submit} />);
   const initial = mount();
@@ -36,6 +36,25 @@ it("submits defaults inside collapsed options without requiring expansion", asyn
   await user.click(screen.getByRole("button", { name: "儲存支出" }));
   expect(payload?.get("transaction_date")).toBe(taipeiDateInputValue());
   expect(payload?.get("category_id")).toBe("");
+  expect(payload?.get("note")).toBe("");
   expect(payload?.get("account_id")).toBe("1");
   expect(payload?.get("amount")).toBe("50");
+});
+
+it("keeps recent accounts separate by owner and transaction type", () => {
+  const accounts = [{ id: 1, name: "現金", currency: "TWD" }, { id: 2, name: "生活費", currency: "TWD" }] as Account[];
+  rememberTransactionAccount("me", "expense", 2);
+  rememberTransactionAccount("me", "income", 1);
+  rememberTransactionAccount("partner", "expense", 1);
+
+  const expense = render(<QuickTransactionForm accounts={accounts} categories={[]} kind="expense" owner="me" pending={false} onCancel={vi.fn()} onSubmit={vi.fn()} />);
+  expect((screen.getByRole("combobox", { name: "付款帳戶" }) as HTMLSelectElement).value).toBe("2");
+  expense.unmount();
+
+  const income = render(<QuickTransactionForm accounts={accounts} categories={[]} kind="income" owner="me" pending={false} onCancel={vi.fn()} onSubmit={vi.fn()} />);
+  expect((screen.getByRole("combobox", { name: "入帳帳戶" }) as HTMLSelectElement).value).toBe("1");
+  income.unmount();
+
+  render(<QuickTransactionForm accounts={accounts} categories={[]} kind="expense" owner="partner" pending={false} onCancel={vi.fn()} onSubmit={vi.fn()} />);
+  expect((screen.getByRole("combobox", { name: "付款帳戶" }) as HTMLSelectElement).value).toBe("1");
 });

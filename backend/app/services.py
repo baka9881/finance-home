@@ -147,6 +147,12 @@ BINANCE_ASSET_SYMBOLS = {
     "LINK": "chainlink",
     "LTC": "litecoin",
 }
+# Binance bStocks use a trailing ``B`` symbol.  They are tokenized equity
+# certificates, not crypto assets; keep this fallback for syncs where the
+# metadata endpoint is unavailable or returns a newer response shape.
+BINANCE_TOKENIZED_EQUITY_ASSET_ALIASES = {
+    "MSTRB": "MSTR",
+}
 BINANCE_CASH_ASSETS = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD"}
 BINANCE_FUTURES_MARKET = "BINANCE_FUTURES"
 BINANCE_MIN_POSITION_VALUE_TWD = Decimal("10")
@@ -2539,8 +2545,19 @@ def _fetch_binance_spot_snapshot(
                 "暫時無法讀取資金帳戶持倉明細，現貨與帳戶總值仍會正常同步"
             )
 
-        equity_asset_map: dict[str, str] = {}
-        if funding_balances:
+        equity_asset_map: dict[str, str] = dict(
+            BINANCE_TOKENIZED_EQUITY_ASSET_ALIASES
+        )
+        wallet_has_possible_tokenized_equity = any(
+            (
+                str(item.get("asset") or "").upper()
+                in BINANCE_TOKENIZED_EQUITY_ASSET_ALIASES
+                or str(item.get("asset") or "").upper().endswith("B")
+            )
+            for item in (wallet_asset_balances or [])
+            if isinstance(item, dict)
+        )
+        if funding_balances or wallet_has_possible_tokenized_equity:
             try:
                 exchange_response = client.get(
                     "https://api.binance.com/sapi/v1/equity/market/exchangeInfo"
@@ -2934,6 +2951,12 @@ def sync_binance_account(
         raise
     except httpx.HTTPError as exc:
         raise ValueError("目前無法連上幣安，請稍後再同步") from exc
+    # Keep the known bStocks fallback even when a mocked/older snapshot does
+    # not include the newer tokenized-equity metadata map.
+    equity_asset_map = {
+        **BINANCE_TOKENIZED_EQUITY_ASSET_ALIASES,
+        **equity_asset_map,
+    }
     usd_rate, usd_estimated = latest_fx_rate(db, "USD")
     if usd_estimated and usd_rate == ONE:
         raise ValueError("尚未設定美元匯率，請先到設定更新匯率")
@@ -3012,6 +3035,30 @@ def sync_binance_account(
         db.flush()
         seen_position_ids.add(position.id)
         _upsert_price(db, "CRYPTO", symbol, date.today(), price, "USD", "Binance")
+
+    # Older syncs could have stored a bStock token as a generic crypto row
+    # (for example ``binance-mstrb``) when Binance's equity metadata was not
+    # available.  Once the wallet details are authoritative, hide that stale
+    # duplicate and keep the corresponding US equity position instead.
+    if wallet_asset_balances is not None and equity_asset_map:
+        tokenized_equity_assets = {
+            asset
+            for asset, underlying in equity_asset_map.items()
+            if asset != underlying
+        }
+        legacy_tokenized_symbols = {
+            f"binance-{asset.lower()}" for asset in tokenized_equity_assets
+        }
+        legacy_tokenized_positions = db.scalars(
+            select(Position).where(
+                Position.account_id == account.id,
+                Position.market == "CRYPTO",
+                Position.symbol.in_(legacy_tokenized_symbols),
+                Position.archived.is_(False),
+            )
+        ).all()
+        for position in legacy_tokenized_positions:
+            position.archived = True
 
     for item in funding_balances:
         asset = str(item.get("asset") or "").upper()

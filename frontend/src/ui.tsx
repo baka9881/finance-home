@@ -1,16 +1,19 @@
 import {
+  Children,
+  Fragment,
   type ChangeEvent,
   useEffect,
   useId,
   useRef,
   useState,
+  isValidElement,
   type ButtonHTMLAttributes,
   type HTMLAttributes,
   type InputHTMLAttributes,
   type ReactNode,
   type SelectHTMLAttributes,
 } from "react";
-import { CalendarDays, ChevronLeft, ChevronRight, X } from "lucide-react";
+import { CalendarDays, ChevronDown, ChevronLeft, ChevronRight, X } from "lucide-react";
 import { createPortal } from "react-dom";
 import { twMerge } from "tailwind-merge";
 import { taipeiDateInputValue, taipeiMonthInputValue } from "./date";
@@ -288,7 +291,7 @@ export function DateInput({
           </button>
           <div className="flex min-w-0 items-center gap-1">
             <input aria-label="跳至年份" type="number" min={1} max={9999} value={viewYear} className="h-9 w-20 rounded-lg border border-slate-200 px-2 text-sm" onChange={(event) => { const next = Number(event.target.value); if (next >= 1 && next <= 9999) setViewYear(next); }} />
-            <select aria-label="跳至月份" value={viewMonth} className="h-9 rounded-lg border border-slate-200 px-2 text-sm" onChange={(event) => setViewMonth(Number(event.target.value))}>{Array.from({ length: 12 }, (_, i) => <option key={i + 1} value={i + 1}>{i + 1}月</option>)}</select>
+            <Select aria-label="跳至月份" value={viewMonth} className="h-9 w-20 rounded-lg px-2 text-sm" onChange={(event) => setViewMonth(Number(event.target.value))}>{Array.from({ length: 12 }, (_, i) => <option key={i + 1} value={i + 1}>{i + 1}月</option>)}</Select>
           </div>
           <button type="button" className={pickerIconButton} aria-label="下一個月" onClick={() => changeMonth(1)}>
             <ChevronRight size={19} />
@@ -442,18 +445,156 @@ export function MonthInput({
 }
 
 export function Select({
+  children,
   className,
+  defaultValue,
+  disabled,
+  onChange,
+  value,
   ...props
 }: SelectHTMLAttributes<HTMLSelectElement>) {
+  const selectRef = useRef<HTMLSelectElement>(null);
+  const buttonRef = useRef<HTMLButtonElement>(null);
+  const [open, setOpen] = useState(false);
+  const options = selectOptions(children);
+  const controlled = value !== undefined;
+  const [internalValue, setInternalValue] = useState(() => String(value ?? defaultValue ?? options[0]?.value ?? ""));
+  const selectedValue = controlled ? String(value ?? "") : internalValue;
+  const selectedOption = options.find((option) => option.value === selectedValue);
+
+  useEffect(() => {
+    if (controlled) setInternalValue(String(value ?? ""));
+  }, [controlled, value]);
+
+  useEffect(() => {
+    if (!open) return;
+    const closeWhenOutside = (event: MouseEvent) => {
+      if (!(event.target instanceof Node) || !buttonRef.current?.parentElement?.contains(event.target)) setOpen(false);
+    };
+    const closeWithEscape = (event: KeyboardEvent) => {
+      if (event.key !== "Escape") return;
+      event.preventDefault();
+      setOpen(false);
+      buttonRef.current?.focus();
+    };
+    document.addEventListener("mousedown", closeWhenOutside);
+    document.addEventListener("keydown", closeWithEscape);
+    return () => {
+      document.removeEventListener("mousedown", closeWhenOutside);
+      document.removeEventListener("keydown", closeWithEscape);
+    };
+  }, [open]);
+
+  const commit = (nextValue: string) => {
+    const nextOption = options.find((option) => option.value === nextValue);
+    if (disabled || nextOption?.disabled) return;
+    if (!controlled) setInternalValue(nextValue);
+    if (selectRef.current) selectRef.current.value = nextValue;
+    if (onChange) {
+      const event = { target: { value: nextValue }, currentTarget: { value: nextValue } } as ChangeEvent<HTMLSelectElement>;
+      onChange(event);
+    }
+    setOpen(false);
+    buttonRef.current?.focus();
+  };
+
   return (
-    <select
-      className={cn(
-        "h-11 min-w-0 w-full max-w-full rounded-xl border border-slate-200 bg-white px-3 text-sm text-slate-800 outline-none focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10",
-        className,
+    <div className={cn("relative min-w-0 w-full max-w-full", className)}>
+      <button
+        ref={buttonRef}
+        type="button"
+        disabled={disabled}
+        aria-haspopup="listbox"
+        aria-expanded={open}
+        aria-label={typeof props["aria-label"] === "string" ? props["aria-label"] : undefined}
+        className={cn(
+          "relative z-10 flex h-11 min-w-0 w-full max-w-full items-center justify-between gap-3 rounded-xl border border-slate-200 bg-white px-3 text-left text-sm text-slate-800 outline-none transition hover:border-slate-300 focus:border-emerald-500 focus:ring-4 focus:ring-emerald-500/10 disabled:cursor-not-allowed disabled:opacity-50",
+          className,
+        )}
+        onClick={() => setOpen((current) => !current)}
+        onKeyDown={(event) => {
+          if (event.key === "Escape" && open) {
+            event.preventDefault();
+            event.stopPropagation();
+            setOpen(false);
+            return;
+          }
+          if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
+            event.preventDefault();
+            setOpen(true);
+          }
+        }}
+      >
+        <span className={cn("min-w-0 flex-1 truncate", !selectedOption && "text-slate-400")}>
+          {selectedOption?.label || "請選擇"}
+        </span>
+        <ChevronDown size={17} aria-hidden="true" className={cn("shrink-0 text-slate-500 transition-transform", open && "rotate-180")} />
+      </button>
+      {open && (
+        <div
+          role="listbox"
+          aria-label={typeof props["aria-label"] === "string" ? props["aria-label"] : "選項"}
+          className="absolute inset-x-0 top-full z-40 mt-2 max-h-64 overflow-auto rounded-2xl border border-slate-200 bg-white p-1.5 shadow-xl shadow-slate-900/10"
+          onKeyDown={(event) => {
+            if (event.key === "Escape") {
+              event.preventDefault();
+              event.stopPropagation();
+              setOpen(false);
+              buttonRef.current?.focus();
+            }
+          }}
+        >
+          {options.map((option) => {
+            const selected = option.value === selectedValue;
+            return (
+              <button
+                key={option.key}
+                type="button"
+                role="option"
+                aria-selected={selected}
+                disabled={option.disabled}
+                className={cn(
+                  "flex w-full items-center justify-between gap-3 rounded-xl px-3 py-2.5 text-left text-sm transition disabled:cursor-not-allowed disabled:opacity-40",
+                  selected ? "bg-emerald-50 font-semibold text-emerald-800" : "text-slate-700 hover:bg-slate-50",
+                )}
+                onClick={() => commit(option.value)}
+              >
+                <span className="min-w-0 truncate">{option.label}</span>
+                {selected && <span aria-hidden="true" className="shrink-0 text-emerald-600">✓</span>}
+              </button>
+            );
+          })}
+        </div>
       )}
-      {...props}
-    />
+      <select
+        ref={selectRef}
+        {...props}
+        value={selectedValue}
+        disabled={disabled}
+        className="pointer-events-none absolute inset-0 h-full w-full opacity-0"
+        tabIndex={-1}
+        onChange={(event) => {
+          setInternalValue(event.currentTarget.value);
+          onChange?.(event);
+        }}
+      >
+        {children}
+      </select>
+    </div>
   );
+}
+
+type SelectOption = { key: string; value: string; label: ReactNode; disabled?: boolean };
+
+function selectOptions(children: ReactNode): SelectOption[] {
+  return Children.toArray(children).flatMap((child, index) => {
+    if (!isValidElement(child)) return [];
+    if (child.type === Fragment) return selectOptions((child.props as { children?: ReactNode }).children);
+    if (child.type !== "option") return [];
+    const option = child.props as { value?: string | number; children?: ReactNode; disabled?: boolean };
+    const optionValue = option.value === undefined ? String(option.children ?? "") : String(option.value);
+    return [{ key: child.key ? String(child.key) : `${optionValue}-${index}`, value: optionValue, label: option.children, disabled: option.disabled }];
+  });
 }
 
 export function Field({

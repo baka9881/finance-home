@@ -29,6 +29,7 @@ from app.email_sync import (
     process_due_card_bills,
     repair_duplicate_card_bills,
     serialize_card_cycle,
+    serialize_email_rule,
     sync_gmail,
 )
 from app import email_sync as email_sync_module
@@ -382,7 +383,7 @@ def test_gmail_card_balance_uses_current_month_without_old_statements() -> None:
     db.close()
 
 
-def test_missing_closing_day_uses_payment_day_for_current_cycle() -> None:
+def test_missing_closing_day_does_not_invent_a_payment_day_cycle() -> None:
     db = make_session()
     payment = Account(name="生活費帳戶", account_type="bank", nature="asset", currency="TWD")
     card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
@@ -427,14 +428,102 @@ def test_missing_closing_day_uses_payment_day_for_current_cycle() -> None:
     cycle = serialize_card_cycle(db, rule, date(2026, 9, 19))
     balance = _refresh_current_gmail_card_balance(db, rule, date(2026, 9, 19))
 
-    assert cycle["closing_day"] == 23
-    assert cycle["current_cycle"] == {
+    assert serialize_email_rule(rule)["closing_day"] is None
+    assert cycle["closing_day"] is None
+    assert cycle["cycle_boundary_known"] is False
+    assert cycle["current_cycle"] is None
+    assert cycle["unbilled"] == {
+        "amount": 300.0,
+        "period_start": None,
+        "period_end": None,
+        "transaction_count": 2,
+    }
+    assert balance == Decimal("300")
+    db.close()
+
+
+def test_unknown_closing_day_uses_formal_bill_plus_confirmed_post_bill_spending() -> None:
+    db = make_session()
+    payment = Account(name="生活費帳戶", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([payment, card])
+    db.flush()
+    rule = EmailCardRule(
+        name="信用卡",
+        card_account_id=card.id,
+        payment_account_id=payment.id,
+        payment_due_day=23,
+        active=True,
+    )
+    db.add(rule)
+    db.flush()
+    db.add(
+        EmailImportRecord(
+            provider="gmail",
+            provider_message_id="statement-without-closing-date",
+            rule_id=rule.id,
+            message_date=datetime(2026, 8, 24, 8, 0),
+            status="processed",
+        )
+    )
+    db.add(
+        CreditCardBill(
+            rule_id=rule.id,
+            card_account_id=card.id,
+            payment_account_id=payment.id,
+            statement_date=None,
+            due_date=date(2026, 9, 23),
+            amount_due=Decimal("1000"),
+            currency="TWD",
+            status="pending",
+            source_message_id="statement-without-closing-date",
+        )
+    )
+    db.add_all(
+        [
+            Transaction(
+                account_id=card.id,
+                transaction_date=date(2026, 8, 23),
+                description="帳單寄達前消費",
+                amount=Decimal("-100"),
+                currency="TWD",
+                fx_rate=Decimal("1"),
+                base_amount=Decimal("-100"),
+                transaction_kind="expense",
+                fingerprint="before-statement-received",
+                source="gmail",
+            ),
+            Transaction(
+                account_id=card.id,
+                transaction_date=date(2026, 8, 25),
+                description="帳單寄達後消費",
+                amount=Decimal("-200"),
+                currency="TWD",
+                fx_rate=Decimal("1"),
+                base_amount=Decimal("-200"),
+                transaction_kind="expense",
+                fingerprint="after-statement-received",
+                source="gmail",
+            ),
+        ]
+    )
+    db.commit()
+
+    cycle = serialize_card_cycle(db, rule, date(2026, 9, 19))
+    balance = _refresh_current_gmail_card_balance(db, rule, date(2026, 9, 19))
+
+    assert balance == Decimal("1200")
+    assert cycle["closing_day"] is None
+    assert cycle["cycle_boundary_known"] is False
+    assert cycle["current_bill"]["amount_due"] == 1000.0
+    assert cycle["current_bill"]["period_start"] is None
+    assert cycle["current_bill"]["period_end"] is None
+    assert cycle["unbilled"] == {
         "amount": 200.0,
-        "period_start": date(2026, 8, 24),
-        "period_end": date(2026, 9, 23),
+        "period_start": date(2026, 8, 25),
+        "period_end": None,
         "transaction_count": 1,
     }
-    assert balance == Decimal("200")
     db.close()
 
 
@@ -1097,7 +1186,7 @@ def test_card_cycle_separates_current_bill_next_cycle_and_paid_history() -> None
     assert balance == Decimal("1200")
     assert cycle["current_bill"]["amount_due"] == 1000.0
     assert cycle["last_paid_bill"]["amount_due"] == 800.0
-    assert cycle["unbilled"]["amount"] == 0.0
+    assert cycle["unbilled"]["amount"] == 200.0
     assert cycle["next_cycle"]["amount"] == 200.0
     assert cycle["current_bill"]["period_start"] == date(2026, 7, 3)
     assert cycle["current_bill"]["period_end"] == date(2026, 8, 2)

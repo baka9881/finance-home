@@ -9,7 +9,7 @@ import secrets
 import threading
 import time
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from pathlib import Path
 from typing import Annotated, Any
@@ -186,6 +186,7 @@ def ensure_schema() -> None:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    validate_runtime_config()
     Base.metadata.create_all(bind=engine)
     ensure_schema()
     with Session(engine) as db:
@@ -206,9 +207,29 @@ async def lifespan(_: FastAPI):
     yield
 
 
+def _env_flag(name: str) -> bool:
+    return os.getenv(name, "").strip().lower() in {"1", "true", "yes", "on"}
+
+
 FINANCE_APP_PASSWORD = os.getenv("FINANCE_APP_PASSWORD", "").strip()
-FINANCE_AUTH_SECRET = os.getenv("FINANCE_AUTH_SECRET", "").strip() or FINANCE_APP_PASSWORD
+FINANCE_AUTH_SECRET_CONFIGURED = os.getenv("FINANCE_AUTH_SECRET", "").strip()
+# A separate signing secret is mandatory for hosted deployments. Keep the
+# password fallback only for backwards-compatible, explicitly local use.
+FINANCE_AUTH_SECRET = FINANCE_AUTH_SECRET_CONFIGURED or FINANCE_APP_PASSWORD
+FINANCE_REQUIRE_AUTH = _env_flag("FINANCE_REQUIRE_AUTH")
+IS_RENDER_DEPLOYMENT = _env_flag("RENDER")
 AUTOMATION_SYNC_PATH = "/api/automation/sync"
+PUBLIC_API_PATHS = frozenset(
+    {
+        "/api/health",
+        "/api/auth/login",
+        "/api/auth/status",
+        AUTOMATION_SYNC_PATH,
+        # OAuth redirects cannot carry the app bearer token. This callback is
+        # protected separately by the short-lived state value stored at setup.
+        "/api/email/gmail/callback",
+    }
+)
 _automation_lock = threading.Lock()
 AUTH_TOKEN_TTL_SECONDS = int(os.getenv("FINANCE_AUTH_TTL_SECONDS", str(30 * 24 * 60 * 60)))
 DEFAULT_ALLOWED_ORIGINS = ["http://localhost:5173", "http://127.0.0.1:5173"]
@@ -217,6 +238,40 @@ configured_origins = [
     for item in os.getenv("FINANCE_ALLOWED_ORIGINS", "").split(",")
     if item.strip()
 ]
+
+
+def auth_required() -> bool:
+    """Return whether financial endpoints must require a signed session."""
+    return FINANCE_REQUIRE_AUTH or IS_RENDER_DEPLOYMENT or bool(FINANCE_APP_PASSWORD)
+
+
+def auth_configuration_errors() -> list[str]:
+    """List missing security settings for a hosted, fail-closed deployment."""
+    if not (FINANCE_REQUIRE_AUTH or IS_RENDER_DEPLOYMENT):
+        return []
+    missing: list[str] = []
+    if not FINANCE_APP_PASSWORD:
+        missing.append("FINANCE_APP_PASSWORD")
+    if not FINANCE_AUTH_SECRET_CONFIGURED:
+        missing.append("FINANCE_AUTH_SECRET")
+    return missing
+
+
+def validate_runtime_config() -> None:
+    missing = auth_configuration_errors()
+    if missing:
+        raise RuntimeError(
+            "Hosted authentication is required, but these environment variables are missing: "
+            + ", ".join(missing)
+        )
+    if AUTH_TOKEN_TTL_SECONDS <= 0:
+        raise RuntimeError("FINANCE_AUTH_TTL_SECONDS must be greater than zero")
+
+
+def data_location() -> str:
+    """Describe where the active database is stored for the client UI."""
+    hosted_database = engine.url.get_backend_name() != "sqlite"
+    return "cloud" if FINANCE_REQUIRE_AUTH or IS_RENDER_DEPLOYMENT or hosted_database else "local"
 
 
 def _encode_part(value: bytes) -> str:
@@ -241,9 +296,9 @@ def create_auth_token() -> str:
     return f"{encoded_payload}.{_encode_part(signature)}"
 
 
-def valid_auth_token(token: str) -> bool:
-    if not FINANCE_APP_PASSWORD or not FINANCE_AUTH_SECRET:
-        return True
+def _valid_auth_payload(token: str) -> dict[str, Any] | None:
+    if not auth_required() or not FINANCE_APP_PASSWORD or not FINANCE_AUTH_SECRET:
+        return None
     try:
         encoded_payload, encoded_signature = token.split(".", 1)
         expected = hmac.new(
@@ -253,9 +308,19 @@ def valid_auth_token(token: str) -> bool:
         ).digest()
         supplied = _decode_part(encoded_signature)
         payload = json.loads(_decode_part(encoded_payload))
-        return secrets.compare_digest(expected, supplied) and int(payload["exp"]) > int(time.time())
-    except (ValueError, KeyError, TypeError, json.JSONDecodeError):
-        return False
+        if not secrets.compare_digest(expected, supplied):
+            return None
+        if int(payload["exp"]) <= int(time.time()):
+            return None
+        return payload
+    except (ValueError, KeyError, TypeError, UnicodeDecodeError, json.JSONDecodeError):
+        return None
+
+
+def valid_auth_token(token: str) -> bool:
+    if not auth_required():
+        return True
+    return _valid_auth_payload(token) is not None
 
 
 app = FastAPI(
@@ -275,19 +340,17 @@ app.add_middleware(
 
 @app.middleware("http")
 async def protect_cloud_api(request: Request, call_next):
-    public_paths = {
-        "/api/health",
-        "/api/auth/login",
-        "/api/auth/status",
-        AUTOMATION_SYNC_PATH,
-        "/api/email/gmail/callback",
-    }
     if (
-        FINANCE_APP_PASSWORD
+        auth_required()
         and request.method != "OPTIONS"
         and request.url.path.startswith("/api/")
-        and request.url.path not in public_paths
+        and request.url.path not in PUBLIC_API_PATHS
     ):
+        if auth_configuration_errors():
+            return JSONResponse(
+                {"detail": "伺服器登入保護尚未完成設定"},
+                status_code=503,
+            )
         authorization = request.headers.get("Authorization", "")
         token = authorization.removeprefix("Bearer ").strip() if authorization.startswith("Bearer ") else ""
         if not valid_auth_token(token):
@@ -498,19 +561,33 @@ def run_automatic_updates() -> None:
 def auth_status(request: Request):
     authorization = request.headers.get("Authorization", "")
     token = authorization.removeprefix("Bearer ").strip() if authorization.startswith("Bearer ") else ""
+    payload = _valid_auth_payload(token) if auth_required() else None
+    expires_at = None
+    if payload:
+        expires_at = datetime.fromtimestamp(int(payload["exp"]), tz=timezone.utc).isoformat()
     return {
-        "required": bool(FINANCE_APP_PASSWORD),
-        "authenticated": not FINANCE_APP_PASSWORD or valid_auth_token(token),
+        "required": auth_required(),
+        "authenticated": not auth_required() or payload is not None,
+        "session_expires_at": expires_at,
+        "data_location": data_location(),
     }
 
 
 @app.post("/api/auth/login")
 def auth_login(payload: AuthLogin):
-    if not FINANCE_APP_PASSWORD:
-        return {"token": "local-mode"}
+    missing = auth_configuration_errors()
+    if missing:
+        raise HTTPException(503, "伺服器登入保護尚未完成設定")
+    if not auth_required():
+        return {"token": "local-mode", "session_expires_at": None}
     if not secrets.compare_digest(payload.password, FINANCE_APP_PASSWORD):
         raise HTTPException(401, "密碼錯誤")
-    return {"token": create_auth_token()}
+    token = create_auth_token()
+    token_payload = _valid_auth_payload(token)
+    expires_at = datetime.fromtimestamp(
+        int(token_payload["exp"]), tz=timezone.utc
+    ).isoformat() if token_payload else None
+    return {"token": token, "session_expires_at": expires_at}
 
 
 @app.get("/api/automation/status")

@@ -75,6 +75,12 @@ FINANCE_AUTOMATION_TOKEN=use-a-long-random-secret
 
 Secrets must be stored in platform environment variables. Never place them in `netlify.toml` or commit them to Git. The Settings page shows whether scheduling is enabled, when it last ran, and whether an error occurred.
 
+## Cloud login protection
+
+Hosted deployments are fail-closed. The Render service sets `FINANCE_REQUIRE_AUTH=true`, so the backend refuses to start unless both `FINANCE_APP_PASSWORD` and a separate, stable `FINANCE_AUTH_SECRET` are configured. All `/api/*` financial endpoints require a valid bearer token; only health checks, login/status, the separately authenticated automation endpoint, and the state-validated Gmail OAuth callback are public. The frontend `/privacy` and `/terms` pages also remain public.
+
+Netlify sets `VITE_DEPLOYMENT=cloud` and rejects the build unless `VITE_AUTH_REQUIRED=true`. Configure `VITE_API_BASE_URL` with the Render service URL in Netlify. The running interface also checks `/api/auth/status` before showing any financial page, reports whether data is local or cloud-hosted, and shows the current session expiry. Local development remains password-free unless `FINANCE_REQUIRE_AUTH=true` or `FINANCE_APP_PASSWORD` is set.
+
 ## Gmail credit-card synchronization
 
 The Settings page can connect to Gmail with read-only permission to process credit-card purchase notifications and electronic statements. Only messages matching the sender, subject, and last four card digits configured by the user are processed. Gmail message IDs and transaction fingerprints prevent duplicates. Original messages and attachments are not stored; PDF passwords and Google refresh tokens are encrypted in the backend.

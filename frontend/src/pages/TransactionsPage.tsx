@@ -27,7 +27,7 @@ import TransactionCorrection from "../TransactionCorrection";
 import BatchClassification from "../BatchClassification";
 import { COMMON_CURRENCIES } from "../currencies";
 import { useTransactionScroll } from "../useTransactionScroll";
-import QuickTransactionForm, { clearQuickDraft, rememberTransactionAccount } from "../QuickTransactionForm";
+import QuickTransactionForm, { clearQuickDraft, readRememberedTransactionAccount, rememberTransactionAccount } from "../QuickTransactionForm";
 import { invalidateFinanceData } from "../appQueries";
 import { readTransactionFilters, saveTransactionFilters, transactionFilterParams, transactionSourceLabel, type TransactionFilters } from "../transactionFilters";
 import { taipeiDateInputValue, taipeiMonthInputValue } from "../date";
@@ -160,6 +160,7 @@ export default function TransactionsPage() {
   const [manualOpen, setManualOpen] = useState(false);
   const [manualScenario, setManualScenario] = useState<ManualScenario | null>(null);
   const [manualKind, setManualKind] = useState("expense");
+  const [loanPaymentAccountId, setLoanPaymentAccountId] = useState("");
   const [loanAccountId, setLoanAccountId] = useState("");
   const [importOpen, setImportOpen] = useState(false);
   const [transferOpen, setTransferOpen] = useState(false);
@@ -176,7 +177,14 @@ export default function TransactionsPage() {
   const [batchMode, setBatchMode] = useState(false);
   const [advancedFiltersOpen, setAdvancedFiltersOpen] = useState(false);
   const [selectedIds, setSelectedIds] = useState<number[]>([]);
+  const listScrollBeforeSave = useRef<number | null>(null);
   useEffect(() => { setSelectedIds([]); }, [month, accountFilter, ownerFilter, searchQuery, page, excluded]);
+  useEffect(() => {
+    setLoanPaymentAccountId("");
+    setLoanAccountId("");
+    setTransferFromAccountId("");
+    setTransferToAccountId("");
+  }, [ownerFilter]);
   const toggleSelected = (id: number) => setSelectedIds((ids) => ids.includes(id) ? ids.filter((value) => value !== id) : [...ids, id]);
 
 
@@ -257,6 +265,29 @@ export default function TransactionsPage() {
     () => (accounts.data || []).filter((account) => account.nature === "liability" && account.account_type === "loan"),
     [accounts.data],
   );
+  useEffect(() => {
+    if (!manualOpen || manualScenario !== "loan_payment") return;
+    if (!loanPaymentAccountId && paymentAccountOptions.length) {
+      const recent = readRememberedTransactionAccount(ownerFilter, "loan_payment:payment");
+      setLoanPaymentAccountId(String(paymentAccountOptions.find((account) => String(account.id) === recent)?.id || paymentAccountOptions[0].id));
+    }
+    if (!loanAccountId && loanAccountOptions.length) {
+      const recent = readRememberedTransactionAccount(ownerFilter, "loan_payment:loan");
+      setLoanAccountId(String(loanAccountOptions.find((account) => String(account.id) === recent)?.id || loanAccountOptions[0].id));
+    }
+  }, [loanAccountId, loanAccountOptions, loanPaymentAccountId, manualOpen, manualScenario, ownerFilter, paymentAccountOptions]);
+  useEffect(() => {
+    if (!accountTransferOpen || !accounts.data?.length) return;
+    const recentFrom = readRememberedTransactionAccount(ownerFilter, "transfer:from");
+    const nextFrom = transferFromAccountId || String(accounts.data.find((account) => String(account.id) === recentFrom)?.id || accounts.data[0].id);
+    if (!transferFromAccountId) setTransferFromAccountId(nextFrom);
+    if (!transferToAccountId) {
+      const recentTo = readRememberedTransactionAccount(ownerFilter, "transfer:to");
+      const target = accounts.data.find((account) => String(account.id) === recentTo && String(account.id) !== nextFrom)
+        || accounts.data.find((account) => String(account.id) !== nextFrom);
+      if (target) setTransferToAccountId(String(target.id));
+    }
+  }, [accountTransferOpen, accounts.data, ownerFilter, transferFromAccountId, transferToAccountId]);
 
   const filteredTransactions = transactions.data?.items || [];
   useTransactionScroll(JSON.stringify([ownerFilter, month, accountFilter, searchQuery, page, onlyUnclassified, showTransfers, excluded]), Boolean(transactions.data));
@@ -271,17 +302,32 @@ export default function TransactionsPage() {
   const transferCount = transactions.data?.transfer_count || 0;
   const activeAdvancedFilterCount = Number(Boolean(onlyUnclassified)) + Number(Boolean(showTransfers)) + Number(Boolean(excluded));
 
+  function captureListScroll() {
+    listScrollBeforeSave.current = window.scrollY;
+  }
+
+  function restoreListScroll() {
+    const top = listScrollBeforeSave.current;
+    listScrollBeforeSave.current = null;
+    if (top === null) return;
+    const restore = () => window.scrollTo({ top, behavior: "instant" });
+    if (typeof window.requestAnimationFrame === "function") window.requestAnimationFrame(restore);
+    else window.setTimeout(restore, 0);
+  }
+
   const createTransaction = useMutation({
     mutationFn: (payload: Record<string, unknown>) =>
       api("/transactions", { method: "POST", body: JSON.stringify(payload) }),
+    onMutate: captureListScroll,
     onSuccess: (_result, payload) => {
-      rememberTransactionAccount(ownerFilter, Number(payload.account_id));
+      rememberTransactionAccount(ownerFilter, String(payload.transaction_kind), Number(payload.account_id));
       clearQuickDraft(ownerFilter, String(payload.transaction_kind));
       invalidateFinanceData(client, ["transactions","accounts","dashboard"]);
       setManualOpen(false);
       setManualScenario(null);
       setManualKind("expense");
       setLoanAccountId("");
+      restoreListScroll();
     },
   });
 
@@ -392,29 +438,39 @@ export default function TransactionsPage() {
   const createAccountTransfer = useMutation({
     mutationFn: (payload: Record<string, unknown>) =>
       api("/account-transfers", { method: "POST", body: JSON.stringify(payload) }),
-    onSuccess: () => {
+    onMutate: captureListScroll,
+    onSuccess: (_result, payload) => {
+      rememberTransactionAccount(ownerFilter, "transfer:from", Number(payload.from_account_id));
+      rememberTransactionAccount(ownerFilter, "transfer:to", Number(payload.to_account_id));
       invalidateFinanceData(client, ["transactions","accounts","dashboard"]);
       setAccountTransferOpen(false);
       setTransferFromAccountId("");
       setTransferToAccountId("");
+      restoreListScroll();
     },
   });
 
   const createLoanPayment = useMutation({
     mutationFn: (payload: Record<string, unknown>) =>
       api("/loan-payments", { method: "POST", body: JSON.stringify(payload) }),
-    onSuccess: () => {
+    onMutate: captureListScroll,
+    onSuccess: (_result, payload) => {
+      rememberTransactionAccount(ownerFilter, "loan_payment:payment", Number(payload.payment_account_id));
+      rememberTransactionAccount(ownerFilter, "loan_payment:loan", Number(payload.loan_account_id));
       invalidateFinanceData(client, ["transactions","accounts","dashboard"]);
       setManualOpen(false);
       setManualKind("expense");
+      setLoanPaymentAccountId("");
       setLoanAccountId("");
       setManualScenario(null);
+      restoreListScroll();
     },
   });
 
   function openManualDialog() {
     setManualScenario("expense");
     setManualKind("expense");
+    setLoanPaymentAccountId("");
     setLoanAccountId("");
     createTransaction.reset();
     createLoanPayment.reset();
@@ -426,6 +482,7 @@ export default function TransactionsPage() {
     setManualOpen(false);
     setManualScenario(null);
     setManualKind("expense");
+    setLoanPaymentAccountId("");
     setLoanAccountId("");
     createTransaction.reset();
     createLoanPayment.reset();
@@ -434,14 +491,22 @@ export default function TransactionsPage() {
 
   function chooseManualScenario(scenario: ManualScenario) {
     if (scenario === "transfer") {
+      if (accountTransferOpen) return;
       closeManualDialog();
 
       setAccountTransferOpen(true);
       return;
     }
 
+    if (accountTransferOpen) {
+      closeAccountTransferDialog();
+      createTransaction.reset();
+      createLoanPayment.reset();
+      setManualOpen(true);
+    }
     setManualScenario(scenario);
     setManualKind(scenario);
+    setLoanPaymentAccountId("");
     setLoanAccountId("");
   }
 
@@ -883,15 +948,12 @@ export default function TransactionsPage() {
             <div className="space-y-3">
               <div className="grid gap-4 sm:grid-cols-2">
                 <Field label={manualKind === "income" ? "入帳帳戶" : "付款帳戶"}>
-                  <Select name="account_id" required>
+                  <Select name="account_id" aria-label="付款帳戶" value={loanPaymentAccountId} onChange={(event) => setLoanPaymentAccountId(event.target.value)} required>
                     <option value="">選擇帳戶</option>
                     {(manualKind === "loan_payment" ? paymentAccountOptions : accounts.data || []).map((account) => (
                       <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
                     ))}
                   </Select>
-                </Field>
-                <Field label="日期">
-                  <DateInput name="transaction_date" defaultValue={taipeiDateInputValue()} required />
                 </Field>
               </div>
             </div>
@@ -924,6 +986,7 @@ export default function TransactionsPage() {
                     <Field label="貸款帳戶">
                       <Select
                         name="loan_account_id"
+                        aria-label="貸款帳戶"
                         value={loanAccountId}
                         onChange={(event) => setLoanAccountId(event.target.value)}
                         required
@@ -1017,6 +1080,15 @@ export default function TransactionsPage() {
               </details>
             )}
 
+            {manualKind === "loan_payment" && (
+              <FormOptions title={`更多選項（${taipeiDateInputValue()}）`}>
+                <Field label="日期">
+                  <DateInput name="transaction_date" defaultValue={taipeiDateInputValue()} required />
+                </Field>
+                <Field label="備註"><Input name="note" maxLength={1000} placeholder="選填" /></Field>
+              </FormOptions>
+            )}
+
             {(createTransaction.isError || createLoanPayment.isError) && (
               <p className="text-sm text-red-600">
                 {((createTransaction.error || createLoanPayment.error) as Error).message}
@@ -1032,8 +1104,11 @@ export default function TransactionsPage() {
         open={accountTransferOpen}
         onClose={closeAccountTransferDialog}
         title="帳戶轉帳"
-        description="從一個帳戶扣款、另一個帳戶入款；系統會標記為轉帳，不列入收入或支出。"
+        description="帳戶間移動資金，不列入收入或支出。"
       >
+        <div className="mb-4 grid grid-cols-4 gap-1 rounded-xl bg-slate-100 p-1" role="group" aria-label="交易類型">
+          {(["expense", "income", "transfer", "loan_payment"] as const).map((kind) => <Button key={kind} variant="ghost" className={`px-1 text-xs ${kind === "transfer" ? "bg-white text-emerald-700 shadow-sm" : ""}`} aria-pressed={kind === "transfer"} disabled={createAccountTransfer.isPending} onClick={() => chooseManualScenario(kind)}>{({ expense: "支出", income: "收入", transfer: "轉帳", loan_payment: "還款" })[kind]}</Button>)}
+        </div>
         <form className="space-y-5" onSubmit={submitAccountTransfer}>
 
           <div className="space-y-3">
@@ -1041,6 +1116,7 @@ export default function TransactionsPage() {
             <Field label="轉出帳戶">
               <Select
                 name="from_account_id"
+                aria-label="轉出帳戶"
                 value={transferFromAccountId}
                 onChange={(event) => setTransferFromAccountId(event.target.value)}
                 required
@@ -1056,6 +1132,7 @@ export default function TransactionsPage() {
             <Field label="轉入帳戶">
               <Select
                 name="to_account_id"
+                aria-label="轉入帳戶"
                 value={transferToAccountId}
                 onChange={(event) => setTransferToAccountId(event.target.value)}
                 required
@@ -1076,10 +1153,7 @@ export default function TransactionsPage() {
 
 
           <div className="space-y-3">
-          <div className="grid gap-4 sm:grid-cols-2">
-            <Field label="轉帳日期">
-              <DateInput name="transfer_date" defaultValue={taipeiDateInputValue()} required />
-            </Field>
+          <div className="grid gap-4">
             <Field label={`轉出金額${transferFromAccount ? `（${transferFromAccount.currency}）` : ""}`}>
               <Input name="amount" type="number" inputMode="decimal" min="0" step="any" placeholder="0" required />
             </Field>
@@ -1097,9 +1171,12 @@ export default function TransactionsPage() {
           </div>
 
 
-          <FormOptions title="用途與備註（選填）">
+          <FormOptions title={`更多選項（${taipeiDateInputValue()}）`}>
+            <Field label="轉帳日期">
+              <DateInput name="transfer_date" defaultValue={taipeiDateInputValue()} required />
+            </Field>
             <Field label="說明"><Input name="description" placeholder="例如：轉到交易所" /></Field>
-            <Field label="備註"><Input name="note" placeholder="選填" /></Field>
+            <Field label="備註"><Input name="note" maxLength={1000} placeholder="選填" /></Field>
           </FormOptions>
           {createAccountTransfer.isError && (
             <p className="text-sm text-red-600">{(createAccountTransfer.error as Error).message}</p>

@@ -201,7 +201,7 @@ interface EmailCardRule {
   subject_pattern?: string;
   card_last4?: string;
   lookback_days: number;
-  closing_day?: number;
+  closing_day?: number | null;
   payment_due_day: number;
   auto_pay: boolean;
   active: boolean;
@@ -283,11 +283,12 @@ interface CreditCardCycle {
   rule_name: string;
   card_account_name: string;
   currency: string;
-  closing_day?: number;
+  closing_day?: number | null;
+  cycle_boundary_known: boolean;
   payment_due_day: number;
   unbilled: CardCycleAmount;
-  current_bill?: CreditCardBill;
-  last_paid_bill?: CreditCardBill;
+  current_bill?: CreditCardBill | null;
+  last_paid_bill?: CreditCardBill | null;
   next_cycle: CardCycleAmount;
 }
 
@@ -1515,6 +1516,7 @@ export default function SettingsPage() {
                   <div className="grid grid-cols-2 gap-3">
                   <Field label="每月結帳日">
                     <Input name="closing_day" type="number" min={1} max={31} defaultValue={editingEmailRule?.closing_day || ""} placeholder="依帳單設定" />
+                    <p className="mt-1 text-xs leading-5 text-slate-400">可留白；系統只從正式帳單確認，不會拿繳款日代替。</p>
                   </Field>
                   <Field label="每月繳款日">
                   <Input
@@ -1567,7 +1569,7 @@ export default function SettingsPage() {
                 </summary>
                 <div className="mt-3 border-t border-slate-100 pt-3 text-xs text-slate-500">
                   {rule.paused_reason && <p className="mb-2 text-amber-700">{rule.paused_reason}。<Link to="/accounts" className="underline">前往帳戶</Link></p>}
-                  <p>{rule.closing_day ? `每月 ${rule.closing_day} 日結帳` : "結帳日會從第一份帳單自動確認"}</p>
+                  <p>{rule.closing_day ? `每月 ${rule.closing_day} 日結帳` : "結帳日未知；不會以繳款日推算，收到正式帳單後再確認"}</p>
                 </div>
                 <div className="mt-3 flex flex-wrap gap-2">
                   <Button variant="secondary" onClick={() => startEditingEmailRule(rule)}>
@@ -1606,17 +1608,22 @@ export default function SettingsPage() {
                   <div className="flex flex-col gap-1 sm:flex-row sm:items-center sm:justify-between">
                     <p className="font-semibold text-slate-800">{cycle.rule_name}</p>
                     <p className="text-xs text-slate-400">
-                      {cycle.closing_day ? `每月 ${cycle.closing_day} 日結帳` : "結帳日待帳單確認"} · 每月 {cycle.payment_due_day || 23} 日繳款
+                      {cycle.cycle_boundary_known ? `每月 ${cycle.closing_day} 日結帳` : "結帳日未知（不以繳款日推算）"} · 每月 {cycle.payment_due_day || 23} 日繳款
                     </p>
                   </div>
-                  <div className="mt-4 grid gap-3 sm:grid-cols-2 xl:grid-cols-4">
+                  <div className="mt-4 grid gap-3 sm:grid-cols-3">
                     <div className="rounded-xl bg-slate-50 p-3">
                       <p className="text-xs text-slate-400">未出帳消費</p>
                       <p className="mt-1 font-semibold text-slate-800">{money(cycle.unbilled.amount)}</p>
-                      <p className="mt-1 text-xs text-slate-400">{cycle.unbilled.transaction_count} 筆</p>
+                      <p className="mt-1 text-xs text-slate-400">
+                        {cycle.unbilled.transaction_count} 筆
+                        {!cycle.cycle_boundary_known && (cycle.current_bill
+                          ? " · 僅統計帳單寄達後可確認的消費"
+                          : " · 尚未取得正式帳期，此金額不是應繳金額")}
+                      </p>
                     </div>
                     <div className="rounded-xl bg-blue-50 p-3">
-                      <p className="text-xs text-blue-500">本期帳單</p>
+                      <p className="text-xs text-blue-500">本期帳單（正式金額）</p>
                       <p className="mt-1 font-semibold text-blue-900">{cycle.current_bill ? money(cycle.current_bill.amount_due) : "尚未出帳"}</p>
                       <p className="mt-1 text-xs text-blue-500">{cycle.current_bill ? `繳款日 ${cycle.current_bill.due_date}` : "等待電子帳單"}</p>
                     </div>
@@ -1624,11 +1631,6 @@ export default function SettingsPage() {
                       <p className="text-xs text-emerald-600">已記錄繳款</p>
                       <p className="mt-1 font-semibold text-emerald-900">{cycle.last_paid_bill ? money(cycle.last_paid_bill.amount_due) : "尚無紀錄"}</p>
                       <p className="mt-1 text-xs text-emerald-600">{cycle.last_paid_bill ? cycle.last_paid_bill.due_date : "—"}</p>
-                    </div>
-                    <div className="rounded-xl bg-violet-50 p-3">
-                      <p className="text-xs text-violet-500">下期消費</p>
-                      <p className="mt-1 font-semibold text-violet-900">{money(cycle.next_cycle.amount)}</p>
-                      <p className="mt-1 text-xs text-violet-500">{cycle.next_cycle.transaction_count} 筆</p>
                     </div>
                   </div>
                 </div>

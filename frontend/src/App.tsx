@@ -18,7 +18,15 @@ import {
 } from "lucide-react";
 import { NavLink, Navigate, Route, Routes, useLocation, useNavigate } from "react-router-dom";
 import { useIsFetching, useQuery, useQueryClient } from "@tanstack/react-query";
-import { api, ApiError, AUTH_REQUIRED, clearAuthToken, getAuthToken, setAuthToken } from "./api";
+import {
+  api,
+  ApiError,
+  CLOUD_AUTH_EXPECTED,
+  clearAuthToken,
+  resolveAuthGate,
+  setAuthToken,
+  type AuthStatus,
+} from "./api";
 import { invalidateFinanceData, prefetchPrimaryData, prefetchSecondaryData, preloadPageModules } from "./appQueries";
 import { ownerFilterOptions, useOwnerFilter } from "./ownerFilter";
 import { Button, cn, Input, Select } from "./ui";
@@ -50,6 +58,19 @@ function readProfileAvatar() {
   } catch {
     return "";
   }
+}
+
+function formatSessionExpiration(value: string | null) {
+  if (!value) return "未提供";
+  const expiration = new Date(value);
+  if (Number.isNaN(expiration.getTime())) return "到期時間無法讀取";
+  return new Intl.DateTimeFormat("zh-TW", {
+    year: "numeric",
+    month: "numeric",
+    day: "numeric",
+    hour: "2-digit",
+    minute: "2-digit",
+  }).format(expiration);
 }
 
 function resizeProfileAvatar(file: File): Promise<string> {
@@ -141,11 +162,13 @@ function MobileQuickActions() {
 function Sidebar({
   compact,
   mobileOpen,
+  session,
   onToggle,
   onMobileClose,
 }: {
   compact: boolean;
   mobileOpen: boolean;
+  session: AuthStatus;
   onToggle: () => void;
   onMobileClose: () => void;
 }) {
@@ -271,12 +294,21 @@ function Sidebar({
                 </span>
               </button>
               <div className="min-w-0">
-                <p className="truncate text-sm font-semibold">{AUTH_REQUIRED ? "雲端財務資料" : "本機財務資料"}</p>
-                <p className="truncate text-xs text-emerald-100/55">{AUTH_REQUIRED ? "已使用密碼保護" : "僅儲存在這台電腦"}</p>
+                <p className="truncate text-sm font-semibold">
+                  {session.data_location === "cloud" ? "雲端財務資料" : "本機財務資料"}
+                </p>
+                <p className="truncate text-xs text-emerald-100/70">
+                  {session.required ? "登入狀態：已登入" : "儲存在這台電腦"}
+                </p>
+                <p className="truncate text-xs text-emerald-100/55" title={formatSessionExpiration(session.session_expires_at)}>
+                  {session.required
+                    ? `工作階段至 ${formatSessionExpiration(session.session_expires_at)}`
+                    : "資料庫位於這台電腦"}
+                </p>
               </div>
             </div>
             {avatarError && <p role="alert" className="mt-2 text-xs text-amber-200">{avatarError}</p>}
-            {AUTH_REQUIRED && (
+            {session.required && (
               <button
                 className="mt-3 flex w-full items-center justify-center gap-2 rounded-xl border border-white/10 py-2 text-xs font-medium text-emerald-50/80 hover:bg-white/10"
                 onClick={clearAuthToken}
@@ -298,7 +330,7 @@ function Sidebar({
   );
 }
 
-function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
+function LoginScreen() {
   const [password, setPassword] = useState("");
   const [error, setError] = useState("");
   const [pending, setPending] = useState(false);
@@ -322,12 +354,11 @@ function LoginScreen({ onSuccess }: { onSuccess: () => void }) {
     setPending(true);
     setError("");
     try {
-      const result = await api<{ token: string }>("/auth/login", {
+      const result = await api<{ token: string; session_expires_at: string | null }>("/auth/login", {
         method: "POST",
         body: JSON.stringify({ password }),
       });
       setAuthToken(result.token);
-      onSuccess();
     } catch (cause) {
       setError(cause instanceof Error ? cause.message : "無法登入");
     } finally {
@@ -409,6 +440,27 @@ function AuthCheckingScreen() {
       <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm text-slate-600 shadow-card">
         <RefreshCw className="animate-spin text-forest" size={18} />
         正在確認登入狀態…
+      </div>
+    </div>
+  );
+}
+
+function AuthUnavailableScreen({ configurationError = false }: { configurationError?: boolean }) {
+  return (
+    <div className="grid min-h-screen place-items-center bg-canvas px-4">
+      <div className="max-w-md rounded-3xl border border-amber-200 bg-white p-7 text-center shadow-card">
+        <LockKeyhole className="mx-auto text-amber-600" size={28} />
+        <h1 className="mt-4 text-xl font-bold text-ink">
+          {configurationError ? "登入保護設定不一致" : "暫時無法確認登入狀態"}
+        </h1>
+        <p className="mt-2 text-sm leading-6 text-slate-500">
+          {configurationError
+            ? "為了保護財務資料，系統已停止顯示內容。請完成雲端前後端的登入設定後再試。"
+            : "目前無法安全確認工作階段，因此暫停顯示財務資料。連線恢復後可重新檢查。"}
+        </p>
+        <Button className="mt-5" onClick={() => window.dispatchEvent(new Event("finance:auth-changed"))}>
+          <RefreshCw size={16} /> 重新檢查
+        </Button>
       </div>
     </div>
   );
@@ -503,7 +555,7 @@ function GlobalQueryProgress() {
   );
 }
 
-function FinanceApp() {
+function FinanceApp({ session }: { session: AuthStatus }) {
   const [compact, setCompact] = useState(false);
   const [mobileOpen, setMobileOpen] = useState(false);
   const [ownerFilter] = useOwnerFilter();
@@ -560,6 +612,7 @@ function FinanceApp() {
       <Sidebar
         compact={compact}
         mobileOpen={mobileOpen}
+        session={session}
         onToggle={() => setCompact((value) => !value)}
         onMobileClose={() => setMobileOpen(false)}
       />
@@ -609,45 +662,43 @@ function FinanceApp() {
 export default function App() {
   const queryClient = useQueryClient();
   const location = useLocation();
-  const [authState, setAuthState] = useState<"checking" | "authenticated" | "anonymous">(
-    !AUTH_REQUIRED ? "authenticated" : getAuthToken() ? "checking" : "anonymous",
-  );
+  const [authState, setAuthState] = useState<
+    "checking" | "authenticated" | "anonymous" | "unavailable" | "configuration-error"
+  >("checking");
+  const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
 
   useEffect(() => {
     let validationSequence = 0;
 
     const syncAuth = () => {
       const sequence = ++validationSequence;
-      if (!AUTH_REQUIRED) {
-        setAuthState("authenticated");
-        return;
-      }
-
-      if (!getAuthToken()) {
-        queryClient.clear();
-        setAuthState("anonymous");
-        return;
-      }
-
       setAuthState("checking");
-      void api<{ authenticated: boolean }>("/auth/status")
+      void api<AuthStatus>("/auth/status")
         .then((result) => {
           if (sequence !== validationSequence) return;
-          if (result.authenticated) {
-            setAuthState("authenticated");
+          setAuthStatus(result);
+          const gate = resolveAuthGate(result, CLOUD_AUTH_EXPECTED);
+          if (gate === "configuration-error") {
+            queryClient.clear();
+            setAuthState("configuration-error");
             return;
           }
-          clearAuthToken();
+          if (gate === "anonymous") {
+            queryClient.clear();
+            setAuthState("anonymous");
+            return;
+          }
+          setAuthState("authenticated");
         })
         .catch((cause) => {
           if (sequence !== validationSequence) return;
           if (cause instanceof ApiError && cause.status === 401) {
             clearAuthToken();
+            queryClient.clear();
+            setAuthState("anonymous");
             return;
           }
-          // A temporary network outage is not the same as an expired login.
-          // Keep the current session so pages can show their normal retry state.
-          setAuthState("authenticated");
+          setAuthState(cause instanceof ApiError && cause.status === 503 ? "configuration-error" : "unavailable");
         });
     };
 
@@ -659,13 +710,29 @@ export default function App() {
     };
   }, [queryClient]);
 
+  useEffect(() => {
+    if (authState !== "authenticated" || !authStatus?.session_expires_at) return;
+    const remaining = new Date(authStatus.session_expires_at).getTime() - Date.now();
+    if (!Number.isFinite(remaining) || remaining <= 0) {
+      clearAuthToken();
+      return;
+    }
+    const timer = window.setTimeout(
+      () => window.dispatchEvent(new Event("finance:auth-changed")),
+      Math.min(remaining + 250, 2_000_000_000),
+    );
+    return () => window.clearTimeout(timer);
+  }, [authState, authStatus?.session_expires_at]);
+
   if (location.pathname === "/privacy" || location.pathname === "/terms") {
     return <PublicInfoPage kind={location.pathname === "/privacy" ? "privacy" : "terms"} />;
   }
 
   if (authState === "checking") return <AuthCheckingScreen />;
+  if (authState === "unavailable") return <AuthUnavailableScreen />;
+  if (authState === "configuration-error") return <AuthUnavailableScreen configurationError />;
   if (authState === "anonymous") {
-    return <LoginScreen onSuccess={() => setAuthState("authenticated")} />;
+    return <LoginScreen />;
   }
-  return <FinanceApp />;
+  return authStatus ? <FinanceApp session={authStatus} /> : <AuthCheckingScreen />;
 }

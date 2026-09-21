@@ -5,25 +5,30 @@ import { currencyOptions } from "./currencies";
 import { taipeiDateInputValue } from "./date";
 import { Button, DateInput, Field, FormOptions, Input, Select } from "./ui";
 
-const recentKey = (owner: string) => `finance.recent-transaction-account.${owner}`;
+const recentKey = (owner: string, kind: string) => `finance.recent-transaction-account.v2.${owner}.${kind}`;
+const legacyRecentKey = (owner: string) => `finance.recent-transaction-account.${owner}`;
 const draftKey = (owner: string, kind: string) => `finance.quick-draft.${owner}.${kind}`;
 export function clearQuickDraft(owner: string, kind: string) {
   try { sessionStorage.removeItem(draftKey(owner, kind)); } catch { /* unavailable */ }
 }
-export function rememberTransactionAccount(owner: string, accountId: number) {
-  try { localStorage.setItem(recentKey(owner), String(accountId)); } catch { /* unavailable storage */ }
+export function readRememberedTransactionAccount(owner: string, kind: string) {
+  try { return localStorage.getItem(recentKey(owner, kind)) || localStorage.getItem(legacyRecentKey(owner)) || ""; }
+  catch { return ""; }
+}
+export function rememberTransactionAccount(owner: string, kind: string, accountId: number) {
+  if (!Number.isFinite(accountId) || accountId <= 0) return;
+  try { localStorage.setItem(recentKey(owner, kind), String(accountId)); } catch { /* unavailable storage */ }
 }
 export default function QuickTransactionForm({ kind, accounts, categories, owner, pending, error, onSubmit, onCancel }: {
   kind: "income" | "expense"; accounts: Account[]; categories: Category[]; owner: string;
   pending: boolean; error?: string; onSubmit: (event: FormEvent<HTMLFormElement>) => void; onCancel: () => void;
 }) {
   const [draft, setDraft] = useState(() => {
-    try { return { amount: "", description: "", transaction_date: taipeiDateInputValue(), category_id: "", ...JSON.parse(sessionStorage.getItem(draftKey(owner, kind)) || "{}") }; }
-    catch { return { amount: "", description: "", transaction_date: taipeiDateInputValue(), category_id: "" }; }
+    try { return { amount: "", description: "", transaction_date: taipeiDateInputValue(), category_id: "", note: "", ...JSON.parse(sessionStorage.getItem(draftKey(owner, kind)) || "{}") }; }
+    catch { return { amount: "", description: "", transaction_date: taipeiDateInputValue(), category_id: "", note: "" }; }
   });
   const [accountId, setAccountId] = useState(() => {
-    let recent: string | null = null;
-    try { recent = localStorage.getItem(recentKey(owner)); } catch { /* unavailable storage */ }
+    const recent = readRememberedTransactionAccount(owner, kind);
     return String(accounts.find((account) => String(account.id) === draft.accountId)?.id || accounts.find((account) => String(account.id) === recent)?.id || accounts[0]?.id || "");
   });
   const account = accounts.find((item) => String(item.id) === accountId);
@@ -42,14 +47,15 @@ export default function QuickTransactionForm({ kind, accounts, categories, owner
       <Select name="account_id" value={accountId} required onChange={(event) => {
         setAccountId(event.target.value);
         setCurrency(accounts.find((item) => String(item.id) === event.target.value)?.currency || "TWD");
-      }}><option value="">選擇帳戶</option>{accounts.map((item) => <option key={item.id} value={item.id}>{item.name}（{item.owner_label}）</option>)}</Select>
+      }} aria-label={kind === "expense" ? "付款帳戶" : "入帳帳戶"}><option value="">選擇帳戶</option>{accounts.map((item) => <option key={item.id} value={item.id}>{item.name}（{item.owner_label}）</option>)}</Select>
     </Field>
     <Field label="摘要"><Input name="description" required maxLength={300} value={draft.description} onChange={(event) => setDraft({ ...draft, description: event.target.value })} placeholder={kind === "expense" ? "例如：早餐、房租" : "例如：薪水、退款"} /></Field>
-    <FormOptions title={`日期與分類（${draft.transaction_date}）`}>
+    <FormOptions title={`更多選項（${draft.transaction_date}）`}>
     <Field label="日期"><DateInput name="transaction_date" value={draft.transaction_date} onChange={(event) => setDraft({ ...draft, transaction_date: event.target.value })} required /></Field>
     <Field label="分類"><Select name="category_id" value={draft.category_id} onChange={(event) => setDraft({ ...draft, category_id: event.target.value })}><option value="">自動分類</option>{categories.filter((category) => category.kind === kind).map((category) => <option key={category.id} value={category.id}>{category.name}</option>)}</Select></Field>
+    <Field label="備註"><Input name="note" maxLength={1000} value={draft.note} onChange={(event) => setDraft({ ...draft, note: event.target.value })} placeholder="選填" /></Field>
     </FormOptions>
-    {(draft.amount || draft.description) && <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500"><span>尚未記帳；關閉後暫存草稿，僅限本次瀏覽。</span><Button variant="ghost" className="h-8 px-2 text-xs" disabled={pending} onClick={() => { setDraft({ amount: "", description: "", transaction_date: taipeiDateInputValue(), category_id: "" }); }}>清空草稿</Button></div>}
+    {(draft.amount || draft.description || draft.note) && <div className="flex flex-wrap items-center gap-2 text-xs text-slate-500"><span>尚未記帳；關閉後暫存草稿，僅限本次瀏覽。</span><Button variant="ghost" className="h-8 px-2 text-xs" disabled={pending} onClick={() => { setDraft({ amount: "", description: "", transaction_date: taipeiDateInputValue(), category_id: "", note: "" }); }}>清空草稿</Button></div>}
     {currency !== "TWD" && <details className="text-sm text-slate-500"><summary className="cursor-pointer">自訂匯率（選填）</summary><Input name="fx_rate" type="number" min="0.00000001" step="any" placeholder="1 單位外幣可換多少 TWD" className="mt-2" /></details>}
     {error && <p role="alert" className="text-sm text-red-700">尚未儲存：{error}</p>}
     <div className="mobile-safe-actions sticky bottom-0 -mx-4 flex justify-end gap-3 border-t border-slate-100 bg-white/95 px-4 py-3 backdrop-blur">

@@ -679,8 +679,8 @@ def _month_day(reference: date, month_delta: int, day: int) -> date:
 
 
 def effective_card_closing_day(rule: EmailCardRule) -> int | None:
-    """Use the payment day as the cycle boundary until a real closing day is known."""
-    return rule.closing_day or rule.payment_due_day
+    """Return only a confirmed closing day; a payment day is not a cycle boundary."""
+    return rule.closing_day
 
 
 def card_cycle_bounds(as_of: date, closing_day: int) -> tuple[date, date]:
@@ -913,31 +913,43 @@ def gmail_card_balance_value(
         ),
         ZERO,
     )
-    statement_dates = [item.statement_date for item in bills if item.statement_date]
-    latest_statement = max(statement_dates) if statement_dates else None
-    if latest_statement:
-        open_cycle_start = latest_statement + timedelta(days=1)
+    latest_bill_anchor = _latest_bill_anchor(db, bills)
+    if latest_bill_anchor:
+        open_cycle_start = latest_bill_anchor + timedelta(days=1)
     else:
         closing_day = effective_card_closing_day(rule)
         if closing_day:
             open_cycle_start, _ = card_cycle_bounds(as_of, closing_day)
         else:
-            open_cycle_start = as_of.replace(day=1)
-    rows = db.scalars(
-        select(Transaction).where(
-            Transaction.account_id == rule.card_account_id,
-            Transaction.transaction_date >= open_cycle_start,
-            Transaction.transaction_date <= as_of,
-            Transaction.source == "gmail",
-        )
-    ).all()
+            open_cycle_start = None
+    transaction_filters = [
+        Transaction.account_id == rule.card_account_id,
+        Transaction.transaction_date <= as_of,
+        Transaction.source == "gmail",
+    ]
+    if open_cycle_start:
+        transaction_filters.append(Transaction.transaction_date >= open_cycle_start)
+    # If a formal bill exists but neither its closing date nor its receipt date is
+    # available, its amount is the only defensible liability.  Counting arbitrary
+    # historical purchases here could charge the same spending twice.
+    rows = (
+        db.scalars(select(Transaction).where(*transaction_filters)).all()
+        if open_cycle_start or not bills
+        else []
+    )
     replaced_id, values = replacement if replacement else (None, {})
     has_history = bool(rows or bills)
     amounts = [decimal_value(item.amount) for item in rows if not item.excluded and item.id != replaced_id]
     if replacement:
         has_history = True
         changed_date = date.fromisoformat(values["transaction_date"])
-        if not values["excluded"] and open_cycle_start <= changed_date <= as_of:
+        change_is_after_bill = open_cycle_start is None or changed_date >= open_cycle_start
+        if (
+            not values["excluded"]
+            and change_is_after_bill
+            and changed_date <= as_of
+            and (open_cycle_start is not None or not bills)
+        ):
             amounts.append(decimal_value(values["amount"]))
     if not has_history:
         return None
@@ -991,6 +1003,26 @@ def rebuild_card_billing_periods(db: Session, rule: EmailCardRule) -> None:
         bill.period_start = period_start
         bill.period_end = period_end
         previous_end = period_end
+
+
+def _bill_anchor_date(db: Session, bill: CreditCardBill) -> date | None:
+    """Find the latest date after which spending is safely outside a formal bill."""
+    if bill.statement_date:
+        return bill.statement_date
+    if not bill.source_message_id:
+        return None
+    received_at = db.scalar(
+        select(EmailImportRecord.message_date).where(
+            EmailImportRecord.provider == "gmail",
+            EmailImportRecord.provider_message_id == bill.source_message_id,
+        )
+    )
+    return received_at.date() if received_at else None
+
+
+def _latest_bill_anchor(db: Session, bills: list[CreditCardBill]) -> date | None:
+    anchors = [anchor for bill in bills if (anchor := _bill_anchor_date(db, bill))]
+    return max(anchors) if anchors else None
 
 
 def repair_duplicate_card_bills(db: Session) -> dict[str, int]:
@@ -1411,7 +1443,7 @@ def serialize_email_rule(rule: EmailCardRule) -> dict[str, Any]:
         "subject_pattern": rule.subject_pattern,
         "card_last4": rule.card_last4,
         "lookback_days": rule.lookback_days,
-        "closing_day": rule.closing_day or rule.payment_due_day,
+        "closing_day": rule.closing_day,
         "payment_due_day": rule.payment_due_day,
         "auto_pay": rule.auto_pay,
         "active": rule.active,
@@ -1457,29 +1489,32 @@ def serialize_card_cycle(
         None,
     )
     last_paid = next((item for item in bills if item.status == "paid"), None)
-    statement_dates = [item.statement_date for item in bills if item.statement_date]
-    latest_statement = max(statement_dates) if statement_dates else None
+    latest_bill_anchor = _latest_bill_anchor(db, bills)
     closing_day = effective_card_closing_day(rule)
-    if latest_statement:
-        open_start = latest_statement + timedelta(days=1)
+    if latest_bill_anchor:
+        open_start = latest_bill_anchor + timedelta(days=1)
         open_end = _month_day(open_start, 0, closing_day) if closing_day else None
         if open_end and open_end < open_start:
             open_end = _month_day(open_start, 1, closing_day)
     elif closing_day:
         open_start, open_end = card_cycle_bounds(as_of, closing_day)
     else:
-        open_start = as_of.replace(day=1)
+        open_start = None
         open_end = None
     activity_end = min(as_of, open_end) if open_end else as_of
-    open_rows = db.scalars(
-        select(Transaction).where(
-            Transaction.account_id == rule.card_account_id,
-            Transaction.transaction_date >= open_start,
-            Transaction.transaction_date <= activity_end,
-            Transaction.source == "gmail",
-            Transaction.excluded.is_(False),
-        )
-    ).all()
+    open_filters = [
+        Transaction.account_id == rule.card_account_id,
+        Transaction.transaction_date <= activity_end,
+        Transaction.source == "gmail",
+        Transaction.excluded.is_(False),
+    ]
+    if open_start:
+        open_filters.append(Transaction.transaction_date >= open_start)
+    open_rows = (
+        db.scalars(select(Transaction).where(*open_filters)).all()
+        if open_start or not bills
+        else []
+    )
     open_amount = max(
         ZERO, -sum((decimal_value(item.amount) for item in open_rows), ZERO)
     )
@@ -1518,9 +1553,10 @@ def serialize_card_cycle(
         "card_account_name": rule.card_account.name,
         "currency": rule.card_account.currency,
         "closing_day": closing_day,
+        "cycle_boundary_known": closing_day is not None,
         "payment_due_day": rule.payment_due_day,
         "current_cycle": current_cycle,
-        "unbilled": empty_cycle if current_bill else open_cycle,
+        "unbilled": open_cycle,
         "current_bill": serialize_card_bill(current_bill) if current_bill else None,
         "last_paid_bill": serialize_card_bill(last_paid) if last_paid else None,
         "next_cycle": open_cycle if current_bill else empty_cycle,
