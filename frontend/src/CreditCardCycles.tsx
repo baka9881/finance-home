@@ -1,6 +1,4 @@
-import { useQuery } from "@tanstack/react-query";
 import { Link } from "react-router-dom";
-import { api } from "./api";
 import { Badge, Button, Card, money } from "./ui";
 
 interface Bill {
@@ -39,13 +37,22 @@ function billStatus(bill: Bill) {
   return <Badge tone="amber">需要確認</Badge>;
 }
 
-export default function CreditCardCycles({ accountIds }: { accountIds: number[] }) {
-  const cycles = useQuery({
-    queryKey: ["credit-card-cycles"],
-    queryFn: () => api<Cycle[]>("/email/card-cycles"),
-    enabled: Boolean(accountIds.length),
-  });
-  const visible = cycles.data?.filter((cycle) => accountIds.includes(cycle.card_account_id)) || [];
+type CreditCardCyclesProps = {
+  accountIds: number[];
+  cycles?: Cycle[];
+  isLoading?: boolean;
+  isError?: boolean;
+  onRetry?: () => void;
+};
+
+export default function CreditCardCycles({
+  accountIds,
+  cycles = [],
+  isLoading = false,
+  isError = false,
+  onRetry,
+}: CreditCardCyclesProps) {
+  const visible = cycles.filter((cycle) => accountIds.includes(cycle.card_account_id));
   if (!accountIds.length) return null;
 
   return (
@@ -59,19 +66,23 @@ export default function CreditCardCycles({ accountIds }: { accountIds: number[] 
       <p className="mt-1 text-xs text-slate-500">
         本期應繳只採正式帳單金額；「已記錄繳款」僅代表財務居已記帳，不代表銀行已完成付款。
       </p>
-      {cycles.isLoading && <p role="status" className="mt-4">正在載入帳期…</p>}
-      {cycles.isError && (
+      {isLoading && <p role="status" className="mt-4">正在載入帳期…</p>}
+      {isError && (
         <div role="alert" className="mt-4 text-sm text-red-700">
           帳期暫時無法更新
-          <Button variant="secondary" onClick={() => cycles.refetch()}>重試</Button>
+          {onRetry && <Button variant="secondary" className="ml-3" onClick={onRetry}>重試</Button>}
         </div>
       )}
-      {!cycles.isPending && !cycles.isError && !visible.length && (
+      {!isLoading && !isError && !visible.length && (
         <p className="mt-4 text-sm text-slate-500">尚未設定信用卡郵件記帳，連接後可在這裡查看帳期。</p>
       )}
       <div className="mt-4 space-y-3">
         {visible.map((cycle) => (
-          <details className="group rounded-2xl border border-slate-200 p-4" key={cycle.rule_id}>
+          <details
+            className="group scroll-mt-24 rounded-2xl border border-slate-200 p-4"
+            id={`card-cycle-${cycle.card_account_id}`}
+            key={cycle.rule_id}
+          >
             <summary className="cursor-pointer text-sm font-semibold">
               <span>{cycle.rule_name}</span>
               <span className="ml-2 font-normal text-slate-500">每月 {cycle.payment_due_day} 日繳款</span>

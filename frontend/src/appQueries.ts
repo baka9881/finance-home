@@ -19,6 +19,11 @@ export function invalidateFinanceData(client: QueryClient, additionalKeys: strin
   return client.invalidateQueries({ predicate: (query) => keys.has(String(query.queryKey[0])) });
 }
 
+export function invalidateFinanceDataSubset(client: QueryClient, keys: string[]) {
+  const allowed = new Set(keys);
+  return client.invalidateQueries({ predicate: (query) => allowed.has(String(query.queryKey[0])) });
+}
+
 export function preloadPageModules() {
   return Promise.allSettled([
     import("./pages/AccountsPage"),

@@ -443,7 +443,7 @@ export default function AnalysisPage() {
             ) : spending.isPending ? (
               <div className="mt-5 h-36 animate-pulse rounded-2xl bg-slate-100" />
             ) : recurringExpenses.length ? (
-              <div className="mt-5 grid min-w-0 gap-3 lg:grid-cols-2">
+              <div className="mt-5 grid min-w-0 gap-3 [grid-template-columns:repeat(auto-fit,minmax(min(100%,36rem),1fr))]">
                 {recurringExpenses.map((item) => (
                   <div
                     key={`${item.source}-${item.id || `${item.account_name}-${item.name}`}`}
@@ -455,17 +455,24 @@ export default function AnalysisPage() {
                           <CalendarDays size={18} />
                         </div>
                         <div className="min-w-0 flex-1">
-                          <div className="flex min-w-0 flex-wrap items-center gap-2">
-                            <p className="w-full min-w-0 break-words font-semibold text-slate-800 [overflow-wrap:anywhere] sm:w-auto">
+                          <div className="flex min-w-0 flex-wrap items-center gap-2 sm:flex-nowrap">
+                            <p
+                              className="w-full min-w-0 break-words font-semibold text-slate-800 [overflow-wrap:anywhere] sm:w-auto sm:flex-1 sm:truncate"
+                              title={item.name}
+                            >
                               {item.name}
                             </p>
-                            <Badge>{item.category_name}</Badge>
-                            <Badge tone={item.source === "custom" ? "blue" : "slate"}>
-                              {item.confirmed ? "已確認固定花費" : item.source === "custom" ? "自行設定" : "待確認"}
-                            </Badge>
-                            <Badge tone={item.status === "recorded" ? "green" : "amber"}>
-                              {item.status === "recorded" ? "當月已發生" : "當月尚未出現"}
-                            </Badge>
+                            <span className="shrink-0 whitespace-nowrap"><Badge>{item.category_name}</Badge></span>
+                            <span className="shrink-0 whitespace-nowrap">
+                              <Badge tone={item.source === "custom" ? "blue" : "slate"}>
+                                {item.confirmed ? "已確認" : item.source === "custom" ? "自行新增" : "待確認"}
+                              </Badge>
+                            </span>
+                            <span className="shrink-0 whitespace-nowrap">
+                              <Badge tone={item.status === "recorded" ? "green" : "amber"}>
+                                {item.status === "recorded" ? "本月已發生" : "本月未出現"}
+                              </Badge>
+                            </span>
                           </div>
                           <p className="mt-1 break-words text-xs text-slate-400 [overflow-wrap:anywhere]">
                             {item.account_name}

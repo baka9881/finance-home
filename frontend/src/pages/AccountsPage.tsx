@@ -2,6 +2,7 @@ import { FormEvent, useEffect, useState } from "react";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Link, useSearchParams } from "react-router-dom";
 import {
+  Archive,
   Banknote,
   Bitcoin,
   Building2,
@@ -11,13 +12,12 @@ import {
   Plus,
   RefreshCw,
   Smartphone,
-  Trash2,
   TrendingUp,
   Wallet,
 } from "lucide-react";
 import { api } from "../api";
 import CreditCardCycles, { type Cycle } from "../CreditCardCycles";
-import { invalidateFinanceData } from "../appQueries";
+import { invalidateFinanceDataSubset } from "../appQueries";
 import { COMMON_CURRENCIES } from "../currencies";
 import { daysBetweenDateValues, taipeiDateInputValue } from "../date";
 import { useOwnerFilter } from "../ownerFilter";
@@ -59,6 +59,7 @@ const ownerOptions = [
 const accountOwnerOptions = ownerOptions.filter((option) => option.value !== "all");
 const customInstitutionValue = "__custom__";
 const customAccountNameValue = "__custom_account_name__";
+const accountMutationQueryKeys = ["accounts", "dashboard", "health", "attention"];
 
 const institutionPresets: Record<string, string[]> = {
   bank: [
@@ -277,7 +278,7 @@ export default function AccountsPage() {
     mutationFn: (payload: Record<string, unknown>) =>
       api<Account>("/accounts", { method: "POST", body: JSON.stringify(payload) }),
     onSuccess: () => {
-      invalidateFinanceData(client, ["accounts","dashboard"]);
+      invalidateFinanceDataSubset(client, accountMutationQueryKeys);
       setCreateOpen(false);
       resetAccountDraft();
       setMessage("帳戶已建立。");
@@ -288,7 +289,7 @@ export default function AccountsPage() {
     mutationFn: ({ id, payload }: { id: number; payload: Record<string, unknown> }) =>
       api(`/accounts/${id}/balance`, { method: "POST", body: JSON.stringify(payload) }),
     onSuccess: () => {
-      invalidateFinanceData(client, ["accounts","dashboard"]);
+      invalidateFinanceDataSubset(client, accountMutationQueryKeys);
       setBalanceAccount(null);
       setMessage("帳戶餘額已更新。");
     },
@@ -297,7 +298,7 @@ export default function AccountsPage() {
   const deleteAccount = useMutation({
     mutationFn: (id: number) => api(`/accounts/${id}/archive`, { method: "POST" }),
     onSuccess: () => {
-      invalidateFinanceData(client, ["accounts","dashboard"]);
+      invalidateFinanceDataSubset(client, accountMutationQueryKeys);
       setArchiveTarget(null);
       setMessage("帳戶已封存，歷史資料保留；可隨時從下方恢復。");
     },
@@ -307,14 +308,14 @@ export default function AccountsPage() {
     mutationFn: (id: number) => api(`/accounts/${id}/restore`, { method: "POST" }),
     onSuccess: () => {
       setMessage("帳戶已恢復，重新列入總資產；原本啟用的同步會繼續運作。");
-      return invalidateFinanceData(client, ["email-card-rules", "gmail-status"]);
+      return invalidateFinanceDataSubset(client, [...accountMutationQueryKeys, "email-card-rules", "gmail-status"]);
     },
   });
 
   const calibrateAutoEstimate = useMutation({
     mutationFn: (id: number) => api<Account>(`/accounts/${id}/auto-estimate`, { method: "POST" }),
     onSuccess: (account) => {
-      invalidateFinanceData(client, ["accounts","dashboard"]);
+      invalidateFinanceDataSubset(client, accountMutationQueryKeys);
       setDetailAccount(account);
       setMessage("已啟用並校準自動估算總資產。");
     },
@@ -420,6 +421,7 @@ export default function AccountsPage() {
               subtitle={`${liabilityAccounts.length} 個帳戶`}
               accounts={liabilityAccounts}
               cardCycles={cardCycles.data}
+              cardCyclesLoading={cardCycles.isPending}
               onBalance={setBalanceAccount}
               onDetail={setDetailAccount}
               onDelete={setArchiveTarget}
@@ -428,7 +430,13 @@ export default function AccountsPage() {
         </div>
       )}
 
-      <CreditCardCycles accountIds={visibleAccounts.filter((item) => item.account_type === "credit_card").map((item) => item.id)} />
+      <CreditCardCycles
+        accountIds={visibleAccounts.filter((item) => item.account_type === "credit_card").map((item) => item.id)}
+        cycles={cardCycles.data}
+        isLoading={cardCycles.isPending}
+        isError={cardCycles.isError}
+        onRetry={() => { void cardCycles.refetch(); }}
+      />
       {archivedAccounts.length > 0 && (
         <details className="group mt-6 rounded-xl border border-slate-200 bg-white">
           <summary className="flex cursor-pointer list-none items-center gap-3 rounded-xl px-4 py-3.5 text-slate-600 transition hover:bg-slate-50 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-emerald-600 focus-visible:ring-offset-2 [&::-webkit-details-marker]:hidden">
@@ -684,6 +692,7 @@ function AccountGroup({
   onDetail,
   onDelete,
   cardCycles = [],
+  cardCyclesLoading = false,
 }: {
   title: string;
   subtitle: string;
@@ -692,6 +701,7 @@ function AccountGroup({
   onDetail: (account: Account) => void;
   onDelete: (account: Account) => void;
   cardCycles?: Cycle[];
+  cardCyclesLoading?: boolean;
 }) {
   return (
     <section>
@@ -704,10 +714,19 @@ function AccountGroup({
           const Icon = iconFor(account.account_type);
           const isCreditCard = account.account_type === "credit_card";
           const cycle = cardCycles.find((item) => item.card_account_id === account.id);
+          const hasCardSync = isCreditCard && Boolean(cycle || account.linked_email_rules?.length);
+          const accountSubtitle = account.institution && !account.name.includes(account.institution)
+            ? account.institution
+            : isCreditCard ? "" : labelFor(account.account_type);
           const staleDays = daysBetweenDateValues(account.balance_date);
           const snapshotIsStale = staleDays !== null && staleDays >= 7;
+          const showCycleDetails = () => {
+            const target = document.getElementById(cycle ? `card-cycle-${account.id}` : "card-cycles");
+            if (target instanceof HTMLDetailsElement) target.open = true;
+            target?.scrollIntoView?.({ behavior: "smooth", block: "center" });
+          };
           return (
-            <Card key={account.id} className="overflow-hidden">
+            <Card key={account.id} className="overflow-hidden" aria-label={`${account.name} 帳戶摘要`}>
               <div className="p-5">
                 <div className="flex items-start gap-4">
                   <div className="grid size-12 shrink-0 place-items-center rounded-2xl bg-emerald-50 text-emerald-700">
@@ -715,33 +734,62 @@ function AccountGroup({
                   </div>
                   <div className="min-w-0">
                     <h3 className="truncate font-bold text-slate-800">{account.name}</h3>
-                    <p className="mt-1 truncate text-xs text-slate-400">
-                      {account.institution || labelFor(account.account_type)}
-                    </p>
+                    {accountSubtitle && <p className="mt-1 truncate text-xs text-slate-400">{accountSubtitle}</p>}
                   </div>
                   <div className="ml-auto flex shrink-0 flex-col items-end gap-1">
                     <Badge>{account.owner_label}</Badge>
-                    <Badge tone={account.nature === "asset" ? "green" : "red"}>
-                      {account.currency}
-                    </Badge>
+                    {(!isCreditCard || account.currency !== "TWD") && (
+                      <Badge tone={account.nature === "asset" ? "green" : "red"}>{account.currency}</Badge>
+                    )}
                   </div>
                 </div>
                 <div className="mt-7">
                   <p className="text-xs font-medium text-slate-400">
-                    {account.nature === "asset" ? "帳戶總價值" : isCreditCard ? "未償還負債" : "目前負債"}
+                    {account.nature === "asset" ? "帳戶總價值" : isCreditCard ? "目前欠款" : "目前負債"}
                   </p>
                   <p className={`mt-1 text-2xl font-bold ${account.nature === "liability" ? "text-red-600" : "text-ink"}`}>
                     {money(Math.abs(account.total_twd))}
                   </p>
                 </div>
-                {isCreditCard && <div className="mt-3 space-y-1 text-xs text-slate-500">
-                  {cycle && <p>{cycle.cycle_boundary_known ? `每月 ${cycle.closing_day} 日結帳 · ` : "結帳日未知（不以繳款日推算） · "}每月 {cycle.payment_due_day} 日繳款</p>}
-                  {cycle?.current_bill && <p>本期正式帳單 {money(cycle.current_bill.amount_due, cycle.currency)} · 繳款日 {cycle.current_bill.due_date}</p>}
-                  {cycle && <p>未出帳消費 {money(cycle.unbilled.amount, cycle.currency)}{!cycle.cycle_boundary_known && <span className="mt-1 block">帳期範圍等待正式帳單確認</span>}</p>}
-                  {cycle?.last_paid_bill && <p>最近已記錄繳款 {money(cycle.last_paid_bill.amount_due, cycle.currency)}</p>}
-                  <p>負債依消費與繳款記錄更新，不會在結帳日自動歸零。</p>
-                  <a href="#card-cycles" className="inline-block py-1 font-medium text-emerald-700">查看帳單與繳款紀錄 →</a>
-                </div>}
+                {isCreditCard && cardCyclesLoading && (
+                  <div className="mt-4 grid grid-cols-2 gap-2" role="status" aria-label="正在載入信用卡帳單">
+                    <div className="h-[66px] animate-pulse rounded-xl bg-slate-100" />
+                    <div className="h-[66px] animate-pulse rounded-xl bg-slate-100" />
+                  </div>
+                )}
+                {isCreditCard && !cardCyclesLoading && cycle && (
+                  <div className="mt-4 space-y-3">
+                    <div className="grid grid-cols-2 gap-2">
+                      <div className="rounded-xl bg-blue-50 px-3 py-2.5">
+                        <p className="text-[11px] font-medium text-blue-600">
+                          本期應繳{cycle.current_bill ? ` · ${cycle.current_bill.due_date}` : ""}
+                        </p>
+                        <p className="mt-1 truncate text-sm font-bold text-blue-950">
+                          {cycle.current_bill ? money(cycle.current_bill.amount_due, cycle.currency) : "尚無待繳"}
+                        </p>
+                      </div>
+                      <div className="rounded-xl bg-slate-50 px-3 py-2.5">
+                        <p className="text-[11px] font-medium text-slate-500">未出帳</p>
+                        <p className="mt-1 truncate text-sm font-bold text-slate-800">
+                          {money(cycle.unbilled.amount, cycle.currency)}
+                        </p>
+                      </div>
+                    </div>
+                    <div className="flex flex-wrap items-center gap-2">
+                      <Badge tone="blue">每月 {cycle.payment_due_day} 日繳款</Badge>
+                      {cycle.cycle_boundary_known ? (
+                        <Badge>每月 {cycle.closing_day} 日結帳</Badge>
+                      ) : (
+                        <Link
+                          to="/settings#email"
+                          className="rounded-full bg-amber-50 px-2.5 py-1 text-xs font-medium text-amber-700 hover:bg-amber-100"
+                        >
+                          設定結帳日
+                        </Link>
+                      )}
+                    </div>
+                  </div>
+                )}
                 <div className="mt-6 flex flex-wrap items-center justify-between gap-2 text-xs text-slate-400">
                   <span>{isCreditCard ? "資料更新" : "餘額更新"} {account.balance_date || "尚未建立"}</span>
                   <div className="flex flex-wrap items-center gap-2">
@@ -752,9 +800,23 @@ function AccountGroup({
                 </div>
               </div>
               <div className="flex border-t border-slate-100 bg-slate-50/60 p-2">
-                <Button variant="ghost" className="flex-1" onClick={() => onBalance(account)}>
-                  <RefreshCw size={15} /> 更新餘額
-                </Button>
+                {hasCardSync ? (
+                  <>
+                    <Button variant="ghost" className="flex-1 text-emerald-700" onClick={showCycleDetails}>
+                      帳單明細
+                    </Button>
+                    <Link
+                      to={`/transactions?account=${account.id}&month=all&search=&unclassified=0&excluded=0&page=1`}
+                      className="flex min-h-10 flex-1 items-center justify-center rounded-xl px-3 text-sm font-semibold text-slate-600 hover:bg-slate-100"
+                    >
+                      查看消費
+                    </Link>
+                  </>
+                ) : (
+                  <Button variant="ghost" className="flex-1" onClick={() => onBalance(account)}>
+                    <RefreshCw size={15} /> {isCreditCard ? "更新負債" : "更新餘額"}
+                  </Button>
+                )}
                 {account.positions_count > 0 && (
                   <Button variant="ghost" className="px-3" onClick={() => onDetail(account)}>
                     明細
@@ -767,7 +829,7 @@ function AccountGroup({
                   title="封存帳戶"
                   aria-label={`封存${account.name}`}
                 >
-                  <Trash2 size={15} />
+                  <Archive size={15} />
                 </Button>
               </div>
             </Card>

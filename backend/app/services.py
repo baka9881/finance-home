@@ -1169,10 +1169,41 @@ def calculate_spending_analysis(
 
 
 def record_valuation(db: Session) -> ValuationSnapshot:
+    """Persist net-worth snapshots without rebuilding every dashboard view.
+
+    Account edits call this function synchronously.  Reusing the full dashboard
+    builder here used to repeat six-month trend, category, and transaction
+    queries four times (once per owner), even though snapshots only need the
+    current asset and liability totals.
+    """
     today = date.today()
-    snapshots: dict[str, ValuationSnapshot] = {}
+    accounts = db.scalars(
+        select(Account)
+        .where(Account.archived.is_(False))
+        .order_by(Account.id)
+    ).all()
+    account_items = [account_summary(db, account) for account in accounts]
+    totals_by_owner: dict[str, tuple[Decimal, Decimal]] = {}
     for owner in ("all", "me", "partner", "shared"):
-        dashboard = calculate_dashboard(db, owner=owner)
+        selected = account_items if owner == "all" else [
+            item for item in account_items if item["owner"] == owner
+        ]
+        assets = sum(
+            (Decimal(str(item["total_twd"])) for item in selected if item["nature"] == "asset"),
+            ZERO,
+        )
+        liabilities = sum(
+            (
+                abs(Decimal(str(item["total_twd"])))
+                for item in selected
+                if item["nature"] == "liability"
+            ),
+            ZERO,
+        )
+        totals_by_owner[owner] = assets, liabilities
+
+    snapshots: dict[str, ValuationSnapshot] = {}
+    for owner, (assets, liabilities) in totals_by_owner.items():
         snapshot = db.scalar(
             select(ValuationSnapshot).where(
                 ValuationSnapshot.snapshot_date == today,
@@ -1182,9 +1213,9 @@ def record_valuation(db: Session) -> ValuationSnapshot:
         if not snapshot:
             snapshot = ValuationSnapshot(snapshot_date=today, owner=owner)
             db.add(snapshot)
-        snapshot.assets = Decimal(str(dashboard["assets"]))
-        snapshot.liabilities = Decimal(str(dashboard["liabilities"]))
-        snapshot.net_worth = Decimal(str(dashboard["net_worth"]))
+        snapshot.assets = assets
+        snapshot.liabilities = liabilities
+        snapshot.net_worth = assets - liabilities
         snapshots[owner] = snapshot
     db.flush()
     return snapshots["all"]
