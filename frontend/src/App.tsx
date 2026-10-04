@@ -23,6 +23,7 @@ import {
   ApiError,
   CLOUD_AUTH_EXPECTED,
   clearAuthToken,
+  getAuthToken,
   resolveAuthGate,
   setAuthToken,
   type AuthStatus,
@@ -51,6 +52,7 @@ const secondaryNavigation = [
 
 const globalOwnerPaths = new Set(["/", "/accounts", "/transactions", "/investments", "/analysis"]);
 const PROFILE_AVATAR_STORAGE_KEY = "finance.profile-avatar";
+const AUTH_CHECK_TIMEOUT_MS = 10_000;
 
 function readProfileAvatar() {
   try {
@@ -664,16 +666,38 @@ export default function App() {
   const location = useLocation();
   const [authState, setAuthState] = useState<
     "checking" | "authenticated" | "anonymous" | "unavailable" | "configuration-error"
-  >("checking");
+  >(() => CLOUD_AUTH_EXPECTED && !getAuthToken() ? "anonymous" : "checking");
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
 
   useEffect(() => {
     let validationSequence = 0;
+    let activeController: AbortController | null = null;
+    let activeTimer: number | null = null;
 
     const syncAuth = () => {
       const sequence = ++validationSequence;
+      activeController?.abort();
+      if (activeTimer !== null) window.clearTimeout(activeTimer);
+
+      // In a cloud deployment, an absent token cannot access financial data.
+      // Show the login form immediately while the server may be waking up.
+      if (CLOUD_AUTH_EXPECTED && !getAuthToken()) {
+        queryClient.clear();
+        setAuthStatus(null);
+        setAuthState("anonymous");
+        return;
+      }
+
+      const controller = new AbortController();
+      activeController = controller;
       setAuthState("checking");
-      void api<AuthStatus>("/auth/status")
+      const timeout = new Promise<never>((_, reject) => {
+        activeTimer = window.setTimeout(() => {
+          controller.abort();
+          reject(new Error("登入狀態檢查逾時"));
+        }, AUTH_CHECK_TIMEOUT_MS);
+      });
+      void Promise.race([api<AuthStatus>("/auth/status", { signal: controller.signal }), timeout])
         .then((result) => {
           if (sequence !== validationSequence) return;
           setAuthStatus(result);
@@ -699,6 +723,13 @@ export default function App() {
             return;
           }
           setAuthState(cause instanceof ApiError && cause.status === 503 ? "configuration-error" : "unavailable");
+        })
+        .finally(() => {
+          if (sequence === validationSequence) {
+            if (activeTimer !== null) window.clearTimeout(activeTimer);
+            activeTimer = null;
+            activeController = null;
+          }
         });
     };
 
@@ -706,6 +737,8 @@ export default function App() {
     syncAuth();
     return () => {
       validationSequence += 1;
+      activeController?.abort();
+      if (activeTimer !== null) window.clearTimeout(activeTimer);
       window.removeEventListener("finance:auth-changed", syncAuth);
     };
   }, [queryClient]);
