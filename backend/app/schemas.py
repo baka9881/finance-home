@@ -220,6 +220,8 @@ class AccountTransferCreate(BaseModel):
 class LoanPaymentCreate(BaseModel):
     payment_account_id: int
     loan_account_id: int
+    bill_id: int | None = None
+    existing_payment_transaction_id: int | None = None
     payment_date: date = Field(default_factory=date.today)
     principal: Decimal = Field(ge=0)
     interest: Decimal = Field(ge=0)

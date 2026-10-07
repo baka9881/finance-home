@@ -10,7 +10,7 @@ export const APP_QUERY_GC_TIME = 30 * 60_000;
 // Keep this dependency list shared by manual changes and background imports.
 export const FINANCE_QUERY_KEYS = [
   "accounts", "positions", "transactions", "dashboard", "health", "spending-analysis",
-  "pending-csv-balances", "transfer-suggestions", "credit-card-bills", "credit-card-cycles",
+  "pending-csv-balances", "transfer-suggestions", "card-payment-candidates", "credit-card-bills", "credit-card-cycles",
   "recurring-expenses", "ignored-recurring-expenses", "account-balances", "attention",
 ] as const;
 

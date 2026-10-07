@@ -1,9 +1,10 @@
 import base64
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal
 from types import SimpleNamespace
 
 import pytest
+from fastapi import HTTPException
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import Session
 
@@ -13,6 +14,8 @@ from app.database import (
     BalanceSnapshot,
     Base,
     CreditCardBill,
+    CreditCardPayment,
+    CreditCardPaymentAllocation,
     EmailCardRule,
     EmailImportRecord,
     Transaction,
@@ -24,22 +27,29 @@ from app.email_sync import (
     _refresh_current_gmail_card_balance,
     _gmail_rule_search_query,
     _plain_html,
+    card_payment_allocations,
     discover_gmail_card_candidates,
     parse_card_email,
     process_due_card_bills,
+    repair_linked_card_payments,
     repair_duplicate_card_bills,
     serialize_card_cycle,
     serialize_email_rule,
     sync_gmail,
+    taipei_today,
 )
+from app.main import card_payment_candidates, confirm_transfer, create_account_transfer, create_loan_payment
+from app.schemas import AccountTransferCreate, LoanPaymentCreate, TransferCreate
 from app import email_sync as email_sync_module
 from app.services import (
     calculate_dashboard,
     create_balance_snapshot,
+    export_backup,
     get_latest_balance,
     import_csv,
     repair_cross_source_card_duplicates,
     repair_linked_transfer_kinds,
+    restore_backup,
     seed_defaults,
 )
 
@@ -434,6 +444,7 @@ def test_missing_closing_day_does_not_invent_a_payment_day_cycle() -> None:
     assert cycle["current_cycle"] is None
     assert cycle["unbilled"] == {
         "amount": 300.0,
+        "payments_total": 0.0,
         "period_start": None,
         "period_end": None,
         "transaction_count": 2,
@@ -520,10 +531,693 @@ def test_unknown_closing_day_uses_formal_bill_plus_confirmed_post_bill_spending(
     assert cycle["current_bill"]["period_end"] is None
     assert cycle["unbilled"] == {
         "amount": 200.0,
+        "payments_total": 0.0,
         "period_start": date(2026, 8, 25),
         "period_end": None,
         "transaction_count": 1,
     }
+    db.close()
+
+
+def test_card_payment_without_statement_survives_gmail_rebuild_and_late_statement() -> None:
+    db = make_session()
+    today = taipei_today()
+    payment = Account(name="生活費帳戶", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="國泰信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([payment, card])
+    db.flush()
+    create_balance_snapshot(db, payment, Decimal("30000"), today)
+    rule = EmailCardRule(
+        name="國泰信用卡", card_account_id=card.id, payment_account_id=payment.id,
+        payment_due_day=23, active=True, auto_pay=False,
+    )
+    db.add(rule)
+    db.add(Transaction(
+        account_id=card.id, transaction_date=today - timedelta(days=3),
+        description="已收到消費通知", amount=Decimal("-16188"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-16188"),
+        transaction_kind="expense", fingerprint="card-payment-no-bill-purchase", source="gmail",
+    ))
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("16188")
+
+    response = create_loan_payment(LoanPaymentCreate(
+        payment_account_id=payment.id, loan_account_id=card.id,
+        payment_date=today - timedelta(days=1), principal=Decimal("16188"), interest=Decimal("0"),
+    ), db)
+    assert len(response["transaction_ids"]) == 2
+    assert Decimal(str(response["loan_account"]["balance"])) == Decimal("0")
+    assert decimal_amount(get_latest_balance(db, payment.id)) == Decimal("13812")
+    assert decimal_amount(get_latest_balance(db, card.id)) == Decimal("0")
+    assert db.query(CreditCardPayment).count() == 1
+    cycle = serialize_card_cycle(db, rule, today)
+    assert cycle["current_bill"] is None
+    assert cycle["unbilled"]["amount"] == 0
+    assert cycle["unbilled"]["payments_total"] == 16188
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("0")
+    backup = export_backup(db)
+    assert len(backup["data"]["credit_card_payments"]) == 1
+    restore_backup(db, backup)
+    rule = db.get(EmailCardRule, rule.id)
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("0")
+
+    _create_or_update_bill(db, rule, {
+        "statement_date": today - timedelta(days=2),
+        "due_date": today + timedelta(days=20),
+        "amount_due": Decimal("16188"),
+    }, "late-statement")
+    db.commit()
+    bill = db.query(CreditCardBill).one()
+    assert bill.status == "paid"
+    assert db.query(CreditCardPayment).one().bill_id == bill.id
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("0")
+    db.add(Transaction(
+        account_id=card.id, transaction_date=today,
+        description="帳單後的新消費", amount=Decimal("-500"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-500"),
+        transaction_kind="expense", fingerprint="card-payment-after-late-bill", source="gmail",
+    ))
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("500")
+    db.close()
+
+
+def test_one_card_payment_keeps_both_bill_allocations_after_restore_and_new_debt() -> None:
+    db = make_session()
+    today = taipei_today()
+    bank = Account(name="付款銀行", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([bank, card])
+    db.flush()
+    create_balance_snapshot(db, bank, Decimal("2000"), today)
+    rule = EmailCardRule(
+        name="信用卡", card_account_id=card.id, payment_account_id=bank.id,
+        active=True, auto_pay=False,
+    )
+    db.add(rule)
+    db.flush()
+    first_bill = CreditCardBill(
+        rule_id=rule.id, card_account_id=card.id, payment_account_id=bank.id,
+        statement_date=today - timedelta(days=40), due_date=today - timedelta(days=5),
+        amount_due=Decimal("600"), currency="TWD", status="pending",
+    )
+    second_bill = CreditCardBill(
+        rule_id=rule.id, card_account_id=card.id, payment_account_id=bank.id,
+        statement_date=today - timedelta(days=10), due_date=today + timedelta(days=5),
+        amount_due=Decimal("400"), currency="TWD", status="pending",
+    )
+    db.add_all([first_bill, second_bill])
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("1000")
+
+    create_loan_payment(LoanPaymentCreate(
+        payment_account_id=bank.id, loan_account_id=card.id,
+        payment_date=today - timedelta(days=1), principal=Decimal("1000"),
+        interest=Decimal("0"),
+    ), db)
+
+    payment = db.query(CreditCardPayment).one()
+    assert first_bill.status == second_bill.status == "paid"
+    expected_allocations = {
+        (payment.id, first_bill.id): Decimal("600"),
+        (payment.id, second_bill.id): Decimal("400"),
+    }
+    assert {
+        (row.payment_id, row.bill_id): Decimal(str(row.amount))
+        for row in db.scalars(select(CreditCardPaymentAllocation)).all()
+    } == expected_allocations
+    allocated, open_payments = card_payment_allocations(
+        db, rule, [first_bill, second_bill], today, None,
+    )
+    assert allocated == {first_bill.id: Decimal("600"), second_bill.id: Decimal("400")}
+    assert open_payments == Decimal("0")
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("0")
+
+    db.add(Transaction(
+        account_id=card.id, transaction_date=today,
+        description="繳清兩份帳單後的新消費", amount=Decimal("-500"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-500"),
+        transaction_kind="expense", fingerprint="two-bills-new-gmail-purchase", source="gmail",
+    ))
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("500")
+    assert serialize_card_cycle(db, rule, today)["unbilled"]["amount"] == 500.0
+
+    backup = export_backup(db)
+    assert len(backup["data"]["credit_card_payment_allocations"]) == 2
+    rule_id = rule.id
+    db.close()
+    db = make_session()
+    restored = restore_backup(db, backup)
+    rule = db.get(EmailCardRule, rule_id)
+    assert rule is not None
+    assert restored["credit_card_payments"] == 1
+    assert restored["credit_card_payment_allocations"] == 2
+    assert {
+        (row.payment_id, row.bill_id): Decimal(str(row.amount))
+        for row in db.scalars(select(CreditCardPaymentAllocation)).all()
+    } == expected_allocations
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("500")
+
+    _create_or_update_bill(db, rule, {
+        "statement_date": today,
+        "due_date": today + timedelta(days=20),
+        "amount_due": Decimal("900"),
+    }, "third-bill-after-full-payment")
+    db.commit()
+    bills = db.scalars(select(CreditCardBill).where(
+        CreditCardBill.rule_id == rule.id,
+    ).order_by(CreditCardBill.id)).all()
+    third_bill = bills[-1]
+    allocated, open_payments = card_payment_allocations(db, rule, bills, today, None)
+    assert third_bill.status == "pending"
+    assert allocated[third_bill.id] == Decimal("0")
+    assert open_payments == Decimal("0")
+    assert db.query(CreditCardPayment).count() == 1
+    assert db.query(CreditCardPaymentAllocation).count() == 2
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("900")
+    assert serialize_card_cycle(db, rule, today)["current_bill"]["remaining_due"] == 900.0
+    db.close()
+
+
+def test_future_generic_transfer_into_card_creates_no_ledger_or_snapshot() -> None:
+    db = make_session()
+    today = taipei_today()
+    bank = Account(name="付款銀行", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([bank, card])
+    db.commit()
+
+    with pytest.raises(HTTPException) as invalid:
+        create_account_transfer(AccountTransferCreate(
+            from_account_id=bank.id, to_account_id=card.id,
+            amount=Decimal("500"), transfer_date=today + timedelta(days=1),
+        ), db)
+
+    assert invalid.value.status_code == 422
+    assert not db.scalars(select(Transaction)).all()
+    assert not db.scalars(select(BalanceSnapshot)).all()
+    assert not db.scalars(select(TransferLink)).all()
+    assert not db.scalars(select(CreditCardPayment)).all()
+    db.close()
+
+
+def test_payment_for_one_rule_bill_does_not_pay_another_rule_on_same_card() -> None:
+    db = make_session()
+    today = taipei_today()
+    bank = Account(name="付款銀行", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([bank, card])
+    db.flush()
+    create_balance_snapshot(db, bank, Decimal("2000"), today)
+    rule_a = EmailCardRule(name="規則 A", card_account_id=card.id,
+                           payment_account_id=bank.id, auto_pay=False, active=True)
+    rule_b = EmailCardRule(name="規則 B", card_account_id=card.id,
+                           payment_account_id=bank.id, auto_pay=False, active=True)
+    db.add_all([rule_a, rule_b])
+    db.flush()
+    bill_a = CreditCardBill(
+        rule_id=rule_a.id, card_account_id=card.id, payment_account_id=bank.id,
+        statement_date=today - timedelta(days=10), due_date=today + timedelta(days=5),
+        amount_due=Decimal("600"), currency="TWD", status="pending",
+    )
+    bill_b = CreditCardBill(
+        rule_id=rule_b.id, card_account_id=card.id, payment_account_id=bank.id,
+        statement_date=today - timedelta(days=10), due_date=today + timedelta(days=5),
+        amount_due=Decimal("400"), currency="TWD", status="pending",
+    )
+    db.add_all([bill_a, bill_b])
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule_a, today) == Decimal("600")
+
+    create_loan_payment(LoanPaymentCreate(
+        payment_account_id=bank.id, loan_account_id=card.id, bill_id=bill_a.id,
+        payment_date=today, principal=Decimal("600"), interest=Decimal("0"),
+    ), db)
+
+    assert db.query(CreditCardPayment).one().bill_id == bill_a.id
+    assert bill_a.status == "paid"
+    assert bill_b.status == "pending"
+    allocated_b, _ = card_payment_allocations(db, rule_b, [bill_b], today, None)
+    assert allocated_b[bill_b.id] == Decimal("0")
+    assert serialize_card_cycle(db, rule_b, today)["current_bill"]["remaining_due"] == 400.0
+    db.close()
+
+
+def test_partial_card_payment_only_auto_records_remaining_statement_once() -> None:
+    db = make_session()
+    today = taipei_today()
+    payment = Account(name="生活費帳戶", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="國泰信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([payment, card])
+    db.flush()
+    create_balance_snapshot(db, payment, Decimal("30000"), today)
+    rule = EmailCardRule(
+        name="國泰信用卡", card_account_id=card.id, payment_account_id=payment.id,
+        payment_due_day=today.day, active=True, auto_pay=True,
+    )
+    db.add(rule)
+    db.flush()
+    bill = CreditCardBill(
+        rule_id=rule.id, card_account_id=card.id, payment_account_id=payment.id,
+        statement_date=today - timedelta(days=10), due_date=today,
+        amount_due=Decimal("12000"), currency="TWD", status="pending",
+    )
+    db.add(bill)
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("12000")
+
+    create_loan_payment(LoanPaymentCreate(
+        payment_account_id=payment.id, loan_account_id=card.id, bill_id=bill.id,
+        payment_date=today, principal=Decimal("5000"), interest=Decimal("0"),
+    ), db)
+    assert decimal_amount(get_latest_balance(db, card.id)) == Decimal("7000")
+    cycle = serialize_card_cycle(db, rule, today)
+    assert cycle["current_bill"]["amount_due"] == 12000
+    assert cycle["current_bill"]["payments_total"] == 5000
+    assert cycle["current_bill"]["remaining_due"] == 7000
+
+    first = process_due_card_bills(db, today)
+    second = process_due_card_bills(db, today)
+    assert first["paid"] == 1
+    assert second["paid"] == 0
+    assert bill.status == "paid"
+    assert decimal_amount(get_latest_balance(db, payment.id)) == Decimal("18000")
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("0")
+    assert db.query(CreditCardPayment).count() == 2
+    db.close()
+
+
+def test_existing_card_transfer_is_recognized_without_second_bank_debit() -> None:
+    db = make_session()
+    today = taipei_today()
+    payment = Account(name="生活費帳戶", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="國泰信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([payment, card])
+    db.flush()
+    create_balance_snapshot(db, payment, Decimal("13812"), today)
+    rule = EmailCardRule(name="國泰信用卡", card_account_id=card.id,
+                         payment_account_id=payment.id, active=True, auto_pay=False)
+    db.add(rule)
+    purchase = Transaction(
+        account_id=card.id, transaction_date=today - timedelta(days=2),
+        description="消費", amount=Decimal("-16188"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-16188"),
+        transaction_kind="expense", fingerprint="preexisting-card-purchase", source="gmail",
+    )
+    outgoing = Transaction(
+        account_id=payment.id, transaction_date=today - timedelta(days=1),
+        description="既有付款", amount=Decimal("-16188"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-16188"),
+        transaction_kind="transfer", fingerprint="preexisting-card-payment-out", source="manual",
+    )
+    incoming = Transaction(
+        account_id=card.id, transaction_date=today - timedelta(days=1),
+        description="既有付款", amount=Decimal("16188"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("16188"),
+        transaction_kind="transfer", fingerprint="preexisting-card-payment-in", source="manual",
+    )
+    db.add_all([purchase, outgoing, incoming])
+    db.flush()
+    db.add(TransferLink(from_transaction_id=outgoing.id, to_transaction_id=incoming.id, confirmed=True))
+    db.commit()
+
+    assert repair_linked_card_payments(db) == 1
+    assert repair_linked_card_payments(db) == 0
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("0")
+    assert decimal_amount(get_latest_balance(db, payment.id)) == Decimal("13812")
+    assert db.query(CreditCardPayment).count() == 1
+    with pytest.raises(HTTPException) as duplicate:
+        confirm_transfer(TransferCreate(from_transaction_id=outgoing.id,
+                                         to_transaction_id=incoming.id), db)
+    assert duplicate.value.status_code == 409
+    db.close()
+
+
+def test_legacy_backup_restores_linked_card_payment_and_clears_liability() -> None:
+    db = make_session()
+    today = taipei_today()
+    bank = Account(name="付款銀行", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([bank, card])
+    db.flush()
+    rule = EmailCardRule(name="信用卡", card_account_id=card.id,
+                         payment_account_id=bank.id, auto_pay=False, active=True)
+    db.add(rule)
+    purchase = Transaction(
+        account_id=card.id, transaction_date=today - timedelta(days=2),
+        description="消費", amount=Decimal("-500"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-500"),
+        transaction_kind="expense", fingerprint="legacy-backup-card-purchase", source="gmail",
+    )
+    outgoing = Transaction(
+        account_id=bank.id, transaction_date=today - timedelta(days=1),
+        description="已繳款", amount=Decimal("-500"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-500"),
+        transaction_kind="transfer", fingerprint="legacy-backup-bank-debit", source="manual",
+    )
+    incoming = Transaction(
+        account_id=card.id, transaction_date=today - timedelta(days=1),
+        description="已繳款", amount=Decimal("500"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("500"),
+        transaction_kind="transfer", fingerprint="legacy-backup-card-credit", source="manual",
+    )
+    db.add_all([purchase, outgoing, incoming])
+    db.flush()
+    db.add(TransferLink(from_transaction_id=outgoing.id,
+                        to_transaction_id=incoming.id, confirmed=True))
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("500")
+    backup = export_backup(db)
+    assert backup["data"].pop("credit_card_payments") == []
+
+    restore_backup(db, backup)
+
+    assert db.query(CreditCardPayment).count() == 1
+    restored_rule = db.get(EmailCardRule, rule.id)
+    assert decimal_amount(get_latest_balance(db, card.id)) == Decimal("0")
+    assert _refresh_current_gmail_card_balance(db, restored_rule, today) == Decimal("0")
+    db.close()
+
+
+def test_confirming_existing_card_transfer_updates_balance_immediately() -> None:
+    db = make_session()
+    today = taipei_today()
+    payment = Account(name="生活費帳戶", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="國泰信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([payment, card])
+    db.flush()
+    create_balance_snapshot(db, payment, Decimal("13812"), today)
+    rule = EmailCardRule(name="國泰信用卡", card_account_id=card.id,
+                         payment_account_id=payment.id, active=True, auto_pay=False)
+    db.add(rule)
+    purchase = Transaction(
+        account_id=card.id, transaction_date=today - timedelta(days=2),
+        description="消費", amount=Decimal("-16188"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-16188"),
+        transaction_kind="expense", fingerprint="confirm-card-purchase", source="gmail",
+    )
+    outgoing = Transaction(
+        account_id=payment.id, transaction_date=today - timedelta(days=1),
+        description="銀行扣款", amount=Decimal("-16188"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-16188"),
+        transaction_kind="expense", fingerprint="confirm-card-out", source="csv",
+    )
+    incoming = Transaction(
+        account_id=card.id, transaction_date=today - timedelta(days=1),
+        description="信用卡入款", amount=Decimal("16188"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("16188"),
+        transaction_kind="income", fingerprint="confirm-card-in", source="manual",
+    )
+    db.add_all([purchase, outgoing, incoming])
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("16188")
+
+    confirm_transfer(TransferCreate(from_transaction_id=outgoing.id,
+                                     to_transaction_id=incoming.id), db)
+    assert decimal_amount(get_latest_balance(db, card.id)) == Decimal("0")
+    assert decimal_amount(get_latest_balance(db, payment.id)) == Decimal("13812")
+    assert db.query(CreditCardPayment).count() == 1
+    db.close()
+
+
+def test_card_payment_reuses_imported_bank_debit_without_reducing_bank_again() -> None:
+    db = make_session()
+    today = taipei_today()
+    payment_date = today - timedelta(days=1)
+    bank = Account(name="付款銀行", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([bank, card])
+    db.flush()
+    create_balance_snapshot(db, bank, Decimal("13812"), today)
+    rule = EmailCardRule(name="信用卡", card_account_id=card.id,
+                         payment_account_id=bank.id, auto_pay=False, active=True)
+    db.add(rule)
+    db.flush()
+    bill = CreditCardBill(
+        rule_id=rule.id, card_account_id=card.id, payment_account_id=bank.id,
+        statement_date=today - timedelta(days=10), due_date=today + timedelta(days=5),
+        amount_due=Decimal("16188"), currency="TWD", status="pending",
+    )
+    debit = Transaction(
+        account_id=bank.id, transaction_date=payment_date, description="信用卡帳單扣款",
+        amount=Decimal("-16188"), currency="TWD", fx_rate=Decimal("1"),
+        base_amount=Decimal("-16188"), transaction_kind="expense",
+        fingerprint="reused-card-bank-debit", source="csv",
+    )
+    db.add_all([bill, debit])
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("16188")
+
+    candidates = card_payment_candidates(card.id, bank.id, db)
+    assert [item["id"] for item in candidates] == [debit.id]
+    assert candidates[0]["amount"] == -16188.0
+    bank_snapshot_ids = db.scalars(select(BalanceSnapshot.id).where(
+        BalanceSnapshot.account_id == bank.id
+    )).all()
+
+    result = create_loan_payment(LoanPaymentCreate(
+        payment_account_id=bank.id, loan_account_id=card.id, bill_id=bill.id,
+        payment_date=payment_date, principal=Decimal("16188"), interest=Decimal("0"),
+        existing_payment_transaction_id=debit.id,
+    ), db)
+
+    assert result["transaction_ids"][0] == debit.id
+    assert len(result["transaction_ids"]) == 2
+    assert [row.id for row in db.scalars(select(Transaction).where(
+        Transaction.account_id == bank.id
+    )).all()] == [debit.id]
+    assert db.scalars(select(BalanceSnapshot.id).where(
+        BalanceSnapshot.account_id == bank.id
+    )).all() == bank_snapshot_ids
+    assert decimal_amount(get_latest_balance(db, bank.id)) == Decimal("13812")
+    assert decimal_amount(get_latest_balance(db, card.id)) == Decimal("0")
+    assert db.get(CreditCardBill, bill.id).status == "paid"
+    payment = db.query(CreditCardPayment).one()
+    link = db.get(TransferLink, payment.transfer_link_id)
+    assert link.from_transaction_id == debit.id
+    assert debit.source == "csv"
+    assert debit.transaction_kind == "transfer"
+    assert card_payment_candidates(card.id, bank.id, db) == []
+    db.close()
+
+
+def test_reused_debit_for_unknown_bill_period_requires_explicit_bill_selection() -> None:
+    db = make_session()
+    today = taipei_today()
+    payment_date = today - timedelta(days=1)
+    bank = Account(name="付款銀行", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([bank, card])
+    db.flush()
+    create_balance_snapshot(db, bank, Decimal("1600"), today)
+    rule = EmailCardRule(
+        name="信用卡", card_account_id=card.id, payment_account_id=bank.id,
+        active=True, auto_pay=False,
+    )
+    db.add(rule)
+    db.flush()
+    bill = CreditCardBill(
+        rule_id=rule.id, card_account_id=card.id, payment_account_id=bank.id,
+        statement_date=None, due_date=today + timedelta(days=5),
+        amount_due=Decimal("600"), currency="TWD", status="pending",
+    )
+    debit = Transaction(
+        account_id=bank.id, transaction_date=payment_date, description="匯入信用卡扣款",
+        amount=Decimal("-400"), currency="TWD", fx_rate=Decimal("1"),
+        base_amount=Decimal("-400"), transaction_kind="expense",
+        fingerprint="no-anchor-bill-bank-debit", source="csv",
+    )
+    db.add_all([bill, debit])
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("600")
+    bank_snapshot_ids = db.scalars(select(BalanceSnapshot.id).where(
+        BalanceSnapshot.account_id == bank.id,
+    )).all()
+    payload = LoanPaymentCreate(
+        payment_account_id=bank.id, loan_account_id=card.id,
+        payment_date=payment_date, principal=Decimal("400"), interest=Decimal("0"),
+        existing_payment_transaction_id=debit.id,
+    )
+
+    with pytest.raises(HTTPException) as invalid:
+        create_loan_payment(payload, db)
+
+    assert invalid.value.status_code == 422
+    assert "帳單帳期未知" in invalid.value.detail
+    assert db.query(TransferLink).count() == 0
+    assert db.query(CreditCardPayment).count() == 0
+    assert db.query(CreditCardPaymentAllocation).count() == 0
+    assert db.scalars(select(Transaction.id)).all() == [debit.id]
+    assert debit.transaction_kind == "expense"
+    assert decimal_amount(get_latest_balance(db, card.id)) == Decimal("600")
+
+    result = create_loan_payment(payload.model_copy(update={"bill_id": bill.id}), db)
+
+    assert result["transaction_ids"][0] == debit.id
+    assert len(result["transaction_ids"]) == 2
+    assert db.scalars(select(Transaction.id).where(
+        Transaction.account_id == bank.id,
+    )).all() == [debit.id]
+    assert db.scalars(select(BalanceSnapshot.id).where(
+        BalanceSnapshot.account_id == bank.id,
+    )).all() == bank_snapshot_ids
+    assert decimal_amount(get_latest_balance(db, bank.id)) == Decimal("1600")
+    assert decimal_amount(get_latest_balance(db, card.id)) == Decimal("200")
+    assert bill.status == "pending"
+    assert db.query(CreditCardPayment).one().bill_id == bill.id
+    allocation = db.query(CreditCardPaymentAllocation).one()
+    assert allocation.bill_id == bill.id
+    assert Decimal(str(allocation.amount)) == Decimal("400")
+    cycle = serialize_card_cycle(db, rule, today)
+    assert cycle["current_bill"]["payments_total"] == 400.0
+    assert cycle["current_bill"]["remaining_due"] == 200.0
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("200")
+    db.close()
+
+
+def test_card_payment_cannot_reuse_a_linked_debit_or_mismatched_amount() -> None:
+    db = make_session()
+    today = taipei_today()
+    payment_date = today - timedelta(days=1)
+    bank = Account(name="付款銀行", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([bank, card])
+    db.flush()
+    create_balance_snapshot(db, bank, Decimal("20000"), today)
+    rule = EmailCardRule(name="信用卡", card_account_id=card.id,
+                         payment_account_id=bank.id, auto_pay=False, active=True)
+    db.add(rule)
+    db.add(Transaction(
+        account_id=card.id, transaction_date=today - timedelta(days=2),
+        description="已入帳消費", amount=Decimal("-32376"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-32376"),
+        transaction_kind="expense", fingerprint="reuse-duplicate-card-purchase", source="gmail",
+    ))
+    debit = Transaction(
+        account_id=bank.id, transaction_date=payment_date, description="信用卡扣款",
+        amount=Decimal("-16188"), currency="TWD", fx_rate=Decimal("1"),
+        base_amount=Decimal("-16188"), transaction_kind="expense",
+        fingerprint="reuse-duplicate-bank-debit", source="csv",
+    )
+    db.add(debit)
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("32376")
+
+    def payload(principal: str) -> LoanPaymentCreate:
+        return LoanPaymentCreate(
+            payment_account_id=bank.id, loan_account_id=card.id,
+            payment_date=payment_date, principal=Decimal(principal), interest=Decimal("0"),
+            existing_payment_transaction_id=debit.id,
+        )
+
+    with pytest.raises(HTTPException) as mismatch:
+        create_loan_payment(payload("16000"), db)
+    assert mismatch.value.status_code == 422
+    assert not db.scalars(select(TransferLink)).all()
+    assert db.query(CreditCardPayment).count() == 0
+
+    create_loan_payment(payload("16188"), db)
+    with pytest.raises(HTTPException) as duplicate:
+        create_loan_payment(payload("16188"), db)
+    assert duplicate.value.status_code == 409
+    assert db.query(CreditCardPayment).count() == 1
+    assert len(db.scalars(select(Transaction).where(
+        Transaction.account_id == bank.id
+    )).all()) == 1
+    db.close()
+
+
+def test_card_payment_rejects_debit_before_the_card_purchase() -> None:
+    db = make_session()
+    today = taipei_today()
+    payment_date = today - timedelta(days=3)
+    bank = Account(name="付款銀行", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([bank, card])
+    db.flush()
+    rule = EmailCardRule(name="信用卡", card_account_id=card.id,
+                         payment_account_id=bank.id, auto_pay=False, active=True)
+    db.add(rule)
+    debit = Transaction(
+        account_id=bank.id, transaction_date=payment_date, description="較早銀行扣款",
+        amount=Decimal("-16188"), currency="TWD", fx_rate=Decimal("1"),
+        base_amount=Decimal("-16188"), transaction_kind="expense",
+        fingerprint="reuse-old-bank-debit", source="csv",
+    )
+    purchase = Transaction(
+        account_id=card.id, transaction_date=today - timedelta(days=1),
+        description="較晚信用卡消費", amount=Decimal("-16188"), currency="TWD",
+        fx_rate=Decimal("1"), base_amount=Decimal("-16188"),
+        transaction_kind="expense", fingerprint="reuse-later-card-purchase", source="gmail",
+    )
+    db.add_all([debit, purchase])
+    db.commit()
+    assert _refresh_current_gmail_card_balance(db, rule, today) == Decimal("16188")
+
+    with pytest.raises(HTTPException) as invalid:
+        create_loan_payment(LoanPaymentCreate(
+            payment_account_id=bank.id, loan_account_id=card.id,
+            payment_date=payment_date, principal=Decimal("16188"), interest=Decimal("0"),
+            existing_payment_transaction_id=debit.id,
+        ), db)
+    assert invalid.value.status_code == 422
+    assert db.query(CreditCardPayment).count() == 0
+    assert not db.scalars(select(TransferLink)).all()
+    db.close()
+
+
+def test_auto_pay_marks_lone_imported_bank_debit_for_review_without_second_debit() -> None:
+    db = make_session()
+    today = taipei_today()
+    bank = Account(name="付款銀行", account_type="bank", nature="asset", currency="TWD")
+    card = Account(name="信用卡", account_type="credit_card", nature="liability", currency="TWD")
+    db.add_all([bank, card])
+    db.flush()
+    create_balance_snapshot(db, bank, Decimal("13812"), today)
+    create_balance_snapshot(db, card, Decimal("16188"), today)
+    rule = EmailCardRule(
+        name="信用卡", card_account_id=card.id, payment_account_id=bank.id,
+        auto_pay=True, active=True, created_at=datetime.combine(today - timedelta(days=1), datetime.min.time()),
+    )
+    db.add(rule)
+    db.flush()
+    bill = CreditCardBill(
+        rule_id=rule.id, card_account_id=card.id, payment_account_id=bank.id,
+        statement_date=today - timedelta(days=10), due_date=today,
+        amount_due=Decimal("16188"), currency="TWD", status="pending",
+    )
+    debit = Transaction(
+        account_id=bank.id, transaction_date=today, description="已匯入信用卡扣款",
+        amount=Decimal("-16188"), currency="TWD", fx_rate=Decimal("1"),
+        base_amount=Decimal("-16188"), transaction_kind="expense",
+        fingerprint="auto-pay-existing-bank-debit", source="csv",
+    )
+    db.add_all([bill, debit])
+    db.commit()
+    bank_snapshot_ids = db.scalars(select(BalanceSnapshot.id).where(
+        BalanceSnapshot.account_id == bank.id
+    )).all()
+
+    first = process_due_card_bills(db, today)
+    second = process_due_card_bills(db, today)
+
+    assert first["paid"] == 0
+    assert first["needs_review"] == 1
+    assert second["checked"] == 0
+    assert bill.status == "needs_review"
+    assert "扣款" in bill.last_error
+    assert [row.id for row in db.scalars(select(Transaction).where(
+        Transaction.account_id == bank.id
+    )).all()] == [debit.id]
+    assert not db.scalars(select(Transaction).where(
+        Transaction.source == "gmail_autopay"
+    )).all()
+    assert db.scalars(select(BalanceSnapshot.id).where(
+        BalanceSnapshot.account_id == bank.id
+    )).all() == bank_snapshot_ids
+    assert decimal_amount(get_latest_balance(db, bank.id)) == Decimal("13812")
+    assert db.query(CreditCardPayment).count() == 0
     db.close()
 
 

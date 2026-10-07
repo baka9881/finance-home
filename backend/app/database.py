@@ -360,6 +360,33 @@ class CreditCardBill(Base, TimestampMixin):
     transfer_link: Mapped["TransferLink | None"] = relationship()
 
 
+class CreditCardPayment(Base, TimestampMixin):
+    """A recorded transfer into a card, kept separate from Gmail purchases."""
+
+    __tablename__ = "credit_card_payments"
+    __table_args__ = (UniqueConstraint("transfer_link_id", name="uq_card_payment_transfer"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    card_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"), index=True)
+    payment_account_id: Mapped[int] = mapped_column(ForeignKey("accounts.id"))
+    bill_id: Mapped[int | None] = mapped_column(ForeignKey("credit_card_bills.id"), index=True)
+    transfer_link_id: Mapped[int] = mapped_column(ForeignKey("transfer_links.id"))
+    payment_date: Mapped[date] = mapped_column(Date, index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+
+
+class CreditCardPaymentAllocation(Base, TimestampMixin):
+    """The part of a payment permanently applied to one statement."""
+
+    __tablename__ = "credit_card_payment_allocations"
+    __table_args__ = (UniqueConstraint("payment_id", "bill_id", name="uq_card_payment_bill"),)
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    payment_id: Mapped[int] = mapped_column(ForeignKey("credit_card_payments.id"), index=True)
+    bill_id: Mapped[int] = mapped_column(ForeignKey("credit_card_bills.id"), index=True)
+    amount: Mapped[Decimal] = mapped_column(Numeric(18, 2))
+
+
 class ValuationSnapshot(Base, TimestampMixin):
     __tablename__ = "valuation_snapshots"
 

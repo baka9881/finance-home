@@ -24,6 +24,8 @@ from .database import (
     Account,
     AppSetting,
     CreditCardBill,
+    CreditCardPayment,
+    CreditCardPaymentAllocation,
     EmailCardRule,
     EmailImportRecord,
     Transaction,
@@ -51,6 +53,10 @@ GMAIL_AUTHORIZE_URL = "https://accounts.google.com/o/oauth2/v2/auth"
 GMAIL_TOKEN_URL = "https://oauth2.googleapis.com/token"
 GMAIL_API_URL = "https://gmail.googleapis.com/gmail/v1/users/me"
 ZERO = Decimal("0")
+
+
+def taipei_today() -> date:
+    return datetime.now(TAIPEI).date()
 
 
 class GmailReconnectRequired(ValueError):
@@ -899,20 +905,12 @@ def gmail_card_balance_value(
     replacement: tuple[int, dict[str, Any]] | None = None,
 ) -> Decimal | None:
     """Rebuild liability from unpaid statements plus the still-open billing cycle."""
-    as_of = as_of or date.today()
+    as_of = as_of or taipei_today()
     bills = db.scalars(
         select(CreditCardBill)
         .where(CreditCardBill.rule_id == rule.id)
         .order_by(CreditCardBill.statement_date, CreditCardBill.due_date, CreditCardBill.id)
     ).all()
-    unpaid_total = sum(
-        (
-            decimal_value(item.amount_due)
-            for item in bills
-            if item.status in {"pending", "insufficient_funds", "needs_review"}
-        ),
-        ZERO,
-    )
     latest_bill_anchor = _latest_bill_anchor(db, bills)
     if latest_bill_anchor:
         open_cycle_start = latest_bill_anchor + timedelta(days=1)
@@ -922,6 +920,15 @@ def gmail_card_balance_value(
             open_cycle_start, _ = card_cycle_bounds(as_of, closing_day)
         else:
             open_cycle_start = None
+    bill_payments, open_payments = card_payment_allocations(db, rule, bills, as_of, open_cycle_start)
+    unpaid_total = sum(
+        (
+            max(ZERO, decimal_value(item.amount_due) - bill_payments.get(item.id, ZERO))
+            for item in bills
+            if item.status in {"pending", "insufficient_funds", "needs_review"}
+        ),
+        ZERO,
+    )
     transaction_filters = [
         Transaction.account_id == rule.card_account_id,
         Transaction.transaction_date <= as_of,
@@ -953,13 +960,13 @@ def gmail_card_balance_value(
             amounts.append(decimal_value(values["amount"]))
     if not has_history:
         return None
-    return max(ZERO, unpaid_total + max(ZERO, -sum(amounts, ZERO)))
+    return max(ZERO, unpaid_total + max(ZERO, -sum(amounts, ZERO) - open_payments))
 
 
 def _refresh_current_gmail_card_balance(
     db: Session, rule: EmailCardRule, as_of: date | None = None
 ) -> Decimal | None:
-    as_of = as_of or date.today()
+    as_of = as_of or taipei_today()
     balance = gmail_card_balance_value(db, rule, as_of)
     if balance is None:
         return None
@@ -1025,6 +1032,162 @@ def _latest_bill_anchor(db: Session, bills: list[CreditCardBill]) -> date | None
     return max(anchors) if anchors else None
 
 
+def card_payment_allocations(
+    db: Session,
+    rule: EmailCardRule,
+    bills: list[CreditCardBill],
+    as_of: date,
+    open_cycle_start: date | None,
+) -> tuple[dict[int, Decimal], Decimal]:
+    """Read durable statement allocations, then the unallocated open-cycle part."""
+    assign_unallocated_card_payments(db, rule, as_of)
+    allocations: dict[int, Decimal] = {bill.id: ZERO for bill in bills}
+    bill_by_id = {bill.id: bill for bill in bills}
+    primary_rule_id = db.scalar(select(EmailCardRule.id).where(
+        EmailCardRule.card_account_id == rule.card_account_id,
+        EmailCardRule.active.is_(True),
+    ).order_by(EmailCardRule.id)) or rule.id
+    payments = db.scalars(
+        select(CreditCardPayment)
+        .where(
+            CreditCardPayment.card_account_id == rule.card_account_id,
+            CreditCardPayment.payment_date <= as_of,
+        )
+        .order_by(CreditCardPayment.payment_date, CreditCardPayment.id)
+    ).all()
+    payment_ids = [payment.id for payment in payments]
+    spent = {payment.id: ZERO for payment in payments}
+    for row in db.scalars(select(CreditCardPaymentAllocation).where(
+        CreditCardPaymentAllocation.payment_id.in_(payment_ids)
+    )).all():
+        spent[row.payment_id] += decimal_value(row.amount)
+        if row.bill_id in bill_by_id:
+            allocations[row.bill_id] += decimal_value(row.amount)
+    allocations = {
+        bill.id: min(decimal_value(bill.amount_due), allocations[bill.id])
+        for bill in bills
+    }
+    open_payments = ZERO
+    for payment in payments:
+        if payment.bill_id is not None and payment.bill_id not in bill_by_id:
+            continue
+        if payment.bill_id is None and rule.id != primary_rule_id:
+            continue
+        remaining = max(ZERO, decimal_value(payment.amount) - spent[payment.id])
+        if remaining > ZERO and (open_cycle_start is None or payment.payment_date >= open_cycle_start):
+            open_payments += remaining
+    return allocations, open_payments
+
+
+def assign_unallocated_card_payments(
+    db: Session, rule: EmailCardRule, as_of: date | None = None
+) -> None:
+    """Persist every bill portion before a payment changes bill status.
+
+    Later imports can claim only a payment's remaining unallocated amount.
+    Paid statements retain their portions and cannot redirect them to new debt.
+    """
+    as_of = as_of or taipei_today()
+    db.flush()
+    primary_rule_id = db.scalar(select(EmailCardRule.id).where(
+        EmailCardRule.card_account_id == rule.card_account_id,
+        EmailCardRule.active.is_(True),
+    ).order_by(EmailCardRule.id)) or rule.id
+    bills = db.scalars(
+        select(CreditCardBill)
+        .where(CreditCardBill.rule_id == rule.id)
+        .order_by(CreditCardBill.due_date, CreditCardBill.id)
+    ).all()
+    payments = db.scalars(
+        select(CreditCardPayment)
+        .where(
+            CreditCardPayment.card_account_id == rule.card_account_id,
+            CreditCardPayment.payment_date <= as_of,
+        )
+        .order_by(CreditCardPayment.payment_date, CreditCardPayment.id)
+    ).all()
+    bill_by_id = {bill.id: bill for bill in bills}
+    applied = {bill.id: ZERO for bill in bills}
+    spent = {payment.id: ZERO for payment in payments}
+    existing = {}
+    for allocation in db.scalars(select(CreditCardPaymentAllocation).where(
+        CreditCardPaymentAllocation.payment_id.in_(list(spent))
+    )).all():
+        spent[allocation.payment_id] += decimal_value(allocation.amount)
+        existing[(allocation.payment_id, allocation.bill_id)] = allocation
+        if allocation.bill_id in applied:
+            applied[allocation.bill_id] += decimal_value(allocation.amount)
+    for payment in payments:
+        if payment.bill_id is not None and payment.bill_id not in bill_by_id:
+            continue
+        if payment.bill_id is None and rule.id != primary_rule_id:
+            continue
+        remaining = max(ZERO, decimal_value(payment.amount) - spent[payment.id])
+        candidates = [bill_by_id[payment.bill_id]] if payment.bill_id in bill_by_id else []
+        candidates.extend(
+            bill for bill in bills
+            if bill not in candidates
+            and bill.status in {"pending", "insufficient_funds", "needs_review"}
+            and (anchor := _bill_anchor_date(db, bill)) is not None
+            and anchor <= payment.payment_date
+        )
+        for bill in candidates:
+            amount = min(remaining, max(ZERO, decimal_value(bill.amount_due) - applied[bill.id]))
+            if amount <= ZERO:
+                continue
+            key = (payment.id, bill.id)
+            allocation = existing.get(key)
+            if allocation:
+                allocation.amount = decimal_value(allocation.amount) + amount
+            else:
+                allocation = CreditCardPaymentAllocation(payment_id=payment.id, bill_id=bill.id, amount=amount)
+                db.add(allocation)
+                existing[key] = allocation
+            if payment.bill_id is None:
+                payment.bill_id = bill.id
+            applied[bill.id] += amount
+            remaining -= amount
+            if remaining <= ZERO:
+                break
+    db.flush()
+
+
+def repair_linked_card_payments(db: Session) -> int:
+    """Recognize already-recorded transfers to cards without debiting cash again."""
+    known_links = set(db.scalars(select(CreditCardPayment.transfer_link_id)).all())
+    added = 0
+    for link in db.scalars(select(TransferLink).where(TransferLink.confirmed.is_(True))).all():
+        if link.id in known_links:
+            continue
+        incoming = db.get(Transaction, link.to_transaction_id)
+        outgoing = db.get(Transaction, link.from_transaction_id)
+        if not incoming or not outgoing or incoming.excluded or outgoing.excluded:
+            continue
+        card = db.get(Account, incoming.account_id)
+        source = db.get(Account, outgoing.account_id)
+        if not card or not source or card.account_type != "credit_card" or source.nature != "asset":
+            continue
+        if decimal_value(incoming.amount) <= ZERO or decimal_value(outgoing.amount) >= ZERO:
+            continue
+        bill = db.scalar(select(CreditCardBill).where(CreditCardBill.transfer_link_id == link.id))
+        db.add(CreditCardPayment(
+            card_account_id=card.id,
+            payment_account_id=source.id,
+            bill_id=bill.id if bill else None,
+            transfer_link_id=link.id,
+            payment_date=incoming.transaction_date,
+            amount=decimal_value(incoming.amount),
+        ))
+        known_links.add(link.id)
+        added += 1
+    if added:
+        db.flush()
+        for rule in db.scalars(select(EmailCardRule).where(EmailCardRule.active.is_(True))).all():
+            assign_unallocated_card_payments(db, rule)
+        db.flush()
+    return added
+
+
 def repair_duplicate_card_bills(db: Session) -> dict[str, int]:
     """Keep one bill per card and due date so historical imports cannot pay twice."""
     groups = db.execute(
@@ -1050,6 +1213,22 @@ def repair_duplicate_card_bills(db: Session) -> dict[str, int]:
         for bill in bills:
             if bill.id == canonical.id or bill.status == "duplicate":
                 continue
+            for payment in db.scalars(
+                select(CreditCardPayment).where(CreditCardPayment.bill_id == bill.id)
+            ).all():
+                payment.bill_id = canonical.id
+            for allocation in db.scalars(select(CreditCardPaymentAllocation).where(
+                CreditCardPaymentAllocation.bill_id == bill.id
+            )).all():
+                canonical_allocation = db.scalar(select(CreditCardPaymentAllocation).where(
+                    CreditCardPaymentAllocation.payment_id == allocation.payment_id,
+                    CreditCardPaymentAllocation.bill_id == canonical.id,
+                ))
+                if canonical_allocation:
+                    canonical_allocation.amount = decimal_value(canonical_allocation.amount) + decimal_value(allocation.amount)
+                    db.delete(allocation)
+                else:
+                    allocation.bill_id = canonical.id
             bill.status = "duplicate"
             bill.last_error = "同一繳款日的重複帳單已合併，不會再次扣款"
             merged += 1
@@ -1098,11 +1277,21 @@ def _create_or_update_bill(
         rule.closing_day = bill.statement_date.day
     rule.payment_due_day = bill.due_date.day
     rebuild_card_billing_periods(db, rule)
+    db.flush()
+    assign_unallocated_card_payments(db, rule)
+    db.flush()
+    bills = db.scalars(select(CreditCardBill).where(CreditCardBill.rule_id == rule.id)).all()
+    bill_payments, _ = card_payment_allocations(db, rule, bills, taipei_today(), None)
+    if bill.status in {"pending", "insufficient_funds", "needs_review"} and (
+        bill_payments.get(bill.id, ZERO) >= decimal_value(bill.amount_due)
+    ):
+        bill.status = "paid"
+        bill.last_error = None
     return created
 
 
 def process_due_card_bills(db: Session, today: date | None = None) -> dict[str, Any]:
-    today = today or date.today()
+    today = today or taipei_today()
     rows = db.scalars(
         select(CreditCardBill)
         .join(EmailCardRule)
@@ -1139,7 +1328,13 @@ def process_due_card_bills(db: Session, today: date | None = None) -> dict[str, 
         card_latest = get_latest_balance(db, card_account.id)
         payment_balance = decimal_value(payment_latest.amount) if payment_latest else ZERO
         card_balance = decimal_value(card_latest.amount) if card_latest else ZERO
-        amount = decimal_value(bill.amount_due)
+        rule_bills = db.scalars(select(CreditCardBill).where(CreditCardBill.rule_id == bill.rule_id)).all()
+        bill_payments, _ = card_payment_allocations(db, bill.rule, rule_bills, today, None)
+        amount = max(ZERO, decimal_value(bill.amount_due) - bill_payments.get(bill.id, ZERO))
+        if amount <= ZERO:
+            bill.status = "paid"
+            bill.last_error = None
+            continue
         description = f"信用卡自動繳款（{bill.rule.name}）"
         out_description = f"{description} → {card_account.name}"
         in_description = f"{description} ← {payment_account.name}"
@@ -1157,6 +1352,26 @@ def process_due_card_bills(db: Session, today: date | None = None) -> dict[str, 
         if existing_payment:
             bill.status = "paid"
             bill.last_error = None
+            continue
+        # An imported bank debit can precede its card-side transfer.  Do not
+        # subtract the bank balance a second time while that debit is unresolved.
+        possible_bank_debits = db.scalars(select(Transaction).where(
+            Transaction.account_id == payment_account.id,
+            Transaction.transaction_date >= bill.due_date - timedelta(days=14),
+            Transaction.transaction_date <= bill.due_date + timedelta(days=3),
+            Transaction.amount == -amount,
+            Transaction.currency == bill.currency,
+            Transaction.source.in_(["manual", "csv"]),
+            Transaction.transaction_kind.in_(["expense", "transfer"]),
+            Transaction.excluded.is_(False),
+        )).all()
+        if any(not db.scalar(select(TransferLink.id).where(
+            (TransferLink.from_transaction_id == row.id)
+            | (TransferLink.to_transaction_id == row.id)
+        )) for row in possible_bank_debits):
+            bill.status = "needs_review"
+            bill.last_error = "付款帳戶已有相同金額的扣款，請先配對信用卡繳款，未重複扣款"
+            needs_review += 1
             continue
         if payment_balance < amount:
             bill.status = "insufficient_funds"
@@ -1207,11 +1422,26 @@ def process_due_card_bills(db: Session, today: date | None = None) -> dict[str, 
         )
         db.add(link)
         db.flush()
+        db.add(CreditCardPayment(
+            card_account_id=card_account.id,
+            payment_account_id=payment_account.id,
+            bill_id=bill.id,
+            transfer_link_id=link.id,
+            payment_date=bill.due_date,
+            amount=amount,
+        ))
+        db.flush()
+        assign_unallocated_card_payments(db, bill.rule, today)
+        snapshot_date = max(
+            today, bill.due_date,
+            payment_latest.snapshot_date if payment_latest else bill.due_date,
+            card_latest.snapshot_date if card_latest else bill.due_date,
+        )
         create_balance_snapshot(
             db,
             payment_account,
             payment_balance - amount,
-            bill.due_date,
+            snapshot_date,
             rate,
             source="gmail_autopay",
         )
@@ -1219,7 +1449,7 @@ def process_due_card_bills(db: Session, today: date | None = None) -> dict[str, 
             db,
             card_account,
             max(ZERO, card_balance - amount),
-            bill.due_date,
+            snapshot_date,
             rate,
             source="gmail_autopay",
         )
@@ -1452,7 +1682,7 @@ def serialize_email_rule(rule: EmailCardRule) -> dict[str, Any]:
     }
 
 
-def serialize_card_bill(bill: CreditCardBill) -> dict[str, Any]:
+def serialize_card_bill(bill: CreditCardBill, payments_total: Decimal = ZERO) -> dict[str, Any]:
     return {
         "id": bill.id,
         "rule_id": bill.rule_id,
@@ -1464,6 +1694,11 @@ def serialize_card_bill(bill: CreditCardBill) -> dict[str, Any]:
         "period_end": bill.period_end,
         "due_date": bill.due_date,
         "amount_due": float(bill.amount_due),
+        "payments_total": float(payments_total),
+        "remaining_due": float(
+            ZERO if bill.status == "paid"
+            else max(ZERO, decimal_value(bill.amount_due) - payments_total)
+        ),
         "currency": bill.currency,
         "status": bill.status,
         "last_error": bill.last_error,
@@ -1473,7 +1708,7 @@ def serialize_card_bill(bill: CreditCardBill) -> dict[str, Any]:
 def serialize_card_cycle(
     db: Session, rule: EmailCardRule, as_of: date | None = None
 ) -> dict[str, Any]:
-    as_of = as_of or date.today()
+    as_of = as_of or taipei_today()
     rebuild_card_billing_periods(db, rule)
     bills = db.scalars(
         select(CreditCardBill)
@@ -1501,6 +1736,7 @@ def serialize_card_cycle(
     else:
         open_start = None
         open_end = None
+    bill_payments, open_payments = card_payment_allocations(db, rule, bills, as_of, open_start)
     activity_end = min(as_of, open_end) if open_end else as_of
     open_filters = [
         Transaction.account_id == rule.card_account_id,
@@ -1516,16 +1752,18 @@ def serialize_card_cycle(
         else []
     )
     open_amount = max(
-        ZERO, -sum((decimal_value(item.amount) for item in open_rows), ZERO)
+        ZERO, -sum((decimal_value(item.amount) for item in open_rows), ZERO) - open_payments
     )
     open_cycle = {
         "amount": float(open_amount),
+        "payments_total": float(open_payments),
         "period_start": open_start,
         "period_end": open_end,
         "transaction_count": len(open_rows),
     }
     empty_cycle = {
         "amount": 0.0,
+        "payments_total": 0.0,
         "period_start": None,
         "period_end": None,
         "transaction_count": 0,
@@ -1551,13 +1789,14 @@ def serialize_card_cycle(
         "rule_name": rule.name,
         "card_account_id": rule.card_account_id,
         "card_account_name": rule.card_account.name,
+        "payment_account_id": rule.payment_account_id,
         "currency": rule.card_account.currency,
         "closing_day": closing_day,
         "cycle_boundary_known": closing_day is not None,
         "payment_due_day": rule.payment_due_day,
         "current_cycle": current_cycle,
         "unbilled": open_cycle,
-        "current_bill": serialize_card_bill(current_bill) if current_bill else None,
-        "last_paid_bill": serialize_card_bill(last_paid) if last_paid else None,
+        "current_bill": serialize_card_bill(current_bill, bill_payments.get(current_bill.id, ZERO)) if current_bill else None,
+        "last_paid_bill": serialize_card_bill(last_paid, bill_payments.get(last_paid.id, ZERO)) if last_paid else None,
         "next_cycle": open_cycle if current_bill else empty_cycle,
     }

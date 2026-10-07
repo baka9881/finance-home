@@ -44,6 +44,7 @@ from .database import (
     ClassificationRule,
     LearnedClassificationRule,
     CreditCardBill,
+    CreditCardPayment,
     EmailCardRule,
     FxRate,
     Goal,
@@ -127,7 +128,11 @@ from .services import (
     DEFAULT_RULES,
 )
 from .email_sync import (
+    _bill_anchor_date,
     _refresh_current_gmail_card_balance,
+    assign_unallocated_card_payments,
+    card_payment_allocations,
+    gmail_card_balance_value,
     analyze_card_email_screenshot_text,
     complete_gmail_authorization,
     disconnect_gmail,
@@ -138,12 +143,14 @@ from .email_sync import (
     gmail_card_provider,
     gmail_status,
     process_due_card_bills,
+    repair_linked_card_payments,
     repair_duplicate_card_bills,
     rebuild_card_billing_periods,
     serialize_card_cycle,
     serialize_card_bill,
     serialize_email_rule,
     sync_gmail,
+    taipei_today,
     usable_email_rules,
 )
 from .transaction_corrections import require_editable, plan_correction, public_plan, commit_correction
@@ -197,6 +204,7 @@ async def lifespan(_: FastAPI):
         repair_linked_transfer_kinds(db)
         repair_cross_source_card_duplicates(db)
         repair_duplicate_card_bills(db)
+        repair_linked_card_payments(db)
         adjusted_email_balances = False
         for rule in usable_email_rules(db):
             if _refresh_current_gmail_card_balance(db, rule) is not None:
@@ -1288,57 +1296,178 @@ def confirm_transfer(payload: TransferCreate, db: DB):
         raise HTTPException(422, "已排除的交易不能配對轉帳")
     if left.account_id == right.account_id:
         raise HTTPException(422, "轉帳必須發生在不同帳戶")
+    already_linked = db.scalar(select(TransferLink).where(
+        TransferLink.confirmed.is_(True),
+        (
+            (TransferLink.from_transaction_id.in_([left.id, right.id]))
+            | (TransferLink.to_transaction_id.in_([left.id, right.id]))
+        ),
+    ))
+    if already_linked:
+        raise HTTPException(409, "這筆交易已經配對轉帳")
     if abs(decimal_value(left.base_amount) + decimal_value(right.base_amount)) > Decimal("2"):
         raise HTTPException(422, "兩筆交易的換算金額不相符")
+    outgoing, incoming = (left, right) if decimal_value(left.amount) < 0 else (right, left)
     link = TransferLink(
-        from_transaction_id=left.id, to_transaction_id=right.id, confirmed=True
+        from_transaction_id=outgoing.id, to_transaction_id=incoming.id, confirmed=True
     )
     left.transaction_kind = "transfer"
     right.transaction_kind = "transfer"
     db.add(link)
+    db.flush()
+    if repair_linked_card_payments(db):
+        refreshed = False
+        for rule in db.scalars(select(EmailCardRule).where(EmailCardRule.active.is_(True))).all():
+            if _refresh_current_gmail_card_balance(db, rule) is not None:
+                refreshed = True
+        if refreshed:
+            record_valuation(db)
     db.commit()
     return {"id": link.id}
+
+
+@app.get("/api/card-payment-candidates")
+def card_payment_candidates(card_account_id: int, payment_account_id: int, db: DB):
+    """Show unlinked debits that can be reused for a card payment."""
+    card = require_account(db, card_account_id)
+    payment_account = require_account(db, payment_account_id)
+    if card.account_type != "credit_card" or card.nature != "liability":
+        raise HTTPException(422, "請選擇信用卡帳戶")
+    if payment_account.nature != "asset" or payment_account.currency != card.currency:
+        raise HTTPException(422, "付款帳戶必須是同幣別資產帳戶")
+    linked_ids = linked_transfer_transaction_ids(db)
+    rows = db.scalars(
+        select(Transaction)
+        .where(
+            Transaction.account_id == payment_account.id,
+            Transaction.amount < 0,
+            Transaction.currency == card.currency,
+            Transaction.transaction_date <= taipei_today(),
+            Transaction.excluded.is_(False),
+            Transaction.source.in_(["manual", "csv"]),
+            Transaction.transaction_kind.in_(["expense", "transfer"]),
+        )
+        .order_by(Transaction.transaction_date.desc(), Transaction.id.desc())
+        .limit(200)
+    ).all()
+    return [
+        {
+            "id": row.id,
+            "transaction_date": row.transaction_date,
+            "description": row.description,
+            "amount": float(row.amount),
+            "source": row.source,
+        }
+        for row in rows if row.id not in linked_ids
+    ]
 
 
 @app.post("/api/loan-payments", status_code=201)
 def create_loan_payment(payload: LoanPaymentCreate, db: DB):
     payment_account = require_account(db, payload.payment_account_id)
     loan_account = require_account(db, payload.loan_account_id)
+    is_credit_card_payment = loan_account.account_type == "credit_card"
     if payment_account.id == loan_account.id:
         raise HTTPException(422, "付款帳戶與貸款帳戶不能相同")
     if payment_account.archived or loan_account.archived:
-        raise HTTPException(422, "封存帳戶不能建立貸款還款")
+        raise HTTPException(422, "封存帳戶不能建立還款")
     if payment_account.nature != "asset":
         raise HTTPException(422, "付款帳戶必須是資產帳戶")
     if loan_account.nature != "liability":
-        raise HTTPException(422, "貸款帳戶必須是負債帳戶")
+        raise HTTPException(422, "還款帳戶必須是負債帳戶")
     if payment_account.currency != loan_account.currency:
-        raise HTTPException(422, "目前貸款還款先支援同幣別帳戶")
+        raise HTTPException(422, "目前還款先支援同幣別帳戶")
+    if payload.bill_id is not None and not is_credit_card_payment:
+        raise HTTPException(422, "只有信用卡繳款可以指定帳單")
+    if payload.existing_payment_transaction_id is not None and not is_credit_card_payment:
+        raise HTTPException(422, "只有信用卡繳款可以使用既有扣款")
 
     principal = decimal_value(payload.principal)
     interest = decimal_value(payload.interest)
     total = principal + interest
     if total <= 0:
         raise HTTPException(422, "本金或利息至少要填一項")
+    if is_credit_card_payment and (principal <= 0 or interest > 0):
+        raise HTTPException(422, "信用卡繳款只需填入繳款金額")
 
     payment_date = payload.payment_date
+    if is_credit_card_payment and payment_date > taipei_today():
+        raise HTTPException(422, "尚未發生的信用卡繳款不能提前記帳")
     rate, estimated = latest_fx_rate(db, payment_account.currency, payment_date)
-    description = (payload.description or "貸款還款").strip()
+    description = (payload.description or ("信用卡繳款" if is_credit_card_payment else "貸款還款")).strip()
     created_ids: list[int] = []
 
     try:
+        if is_credit_card_payment:
+            db.scalar(select(Account).where(Account.id == loan_account.id).with_for_update())
         payment_latest = get_latest_balance(db, payment_account.id)
         loan_latest = get_latest_balance(db, loan_account.id)
         payment_current = (
             decimal_value(payment_latest.amount) if payment_latest else Decimal("0")
         )
         loan_current = decimal_value(loan_latest.amount) if loan_latest else Decimal("0")
+        rule = db.scalar(select(EmailCardRule).where(
+            EmailCardRule.card_account_id == loan_account.id,
+            EmailCardRule.active.is_(True),
+        ).order_by(EmailCardRule.id)) if is_credit_card_payment else None
+        if is_credit_card_payment:
+            if rule:
+                calculated = gmail_card_balance_value(db, rule)
+                if calculated is not None:
+                    loan_current = calculated
+                has_formal_bill = db.scalar(select(CreditCardBill.id).where(
+                    CreditCardBill.rule_id == rule.id
+                )) is not None
+                if not has_formal_bill:
+                    debt_on_payment_date = gmail_card_balance_value(db, rule, payment_date)
+                    if calculated is not None and principal > (debt_on_payment_date or Decimal("0")) + Decimal("0.01"):
+                        raise HTTPException(422, "繳款日之前的信用卡欠款不足，請確認扣款日期")
+            if principal > loan_current + Decimal("0.01"):
+                raise HTTPException(422, "繳款金額不能高於目前信用卡欠款")
+            if payload.bill_id is not None:
+                selected_bill = db.get(CreditCardBill, payload.bill_id)
+                if not selected_bill or selected_bill.card_account_id != loan_account.id or selected_bill.status in {"paid", "duplicate"}:
+                    raise HTTPException(422, "這份帳單無法記錄繳款")
+                if selected_bill.statement_date and payment_date < selected_bill.statement_date:
+                    raise HTTPException(422, "扣款日期早於這份帳單的結帳日，請確認帳單")
+            elif payload.existing_payment_transaction_id is not None and rule:
+                pending_bills = db.scalars(select(CreditCardBill).where(
+                    CreditCardBill.rule_id == rule.id,
+                    CreditCardBill.status.in_(["pending", "insufficient_funds", "needs_review"]),
+                )).all()
+                if any(_bill_anchor_date(db, bill) is None for bill in pending_bills):
+                    raise HTTPException(422, "帳單帳期未知，請勾選這筆扣款用來銷帳目前帳單")
+
+        existing_debit = None
+        if payload.existing_payment_transaction_id is not None:
+            existing_debit = db.scalar(select(Transaction).where(
+                Transaction.id == payload.existing_payment_transaction_id
+            ).with_for_update())
+            if (
+                not existing_debit
+                or existing_debit.account_id != payment_account.id
+                or existing_debit.excluded
+                or existing_debit.source not in {"manual", "csv"}
+                or existing_debit.transaction_kind not in {"expense", "transfer"}
+                or existing_debit.currency != payment_account.currency
+                or decimal_value(existing_debit.amount) != -principal
+                or existing_debit.transaction_date != payment_date
+            ):
+                raise HTTPException(422, "既有扣款與付款帳戶、日期或金額不符")
+            linked = db.scalar(select(TransferLink).where(
+                (TransferLink.from_transaction_id == existing_debit.id)
+                | (TransferLink.to_transaction_id == existing_debit.id)
+            ))
+            if linked:
+                raise HTTPException(409, "這筆扣款已經配對轉帳")
 
         principal_out = None
         principal_in = None
         if principal > 0:
-            principal_out_description = f"{description}（本金）"
-            principal_out = Transaction(
+            principal_out_description = (
+                f"{description} → {loan_account.name}" if is_credit_card_payment else f"{description}（本金）"
+            )
+            principal_out = existing_debit or Transaction(
                 account_id=payment_account.id,
                 transaction_date=payment_date,
                 description=principal_out_description,
@@ -1347,7 +1476,7 @@ def create_loan_payment(payload: LoanPaymentCreate, db: DB):
                 fx_rate=rate,
                 base_amount=-principal * rate,
                 fx_estimated=estimated,
-                transaction_kind="debt_principal",
+                transaction_kind="transfer" if is_credit_card_payment else "debt_principal",
                 fingerprint=transaction_fingerprint(
                     payment_account.id,
                     payment_date,
@@ -1357,7 +1486,12 @@ def create_loan_payment(payload: LoanPaymentCreate, db: DB):
                 source="manual",
                 note=payload.note,
             )
-            principal_in_description = f"{description}（沖抵本金）"
+            if existing_debit:
+                principal_out.transaction_kind = "transfer"
+                principal_out.category_id = None
+            principal_in_description = (
+                f"{description} ← {payment_account.name}" if is_credit_card_payment else f"{description}（沖抵本金）"
+            )
             principal_in = Transaction(
                 account_id=loan_account.id,
                 transaction_date=payment_date,
@@ -1377,7 +1511,8 @@ def create_loan_payment(payload: LoanPaymentCreate, db: DB):
                 source="manual",
                 note=payload.note,
             )
-            db.add(principal_out)
+            if not existing_debit:
+                db.add(principal_out)
             db.add(principal_in)
 
         if interest > 0:
@@ -1406,34 +1541,60 @@ def create_loan_payment(payload: LoanPaymentCreate, db: DB):
         db.flush()
 
         if principal_out is not None and principal_in is not None:
-            db.add(
-                TransferLink(
-                    from_transaction_id=principal_out.id,
-                    to_transaction_id=principal_in.id,
-                    confirmed=True,
-                )
+            link = TransferLink(
+                from_transaction_id=principal_out.id,
+                to_transaction_id=principal_in.id,
+                confirmed=True,
             )
+            db.add(link)
+            db.flush()
+            if is_credit_card_payment:
+                db.add(CreditCardPayment(
+                    card_account_id=loan_account.id,
+                    payment_account_id=payment_account.id,
+                    bill_id=payload.bill_id,
+                    transfer_link_id=link.id,
+                    payment_date=payment_date,
+                    amount=principal,
+                ))
+                db.flush()
             created_ids.extend([principal_out.id, principal_in.id])
         if interest > 0:
             created_ids.append(interest_row.id)
+        if is_credit_card_payment and rule:
+            assign_unallocated_card_payments(db, rule)
+            db.flush()
 
-        create_balance_snapshot(
-            db,
-            payment_account,
-            next_balance_amount(payment_account, payment_current, -total),
-            payment_date,
-            rate,
-            source="loan_payment",
-        )
-        if principal > 0:
+        snapshot_date = max(taipei_today(), payment_date,
+                            payment_latest.snapshot_date if payment_latest else payment_date,
+                            loan_latest.snapshot_date if loan_latest else payment_date) if is_credit_card_payment else payment_date
+        if not existing_debit:
             create_balance_snapshot(
                 db,
-                loan_account,
-                next_balance_amount(loan_account, loan_current, principal),
-                payment_date,
+                payment_account,
+                next_balance_amount(payment_account, payment_current, -total),
+                snapshot_date,
                 rate,
-                source="loan_payment",
+                source="credit_card_payment" if is_credit_card_payment else "loan_payment",
             )
+        if principal > 0:
+            rebuilt = _refresh_current_gmail_card_balance(db, rule, snapshot_date) if rule else None
+            if rebuilt is None:
+                create_balance_snapshot(
+                    db,
+                    loan_account,
+                    next_balance_amount(loan_account, loan_current, principal),
+                    snapshot_date,
+                    rate,
+                    source="credit_card_payment" if is_credit_card_payment else "loan_payment",
+                )
+        if is_credit_card_payment and rule:
+            bills = db.scalars(select(CreditCardBill).where(CreditCardBill.rule_id == rule.id)).all()
+            allocated, _ = card_payment_allocations(db, rule, bills, snapshot_date, None)
+            for bill in bills:
+                if bill.status in {"pending", "insufficient_funds", "needs_review"} and allocated.get(bill.id, Decimal("0")) >= decimal_value(bill.amount_due):
+                    bill.status = "paid"
+                    bill.last_error = None
         db.flush()
         recalibrate_auto_base_if_needed(db, payment_account)
         recalibrate_auto_base_if_needed(db, loan_account)
@@ -1441,7 +1602,7 @@ def create_loan_payment(payload: LoanPaymentCreate, db: DB):
         db.commit()
     except IntegrityError as exc:
         db.rollback()
-        raise HTTPException(409, "這筆貸款還款可能已經存在，請調整日期或說明後再試") from exc
+        raise HTTPException(409, "這筆還款可能已經存在，請先檢查交易紀錄") from exc
 
     return {
         "transaction_ids": created_ids,
@@ -1510,20 +1671,46 @@ def create_account_transfer(payload: AccountTransferCreate, db: DB):
     )
 
     try:
-        db.add(from_transaction)
-        db.add(to_transaction)
-        db.flush()
-
+        if to_account.account_type == "credit_card" and from_account.nature == "asset":
+            db.scalar(select(Account).where(Account.id == to_account.id).with_for_update())
         from_latest = get_latest_balance(db, from_account.id)
         to_latest = get_latest_balance(db, to_account.id)
         from_current = decimal_value(from_latest.amount) if from_latest else Decimal("0")
         to_current = decimal_value(to_latest.amount) if to_latest else Decimal("0")
+        card_payment = to_account.account_type == "credit_card" and from_account.nature == "asset"
+        rule = db.scalar(select(EmailCardRule).where(
+            EmailCardRule.card_account_id == to_account.id,
+            EmailCardRule.active.is_(True),
+        ).order_by(EmailCardRule.id)) if card_payment else None
+        if card_payment:
+            if transfer_date > taipei_today():
+                raise HTTPException(422, "尚未發生的信用卡繳款不能提前記帳")
+            calculated = gmail_card_balance_value(db, rule) if rule else None
+            card_due = calculated if calculated is not None else to_current
+            has_formal_bill = bool(rule and db.scalar(select(CreditCardBill.id).where(
+                CreditCardBill.rule_id == rule.id
+            )))
+            if rule and not has_formal_bill:
+                debt_on_transfer_date = gmail_card_balance_value(db, rule, transfer_date)
+                if calculated is not None and to_amount > (debt_on_transfer_date or Decimal("0")) + Decimal("0.01"):
+                    raise HTTPException(422, "轉帳日期之前的信用卡欠款不足，請確認日期")
+            if to_amount > card_due + Decimal("0.01"):
+                raise HTTPException(422, "轉入金額不能高於目前信用卡欠款")
+        db.add(from_transaction)
+        db.add(to_transaction)
+        db.flush()
+        snapshot_date = (
+            max(taipei_today(), transfer_date,
+                from_latest.snapshot_date if from_latest else transfer_date,
+                to_latest.snapshot_date if to_latest else transfer_date)
+            if card_payment else transfer_date
+        )
 
         create_balance_snapshot(
             db,
             from_account,
             next_balance_amount(from_account, from_current, -amount),
-            transfer_date,
+            snapshot_date,
             from_rate,
             source="transfer",
         )
@@ -1531,7 +1718,7 @@ def create_account_transfer(payload: AccountTransferCreate, db: DB):
             db,
             to_account,
             next_balance_amount(to_account, to_current, to_amount),
-            transfer_date,
+            snapshot_date,
             to_rate,
             source="transfer",
         )
@@ -1542,6 +1729,19 @@ def create_account_transfer(payload: AccountTransferCreate, db: DB):
         )
         db.add(link)
         db.flush()
+        if card_payment:
+            db.add(CreditCardPayment(
+                card_account_id=to_account.id,
+                payment_account_id=from_account.id,
+                transfer_link_id=link.id,
+                payment_date=transfer_date,
+                amount=to_amount,
+            ))
+            db.flush()
+            if rule:
+                assign_unallocated_card_payments(db, rule)
+                db.flush()
+                _refresh_current_gmail_card_balance(db, rule, snapshot_date)
         recalibrate_auto_base_if_needed(db, from_account)
         recalibrate_auto_base_if_needed(db, to_account)
         record_valuation(db)
@@ -2628,13 +2828,21 @@ def deactivate_email_card_rule(rule_id: int, db: DB):
 def list_credit_card_bills(db: DB, limit: int = Query(12, ge=1, le=100)):
     for rule in db.scalars(select(EmailCardRule).order_by(EmailCardRule.id)).all():
         rebuild_card_billing_periods(db, rule)
+    rows = db.scalars(
+        select(CreditCardBill)
+        .order_by(CreditCardBill.due_date.desc(), CreditCardBill.id.desc())
+        .limit(limit)
+    ).all()
+    allocations_by_rule: dict[int, dict[int, Decimal]] = {}
+    for item in rows:
+        if item.rule_id not in allocations_by_rule:
+            rule_bills = db.scalars(select(CreditCardBill).where(CreditCardBill.rule_id == item.rule_id)).all()
+            allocations_by_rule[item.rule_id], _ = card_payment_allocations(
+                db, item.rule, rule_bills, taipei_today(), None
+            )
     result = [
-        serialize_card_bill(item)
-        for item in db.scalars(
-            select(CreditCardBill)
-            .order_by(CreditCardBill.due_date.desc(), CreditCardBill.id.desc())
-            .limit(limit)
-        ).all()
+        serialize_card_bill(item, allocations_by_rule[item.rule_id].get(item.id, Decimal("0")))
+        for item in rows
     ]
     db.commit()
     return result

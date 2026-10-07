@@ -431,7 +431,7 @@ export default function TransactionsPage() {
         }),
       }),
     onSuccess: () => {
-      invalidateFinanceData(client, ["transactions","dashboard","transfer-suggestions"]);
+      invalidateFinanceData(client, ["transactions","accounts","dashboard","transfer-suggestions","credit-card-cycles","credit-card-bills","spending-analysis"]);
     },
   });
 
@@ -442,7 +442,7 @@ export default function TransactionsPage() {
     onSuccess: (_result, payload) => {
       rememberTransactionAccount(ownerFilter, "transfer:from", Number(payload.from_account_id));
       rememberTransactionAccount(ownerFilter, "transfer:to", Number(payload.to_account_id));
-      invalidateFinanceData(client, ["transactions","accounts","dashboard"]);
+      invalidateFinanceData(client, ["transactions","accounts","dashboard","credit-card-cycles","credit-card-bills","spending-analysis"]);
       setAccountTransferOpen(false);
       setTransferFromAccountId("");
       setTransferToAccountId("");
@@ -457,7 +457,7 @@ export default function TransactionsPage() {
     onSuccess: (_result, payload) => {
       rememberTransactionAccount(ownerFilter, "loan_payment:payment", Number(payload.payment_account_id));
       rememberTransactionAccount(ownerFilter, "loan_payment:loan", Number(payload.loan_account_id));
-      invalidateFinanceData(client, ["transactions","accounts","dashboard"]);
+      invalidateFinanceData(client, ["transactions","accounts","dashboard","credit-card-cycles","credit-card-bills","spending-analysis"]);
       setManualOpen(false);
       setManualKind("expense");
       setLoanPaymentAccountId("");

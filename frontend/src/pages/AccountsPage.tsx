@@ -61,6 +61,20 @@ const customInstitutionValue = "__custom__";
 const customAccountNameValue = "__custom_account_name__";
 const accountMutationQueryKeys = ["accounts", "dashboard", "health", "attention"];
 
+type CardPaymentCandidate = {
+  id: number;
+  transaction_date: string;
+  description: string;
+  amount: number;
+  source: string;
+};
+
+function candidateSourceLabel(source: string) {
+  if (source === "csv") return "銀行匯入";
+  if (source === "manual") return "手動記錄";
+  return "";
+}
+
 const institutionPresets: Record<string, string[]> = {
   bank: [
     "國泰世華銀行",
@@ -157,6 +171,11 @@ export default function AccountsPage() {
   const [createOpen, setCreateOpen] = useState(false);
   const [balancePickerOpen, setBalancePickerOpen] = useState(false);
   const [balanceAccount, setBalanceAccount] = useState<Account | null>(null);
+  const [cardPaymentAccount, setCardPaymentAccount] = useState<Account | null>(null);
+  const [cardPaymentSourceId, setCardPaymentSourceId] = useState("");
+  const [reuseCardPaymentDebit, setReuseCardPaymentDebit] = useState(false);
+  const [selectedCardPaymentDebitId, setSelectedCardPaymentDebitId] = useState("");
+  const [selectedCurrentBillId, setSelectedCurrentBillId] = useState<number | null>(null);
   const [detailAccount, setDetailAccount] = useState<Account | null>(null);
   const [archiveTarget, setArchiveTarget] = useState<Account | null>(null);
   const [message, setMessage] = useState("");
@@ -210,6 +229,14 @@ export default function AccountsPage() {
   function openCreateDialog() {
     resetAccountDraft();
     setCreateOpen(true);
+  }
+
+  function openCardPaymentDialog(account: Account) {
+    setCardPaymentSourceId("");
+    setReuseCardPaymentDebit(false);
+    setSelectedCardPaymentDebitId("");
+    setSelectedCurrentBillId(null);
+    setCardPaymentAccount(account);
   }
 
   function closeCreateDialog() {
@@ -295,6 +322,34 @@ export default function AccountsPage() {
     },
   });
 
+  const recordCardPayment = useMutation({
+    mutationFn: (payload: Record<string, unknown>) =>
+      api<{ payment_account?: Account; loan_account?: Account }>("/loan-payments", { method: "POST", body: JSON.stringify(payload) }),
+    onSuccess: (result, payload) => {
+      if (result.payment_account && result.loan_account) {
+        client.setQueryData<Account[]>(["accounts", ownerFilter, "including-archived"], (current) =>
+          current?.map((account) => {
+            if (account.id === result.payment_account?.id) return result.payment_account;
+            if (account.id === result.loan_account?.id) return result.loan_account;
+            return account;
+          }),
+        );
+      }
+      setCardPaymentAccount(null);
+      setMessage(payload.existing_payment_transaction_id
+        ? "已連結現有扣款並更新信用卡欠款。"
+        : "信用卡繳款已記錄，欠款與付款帳戶會同步更新。");
+      void invalidateFinanceDataSubset(client, [
+        ...accountMutationQueryKeys,
+        "card-payment-candidates",
+        "credit-card-cycles",
+        "credit-card-bills",
+        "transactions",
+        "spending-analysis",
+      ]);
+    },
+  });
+
   const deleteAccount = useMutation({
     mutationFn: (id: number) => api(`/accounts/${id}/archive`, { method: "POST" }),
     onSuccess: () => {
@@ -353,6 +408,28 @@ export default function AccountsPage() {
     });
   }
 
+  function submitCardPayment(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    if (!cardPaymentAccount || recordCardPayment.isPending) return;
+    const form = new FormData(event.currentTarget);
+    const selectedDebit = reuseCardPaymentDebit
+      ? cardPaymentCandidates.data?.find((candidate) => String(candidate.id) === selectedCardPaymentDebitId)
+      : undefined;
+    if (reuseCardPaymentDebit && !selectedDebit) return;
+    recordCardPayment.mutate({
+      payment_account_id: Number(cardPaymentSourceId || preferredPaymentSource?.id),
+      loan_account_id: cardPaymentAccount.id,
+      principal: selectedDebit ? Math.abs(selectedDebit.amount) : Number(form.get("amount")),
+      interest: 0,
+      payment_date: selectedDebit ? selectedDebit.transaction_date : form.get("payment_date"),
+      description: "信用卡繳款",
+      ...(selectedDebit ? { existing_payment_transaction_id: selectedDebit.id } : {}),
+      ...((!selectedDebit || selectedCurrentBillId === cardPaymentCycle?.current_bill?.id) && cardPaymentCycle?.current_bill?.id
+        ? { bill_id: cardPaymentCycle.current_bill.id }
+        : {}),
+    });
+  }
+
   const visibleAccounts = accounts.data?.filter((item) => !item.archived) || [];
   const assetAccounts = visibleAccounts.filter((item) => item.nature === "asset");
   const liabilityAccounts = visibleAccounts.filter((item) => item.nature === "liability");
@@ -362,6 +439,20 @@ export default function AccountsPage() {
     queryFn: () => api<Cycle[]>("/email/card-cycles"),
     enabled: visibleAccounts.some((account) => account.account_type === "credit_card"),
   });
+  const cardPaymentCycle = cardCycles.data?.find((item) => item.card_account_id === cardPaymentAccount?.id);
+  const cardPaymentSources = assetAccounts.filter((account) => account.currency === cardPaymentAccount?.currency);
+  const preferredPaymentSource = cardPaymentSources.find((account) => account.id === cardPaymentCycle?.payment_account_id)
+    || cardPaymentSources.find((account) => ["bank", "cash", "ewallet"].includes(account.account_type))
+    || cardPaymentSources[0];
+  const selectedPaymentSourceId = cardPaymentSourceId || String(preferredPaymentSource?.id || "");
+  const cardPaymentCandidates = useQuery({
+    queryKey: ["card-payment-candidates", cardPaymentAccount?.id, selectedPaymentSourceId],
+    queryFn: () => api<CardPaymentCandidate[]>(`/card-payment-candidates?card_account_id=${cardPaymentAccount?.id}&payment_account_id=${selectedPaymentSourceId}`),
+    enabled: reuseCardPaymentDebit && Boolean(cardPaymentAccount && selectedPaymentSourceId),
+  });
+  const selectedCardPaymentDebit = cardPaymentCandidates.data?.find(
+    (candidate) => String(candidate.id) === selectedCardPaymentDebitId,
+  );
 
   return (
     <>
@@ -412,6 +503,7 @@ export default function AccountsPage() {
             subtitle={`${assetAccounts.length} 個帳戶`}
             accounts={assetAccounts}
             onBalance={setBalanceAccount}
+            onCardPayment={openCardPaymentDialog}
             onDetail={setDetailAccount}
             onDelete={setArchiveTarget}
           />
@@ -423,6 +515,7 @@ export default function AccountsPage() {
               cardCycles={cardCycles.data}
               cardCyclesLoading={cardCycles.isPending}
               onBalance={setBalanceAccount}
+              onCardPayment={openCardPaymentDialog}
               onDetail={setDetailAccount}
               onDelete={setArchiveTarget}
             />
@@ -618,6 +711,143 @@ export default function AccountsPage() {
       </Dialog>
 
       <Dialog
+        open={Boolean(cardPaymentAccount)}
+        onClose={() => { if (!recordCardPayment.isPending) setCardPaymentAccount(null); }}
+        title="記錄信用卡繳款"
+        description={cardPaymentAccount?.name || ""}
+      >
+        {cardPaymentAccount && (
+          <form className="space-y-4" onSubmit={submitCardPayment}>
+            <div className="rounded-xl bg-slate-50 p-4">
+              <p className="text-xs text-slate-500">目前欠款</p>
+              <p className="mt-1 text-xl font-bold text-slate-800">{money(Math.abs(cardPaymentAccount.balance), cardPaymentAccount.currency)}</p>
+              <p className="mt-1 text-xs text-slate-500">
+                {cardPaymentCycle?.current_bill
+                  ? `正式帳單剩餘 ${money(cardPaymentCycle.current_bill.remaining_due ?? cardPaymentCycle.current_bill.amount_due, cardPaymentAccount.currency)}`
+                  : "尚無正式帳單，仍可記錄已支付的金額。"}
+              </p>
+            </div>
+            {cardPaymentSources.length ? (
+              <Field label="付款帳戶">
+                <Select
+                  name="payment_account_id"
+                  value={selectedPaymentSourceId}
+                  onChange={(event) => {
+                    setCardPaymentSourceId(event.target.value);
+                    setSelectedCardPaymentDebitId("");
+                    setSelectedCurrentBillId(null);
+                  }}
+                  required
+                >
+                  {cardPaymentSources.map((account) => (
+                    <option key={account.id} value={account.id}>{account.name}（{account.owner_label}）</option>
+                  ))}
+                </Select>
+              </Field>
+            ) : (
+              <p role="alert" className="rounded-xl bg-amber-50 p-3 text-sm text-amber-800">沒有同幣別的付款帳戶，請先新增銀行或現金帳戶。</p>
+            )}
+            <label className="flex items-start gap-2 text-sm text-slate-700">
+              <input
+                type="checkbox"
+                checked={reuseCardPaymentDebit}
+                onChange={(event) => {
+                  setReuseCardPaymentDebit(event.target.checked);
+                  setSelectedCardPaymentDebitId("");
+                  setSelectedCurrentBillId(null);
+                }}
+                className="mt-1 accent-emerald-600"
+              />
+              <span>已在付款帳戶記錄扣款<span className="mt-1 block text-xs text-slate-500">選擇現有扣款連結信用卡繳款，付款帳戶不會再扣一次。</span></span>
+            </label>
+            {reuseCardPaymentDebit ? (
+              <div className="space-y-3">
+                {selectedPaymentSourceId && cardPaymentCandidates.isPending && (
+                  <p role="status" className="text-sm text-slate-500">正在載入可連結的扣款…</p>
+                )}
+                {cardPaymentCandidates.isError && (
+                  <p role="alert" className="text-sm text-red-600">無法載入扣款：{cardPaymentCandidates.error.message} <button type="button" className="underline" onClick={() => { void cardPaymentCandidates.refetch(); }}>重試</button></p>
+                )}
+                {cardPaymentCandidates.data && cardPaymentCandidates.data.length === 0 && (
+                  <p className="rounded-xl bg-slate-50 p-3 text-sm text-slate-600">此付款帳戶沒有可連結的扣款。</p>
+                )}
+                {cardPaymentCandidates.data && cardPaymentCandidates.data.length > 0 && (
+                  <Field label="已記錄的扣款">
+                    <Select
+                      aria-label="已記錄的扣款"
+                      value={selectedCardPaymentDebitId}
+                      onChange={(event) => {
+                        setSelectedCardPaymentDebitId(event.target.value);
+                        setSelectedCurrentBillId(null);
+                      }}
+                      required
+                    >
+                      <option value="">請選擇一筆扣款</option>
+                      {cardPaymentCandidates.data.map((candidate) => (
+                        <option key={candidate.id} value={candidate.id}>
+                          {candidate.transaction_date} · {candidate.description} · {money(Math.abs(candidate.amount), cardPaymentAccount.currency)}{candidateSourceLabel(candidate.source) ? ` · ${candidateSourceLabel(candidate.source)}` : ""}
+                        </option>
+                      ))}
+                    </Select>
+                  </Field>
+                )}
+                {selectedCardPaymentDebit && (
+                  <div className="rounded-xl bg-emerald-50 p-3 text-sm text-emerald-900">
+                    <p>繳款金額：{money(Math.abs(selectedCardPaymentDebit.amount), cardPaymentAccount.currency)}</p>
+                    <p>繳款日期：{selectedCardPaymentDebit.transaction_date}</p>
+                    <p className="mt-1 text-xs">金額與日期依現有扣款記錄，無法在此修改。</p>
+                  </div>
+                )}
+                {selectedCardPaymentDebit && cardPaymentCycle?.current_bill?.id && (
+                  <label className="flex items-start gap-2 rounded-xl border border-blue-100 bg-blue-50 p-3 text-sm text-slate-700">
+                    <input
+                      type="checkbox"
+                      checked={selectedCurrentBillId === cardPaymentCycle.current_bill.id}
+                      onChange={(event) => setSelectedCurrentBillId(event.target.checked ? cardPaymentCycle?.current_bill?.id ?? null : null)}
+                      className="mt-1 accent-emerald-600"
+                    />
+                    <span>
+                      這筆扣款用來銷帳目前帳單
+                      <span className="mt-1 block text-xs text-slate-600">
+                        繳款期限 {cardPaymentCycle.current_bill.due_date} · 尚待繳 {money(cardPaymentCycle.current_bill.remaining_due ?? cardPaymentCycle.current_bill.amount_due, cardPaymentAccount.currency)}。請確認這筆扣款屬於這期帳單。
+                      </span>
+                    </span>
+                  </label>
+                )}
+              </div>
+            ) : (
+              <>
+                <Field label={`繳款金額（${cardPaymentAccount.currency}）`}>
+                  <Input
+                    name="amount"
+                    type="number"
+                    inputMode="decimal"
+                    step="0.01"
+                    min="0.01"
+                    defaultValue={cardPaymentCycle?.current_bill
+                      ? Math.min(Number(cardPaymentAccount.balance), cardPaymentCycle.current_bill.remaining_due ?? cardPaymentCycle.current_bill.amount_due)
+                      : cardPaymentAccount.balance}
+                    required
+                    autoFocus
+                  />
+                </Field>
+                <FormOptions title={`繳款日期（預設 ${taipeiDateInputValue()}）`}>
+                  <Field label="繳款日期"><DateInput name="payment_date" defaultValue={taipeiDateInputValue()} required /></Field>
+                </FormOptions>
+              </>
+            )}
+            {recordCardPayment.isError && <p role="alert" className="text-sm text-red-600">{recordCardPayment.error.message}</p>}
+            <FormActions
+              onCancel={() => setCardPaymentAccount(null)}
+              pending={recordCardPayment.isPending}
+              disabled={!cardPaymentSources.length || (reuseCardPaymentDebit && !selectedCardPaymentDebit)}
+              label="儲存繳款"
+            />
+          </form>
+        )}
+      </Dialog>
+
+      <Dialog
         open={Boolean(detailAccount)}
         onClose={() => setDetailAccount(null)}
         title={`${detailAccount?.name || ""}明細`}
@@ -689,6 +919,7 @@ function AccountGroup({
   subtitle,
   accounts,
   onBalance,
+  onCardPayment,
   onDetail,
   onDelete,
   cardCycles = [],
@@ -698,6 +929,7 @@ function AccountGroup({
   subtitle: string;
   accounts: Account[];
   onBalance: (account: Account) => void;
+  onCardPayment: (account: Account) => void;
   onDetail: (account: Account) => void;
   onDelete: (account: Account) => void;
   cardCycles?: Cycle[];
@@ -762,14 +994,18 @@ function AccountGroup({
                     <div className="grid grid-cols-2 gap-2">
                       <div className="rounded-xl bg-blue-50 px-3 py-2.5">
                         <p className="text-[11px] font-medium text-blue-600">
-                          本期應繳{cycle.current_bill ? ` · ${cycle.current_bill.due_date}` : ""}
+                          {cycle.current_bill
+                            ? `本期剩餘應繳 · ${cycle.current_bill.due_date}`
+                            : cycle.last_paid_bill ? `最近帳單 · ${cycle.last_paid_bill.due_date}` : "正式帳單"}
                         </p>
                         <p className="mt-1 truncate text-sm font-bold text-blue-950">
-                          {cycle.current_bill ? money(cycle.current_bill.amount_due, cycle.currency) : "尚無待繳"}
+                          {cycle.current_bill
+                            ? money(cycle.current_bill.remaining_due ?? cycle.current_bill.amount_due, cycle.currency)
+                            : cycle.last_paid_bill ? "已繳清" : "尚未匯入"}
                         </p>
                       </div>
                       <div className="rounded-xl bg-slate-50 px-3 py-2.5">
-                        <p className="text-[11px] font-medium text-slate-500">未出帳</p>
+                        <p className="text-[11px] font-medium text-slate-500">{cycle.cycle_boundary_known ? "未出帳欠款" : "待核對欠款"}</p>
                         <p className="mt-1 truncate text-sm font-bold text-slate-800">
                           {money(cycle.unbilled.amount, cycle.currency)}
                         </p>
@@ -802,20 +1038,20 @@ function AccountGroup({
               <div className="flex border-t border-slate-100 bg-slate-50/60 p-2">
                 {hasCardSync ? (
                   <>
+                    <Button variant="ghost" className="flex-1 text-emerald-700" onClick={() => onCardPayment(account)}>
+                      記錄繳款
+                    </Button>
                     <Button variant="ghost" className="flex-1 text-emerald-700" onClick={showCycleDetails}>
                       帳單明細
                     </Button>
-                    <Link
-                      to={`/transactions?account=${account.id}&month=all&search=&unclassified=0&excluded=0&page=1`}
-                      className="flex min-h-10 flex-1 items-center justify-center rounded-xl px-3 text-sm font-semibold text-slate-600 hover:bg-slate-100"
-                    >
-                      查看消費
-                    </Link>
                   </>
                 ) : (
-                  <Button variant="ghost" className="flex-1" onClick={() => onBalance(account)}>
-                    <RefreshCw size={15} /> {isCreditCard ? "更新負債" : "更新餘額"}
-                  </Button>
+                  <>
+                    <Button variant="ghost" className="flex-1" onClick={() => onBalance(account)}>
+                      <RefreshCw size={15} /> {isCreditCard ? "更新負債" : "更新餘額"}
+                    </Button>
+                    {isCreditCard && <Button variant="ghost" className="flex-1 text-emerald-700" onClick={() => onCardPayment(account)}>記錄繳款</Button>}
+                  </>
                 )}
                 {account.positions_count > 0 && (
                   <Button variant="ghost" className="px-3" onClick={() => onDetail(account)}>

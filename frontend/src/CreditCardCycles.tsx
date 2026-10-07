@@ -2,15 +2,20 @@ import { Link } from "react-router-dom";
 import { Badge, Button, Card, money } from "./ui";
 
 interface Bill {
+  id?: number;
   amount_due: number;
+  remaining_due?: number;
+  payments_total?: number;
   due_date: string;
   status: string;
+  last_error?: string | null;
   period_start?: string | null;
   period_end?: string | null;
 }
 
 interface CycleAmount {
   amount: number;
+  payments_total?: number;
   transaction_count: number;
   period_start?: string | null;
   period_end?: string | null;
@@ -20,6 +25,7 @@ export interface Cycle {
   rule_id: number;
   rule_name: string;
   card_account_id: number;
+  payment_account_id?: number;
   currency: string;
   closing_day?: number | null;
   cycle_boundary_known: boolean;
@@ -32,7 +38,10 @@ export interface Cycle {
 }
 
 function billStatus(bill: Bill) {
-  if (bill.status === "pending") return <Badge tone="blue">待記錄繳款</Badge>;
+  if (bill.status === "pending") {
+    if ((bill.remaining_due ?? bill.amount_due) <= 0) return <Badge tone="green">已記錄繳款</Badge>;
+    return <Badge tone="blue">{bill.payments_total ? "部分已記錄" : "待記錄繳款"}</Badge>;
+  }
   if (bill.status === "insufficient_funds") return <Badge tone="amber">記帳餘額不足</Badge>;
   return <Badge tone="amber">需要確認</Badge>;
 }
@@ -64,7 +73,7 @@ export default function CreditCardCycles({
         </Link>
       </div>
       <p className="mt-1 text-xs text-slate-500">
-        本期應繳只採正式帳單金額；「已記錄繳款」僅代表財務居已記帳，不代表銀行已完成付款。
+        本期應繳以正式帳單為準；未收到帳單也可以記錄實際繳款。
       </p>
       {isLoading && <p role="status" className="mt-4">正在載入帳期…</p>}
       {isError && (
@@ -94,39 +103,51 @@ export default function CreditCardCycles({
             </p>
             <div className="mt-3 grid gap-3 sm:grid-cols-3">
               <div className="rounded-xl bg-slate-50 p-3">
-                <p className="text-xs text-slate-500">未出帳消費</p>
+                <p className="text-xs text-slate-500">{cycle.cycle_boundary_known ? "未出帳欠款" : "待核對欠款"}</p>
                 <p className="mt-1 font-semibold">{money(cycle.unbilled.amount, cycle.currency)}</p>
+                {Boolean(cycle.unbilled.payments_total) && (
+                  <p className="mt-1 text-xs text-emerald-700">已沖抵 {money(cycle.unbilled.payments_total || 0, cycle.currency)}</p>
+                )}
                 <p className="mt-1 text-xs text-slate-500">
                   {cycle.unbilled.transaction_count} 筆
                   {cycle.cycle_boundary_known && cycle.unbilled.period_start
                     ? ` · ${cycle.unbilled.period_start} 起`
                     : cycle.current_bill
                       ? " · 僅統計帳單寄達後可確認的消費"
-                      : " · 尚未取得正式帳期，此金額不是應繳金額"}
+                      : " · 帳期未知，此金額不是應繳金額"}
                 </p>
               </div>
               <div className="rounded-xl bg-blue-50 p-3">
-                <p className="text-xs text-blue-700">本期帳單（正式金額）</p>
+                <p className="text-xs text-blue-700">{cycle.current_bill ? "本期剩餘應繳" : cycle.last_paid_bill ? "最近帳單" : "正式帳單"}</p>
                 <p className="mt-1 font-semibold">
-                  {cycle.current_bill ? money(cycle.current_bill.amount_due, cycle.currency) : "等待正式帳單"}
+                  {cycle.current_bill
+                    ? money(cycle.current_bill.remaining_due ?? cycle.current_bill.amount_due, cycle.currency)
+                    : cycle.last_paid_bill ? "已繳清" : "等待正式帳單"}
                 </p>
+                {!cycle.current_bill && cycle.last_paid_bill && <p className="mt-1 text-xs">原繳款期限 {cycle.last_paid_bill.due_date}</p>}
                 {cycle.current_bill && (
                   <>
+                    {Boolean(cycle.current_bill.payments_total) && <p className="mt-1 text-xs text-blue-700">已記錄 {money(cycle.current_bill.payments_total || 0, cycle.currency)}</p>}
                     <p className="mt-1 text-xs">繳款日 {cycle.current_bill.due_date}</p>
                     {cycle.current_bill.period_start && cycle.current_bill.period_end && (
                       <p className="mt-1 text-xs">{cycle.current_bill.period_start}～{cycle.current_bill.period_end}</p>
                     )}
                     <div className="mt-2">{billStatus(cycle.current_bill)}</div>
+                    {cycle.current_bill.last_error && <p className="mt-2 text-xs text-amber-700">{cycle.current_bill.last_error}</p>}
                   </>
                 )}
               </div>
               <div className="rounded-xl bg-emerald-50 p-3">
                 <p className="text-xs text-emerald-700">已記錄繳款</p>
                 <p className="mt-1 font-semibold">
-                  {cycle.last_paid_bill ? money(cycle.last_paid_bill.amount_due, cycle.currency) : "尚無紀錄"}
+                  {(cycle.current_bill?.payments_total || 0) + (cycle.unbilled.payments_total || 0) > 0
+                    ? money((cycle.current_bill?.payments_total || 0) + (cycle.unbilled.payments_total || 0), cycle.currency)
+                    : cycle.last_paid_bill ? money(cycle.last_paid_bill.amount_due, cycle.currency) : "尚無紀錄"}
                 </p>
                 <p className="mt-1 text-xs">
-                  {cycle.last_paid_bill ? `帳單繳款日 ${cycle.last_paid_bill.due_date}` : "—"}
+                  {(cycle.current_bill?.payments_total || 0) + (cycle.unbilled.payments_total || 0) > 0
+                    ? "財務居已記帳，請以銀行紀錄為準"
+                    : cycle.last_paid_bill ? `原繳款期限 ${cycle.last_paid_bill.due_date}` : "—"}
                 </p>
               </div>
             </div>

@@ -36,6 +36,8 @@ from .database import (
     ClassificationRule,
     LearnedClassificationRule,
     CreditCardBill,
+    CreditCardPayment,
+    CreditCardPaymentAllocation,
     EmailCardRule,
     EmailImportRecord,
     FxRate,
@@ -4053,6 +4055,8 @@ BACKUP_MODELS = [
     TransferLink,
     EmailImportRecord,
     CreditCardBill,
+    CreditCardPayment,
+    CreditCardPaymentAllocation,
     Position,
     PriceSnapshot,
     FxRate,
@@ -4130,6 +4134,16 @@ def restore_backup(db: Session, payload: dict[str, Any]) -> dict[str, int]:
                     f"COALESCE(MAX(id), 1), MAX(id) IS NOT NULL) FROM {table_name}"
                 )
             )
+    # Version 1 backups created before card payment tracking contain transfer
+    # links but no payment ledger. Recover those links before the restored data
+    # is made visible, so the next Gmail refresh cannot reinstate paid debt.
+    if "credit_card_payments" not in data:
+        from .email_sync import _refresh_current_gmail_card_balance, repair_linked_card_payments
+
+        if repair_linked_card_payments(db):
+            for rule in db.scalars(select(EmailCardRule).where(EmailCardRule.active.is_(True))).all():
+                _refresh_current_gmail_card_balance(db, rule)
+            record_valuation(db)
     db.commit()
     seed_defaults(db)
     return restored
