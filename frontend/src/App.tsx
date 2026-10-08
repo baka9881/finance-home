@@ -52,7 +52,9 @@ const secondaryNavigation = [
 
 const globalOwnerPaths = new Set(["/", "/accounts", "/transactions", "/investments", "/analysis"]);
 const PROFILE_AVATAR_STORAGE_KEY = "finance.profile-avatar";
-const AUTH_CHECK_TIMEOUT_MS = 10_000;
+const AUTH_CHECK_SLOW_MS = 10_000;
+const AUTH_CHECK_TIMEOUT_MS = 75_000;
+const AUTH_CHECK_RETRY_DELAYS_MS = [2_000, 4_000];
 
 function readProfileAvatar() {
   try {
@@ -436,12 +438,12 @@ function LoginScreen() {
   );
 }
 
-function AuthCheckingScreen() {
+function AuthCheckingScreen({ slow = false }: { slow?: boolean }) {
   return (
     <div className="grid min-h-screen place-items-center bg-canvas px-4">
       <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm text-slate-600 shadow-card">
         <RefreshCw className="animate-spin text-forest" size={18} />
-        正在確認登入狀態…
+        {slow ? "雲端連線較慢，正在繼續確認…" : "正在確認登入狀態…"}
       </div>
     </div>
   );
@@ -668,16 +670,14 @@ export default function App() {
     "checking" | "authenticated" | "anonymous" | "unavailable" | "configuration-error"
   >(() => CLOUD_AUTH_EXPECTED && !getAuthToken() ? "anonymous" : "checking");
   const [authStatus, setAuthStatus] = useState<AuthStatus | null>(null);
+  const [authCheckSlow, setAuthCheckSlow] = useState(false);
 
   useEffect(() => {
-    let validationSequence = 0;
-    let activeController: AbortController | null = null;
-    let activeTimer: number | null = null;
+    let stopActiveCheck: (() => void) | null = null;
 
     const syncAuth = () => {
-      const sequence = ++validationSequence;
-      activeController?.abort();
-      if (activeTimer !== null) window.clearTimeout(activeTimer);
+      stopActiveCheck?.();
+      setAuthCheckSlow(false);
 
       // In a cloud deployment, an absent token cannot access financial data.
       // Show the login form immediately while the server may be waking up.
@@ -688,57 +688,72 @@ export default function App() {
         return;
       }
 
-      const controller = new AbortController();
-      activeController = controller;
+      let stopped = false;
+      let controller: AbortController | null = null;
+      const timers = new Set<number>();
+      const stop = () => {
+        stopped = true;
+        controller?.abort();
+        timers.forEach((timer) => window.clearTimeout(timer));
+        timers.clear();
+        if (stopActiveCheck === stop) stopActiveCheck = null;
+      };
+      const schedule = (callback: () => void, delay: number) => {
+        const timer = window.setTimeout(() => {
+          timers.delete(timer);
+          if (!stopped) callback();
+        }, delay);
+        timers.add(timer);
+      };
+      stopActiveCheck = stop;
       setAuthState("checking");
-      const timeout = new Promise<never>((_, reject) => {
-        activeTimer = window.setTimeout(() => {
-          controller.abort();
-          reject(new Error("登入狀態檢查逾時"));
-        }, AUTH_CHECK_TIMEOUT_MS);
-      });
-      void Promise.race([api<AuthStatus>("/auth/status", { signal: controller.signal }), timeout])
-        .then((result) => {
-          if (sequence !== validationSequence) return;
-          setAuthStatus(result);
-          const gate = resolveAuthGate(result, CLOUD_AUTH_EXPECTED);
-          if (gate === "configuration-error") {
-            queryClient.clear();
-            setAuthState("configuration-error");
-            return;
-          }
-          if (gate === "anonymous") {
-            queryClient.clear();
-            setAuthState("anonymous");
-            return;
-          }
-          setAuthState("authenticated");
-        })
-        .catch((cause) => {
-          if (sequence !== validationSequence) return;
-          if (cause instanceof ApiError && cause.status === 401) {
-            clearAuthToken();
-            queryClient.clear();
-            setAuthState("anonymous");
-            return;
-          }
-          setAuthState(cause instanceof ApiError && cause.status === 503 ? "configuration-error" : "unavailable");
-        })
-        .finally(() => {
-          if (sequence === validationSequence) {
-            if (activeTimer !== null) window.clearTimeout(activeTimer);
-            activeTimer = null;
-            activeController = null;
-          }
-        });
+      // A cold cloud server may take longer than the initial status message.
+      // Keep one request pending, and give retries the same overall deadline.
+      schedule(() => setAuthCheckSlow(true), AUTH_CHECK_SLOW_MS);
+      schedule(() => {
+        stop();
+        setAuthState("unavailable");
+      }, AUTH_CHECK_TIMEOUT_MS);
+
+      const check = (retries = 0) => {
+        if (stopped) return;
+        controller = new AbortController();
+        void api<AuthStatus>("/auth/status", { signal: controller.signal })
+          .then((result) => {
+            if (stopped) return;
+            const gate = resolveAuthGate(result, CLOUD_AUTH_EXPECTED);
+            stop();
+            setAuthStatus(result);
+            if (gate !== "authenticated") queryClient.clear();
+            setAuthState(gate);
+          })
+          .catch((cause) => {
+            if (stopped) return;
+            if (cause instanceof ApiError && cause.status === 401) {
+              stop();
+              clearAuthToken();
+              queryClient.clear();
+              setAuthStatus(null);
+              setAuthState("anonymous");
+              return;
+            }
+            const transient = cause instanceof TypeError
+              || (cause instanceof ApiError && [502, 503, 504].includes(cause.status));
+            if (transient && retries < AUTH_CHECK_RETRY_DELAYS_MS.length) {
+              schedule(() => check(retries + 1), AUTH_CHECK_RETRY_DELAYS_MS[retries]);
+              return;
+            }
+            stop();
+            setAuthState("unavailable");
+          });
+      };
+      check();
     };
 
     window.addEventListener("finance:auth-changed", syncAuth);
     syncAuth();
     return () => {
-      validationSequence += 1;
-      activeController?.abort();
-      if (activeTimer !== null) window.clearTimeout(activeTimer);
+      stopActiveCheck?.();
       window.removeEventListener("finance:auth-changed", syncAuth);
     };
   }, [queryClient]);
@@ -761,7 +776,7 @@ export default function App() {
     return <PublicInfoPage kind={location.pathname === "/privacy" ? "privacy" : "terms"} />;
   }
 
-  if (authState === "checking") return <AuthCheckingScreen />;
+  if (authState === "checking") return <AuthCheckingScreen slow={authCheckSlow} />;
   if (authState === "unavailable") return <AuthUnavailableScreen />;
   if (authState === "configuration-error") return <AuthUnavailableScreen configurationError />;
   if (authState === "anonymous") {
