@@ -24,6 +24,7 @@ import {
 } from "lucide-react";
 import { api, apiBlob } from "../api";
 import { invalidateFinanceData } from "../appQueries";
+import { automationTimestamp, describeAutomationStatus, type AutomationStatus } from "../automationStatus";
 import { COMMON_CURRENCIES } from "../currencies";
 import { taipeiDateInputValue } from "../date";
 import { type AppTheme, getStoredTheme, saveTheme } from "../theme";
@@ -136,27 +137,6 @@ function MobileSettingsSection({
       </div>
     </section>
   );
-}
-
-interface AutomationStatus {
-  enabled: boolean;
-  schedule: "hourly";
-  running: boolean;
-  connected_exchanges: number;
-  email_connected: boolean;
-  last_status: "idle" | "running" | "success" | "warning" | "failed";
-  last_started_at?: string;
-  last_run_at?: string;
-  last_error?: string;
-  last_result?: {
-    exchanges_updated: number;
-    exchanges_skipped: number;
-    market_updated: number;
-    market_skipped: number;
-    fx_saved: number;
-    warnings: string[];
-    errors: string[];
-  };
 }
 
 interface GmailStatus {
@@ -392,6 +372,13 @@ export default function SettingsPage() {
     queryFn: () => api<AutomationStatus>("/automation/status"),
     refetchInterval: 60_000,
   });
+  const [syncStatusNow, setSyncStatusNow] = useState(Date.now);
+  useEffect(() => {
+    const timer = setInterval(() => setSyncStatusNow(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, []);
+  const automationSync = describeAutomationStatus(automationStatus.data, syncStatusNow, automationStatus.isError);
+  const automationCompletedAt = automationTimestamp(automationStatus.data?.last_run_at);
   const accounts = useQuery({
     queryKey: ["accounts", "settings"],
     queryFn: () => api<Account[]>("/accounts"),
@@ -1004,7 +991,8 @@ export default function SettingsPage() {
         icon={<Bitcoin size={18} />}
         title="交易所同步"
         description="連接投資帳戶並自動更新持倉"
-        status={binanceConnections.isError ? "載入失敗" : binanceConnections.isPending ? "載入中" : binanceConnections.data?.some((item) => item.connected) ? "已連接" : "未連接"}
+        status={binanceConnections.isError ? "載入失敗" : binanceConnections.isPending ? "載入中" : binanceConnections.data?.some((item) => item.connected) ? automationSync.needsAttention ? automationSync.label : "已連接" : "未連接"}
+        warning={binanceConnections.isError || Boolean(binanceConnections.data?.some((item) => item.connected) && automationSync.needsAttention)}
       >
       <Card className="settings-detail-card mt-6 p-6">
         <div className="flex flex-col justify-between gap-5 lg:flex-row lg:items-start">
@@ -1016,14 +1004,12 @@ export default function SettingsPage() {
                 <Badge tone={binanceConnections.data?.some((item) => item.connected) ? "green" : "amber"}>
                   {binanceConnections.isError ? "無法確認連線狀態" : binanceConnections.isPending ? "載入中" : binanceConnections.data?.some((item) => item.connected) ? "已連接" : "尚未連接"}
                 </Badge>
-                <Badge tone={automationStatus.data?.enabled ? "green" : "amber"}>
-                  {automationStatus.data?.enabled ? "自動更新中" : "只在開啟時更新"}
+                <Badge tone={automationSync.tone}>
+                  {automationSync.label}
                 </Badge>
               </div>
               <p className="mt-2 max-w-3xl text-sm leading-6 text-slate-500">
-                {automationStatus.data?.enabled
-                  ? "帳戶餘額與持倉會定期更新，不需要持續開著財務居。"
-                  : "目前會在你開啟財務居時更新資料。"}
+                {automationSync.description}
               </p>
               <p className="mt-2 text-xs leading-5 text-amber-700">
                 連接時請使用唯讀金鑰，並關閉交易與提領權限。
@@ -1052,18 +1038,14 @@ export default function SettingsPage() {
           <div>
             <p className="text-xs text-slate-400">自動更新</p>
             <p className="mt-1 font-semibold text-slate-800">
-              {automationStatus.data?.running
-                ? "正在更新"
-                : automationStatus.data?.enabled
-                  ? "已啟用"
-                  : "僅開啟時更新"}
+              {automationSync.label}
             </p>
           </div>
           <div>
-            <p className="text-xs text-slate-400">最近更新</p>
+            <p className="text-xs text-slate-400">最近完成</p>
             <p className="mt-1 font-semibold text-slate-800">
-              {automationStatus.data?.last_run_at
-                ? new Date(`${automationStatus.data.last_run_at}Z`).toLocaleString("zh-TW", { hour12: false })
+              {automationCompletedAt !== null
+                ? new Date(automationCompletedAt).toLocaleString("zh-TW", { hour12: false })
                 : "尚未執行"}
             </p>
           </div>
@@ -1190,8 +1172,8 @@ export default function SettingsPage() {
         icon={<Mail size={18} />}
         title="信用卡自動記帳"
         description="自動匯入刷卡消費與帳單"
-        status={gmail.isError ? "載入失敗" : gmail.data?.reconnect_required ? "需要重新連接" : gmail.data?.paused_rules ? "帳戶已封存" : gmail.data?.issues?.length ? "有郵件待處理" : gmail.data?.connected ? "已連接" : "未連接"}
-        warning={gmail.isError || Boolean(gmail.data?.reconnect_required || gmail.data?.paused_rules || gmail.data?.issues?.length)}
+        status={gmail.isError ? "載入失敗" : gmail.data?.reconnect_required ? "需要重新連接" : gmail.data?.paused_rules ? "帳戶已封存" : gmail.data?.issues?.length ? "有郵件待處理" : gmail.data?.connected ? automationSync.needsAttention ? automationSync.label : "已連接" : "未連接"}
+        warning={gmail.isError || Boolean(gmail.data?.reconnect_required || gmail.data?.paused_rules || gmail.data?.issues?.length || (gmail.data?.connected && automationSync.needsAttention))}
       >
       <Card className="settings-detail-card mt-6 p-6">
         <div className="flex flex-col justify-between gap-5 lg:flex-row lg:items-start">
@@ -1203,7 +1185,7 @@ export default function SettingsPage() {
                 <Badge tone={gmail.data?.connected ? "green" : "amber"}>
                   {gmail.isError ? "無法確認連線狀態" : gmail.isPending ? "載入中" : gmail.data?.reconnect_required ? "授權已到期" : gmail.data?.connected ? "已連接" : "尚未連接 Gmail"}
                 </Badge>
-                {gmail.data?.connected && automationStatus.data?.enabled && <Badge tone="green">每小時同步</Badge>}
+                {gmail.data?.connected && <Badge tone={automationSync.tone}>{automationSync.label}</Badge>}
               </div>
               <p className="mt-1 truncate text-sm text-slate-500">
                 {gmail.data?.reconnect_required
@@ -1267,9 +1249,9 @@ export default function SettingsPage() {
           </p>
         )}
 
-        {gmail.data?.connected && !automationStatus.data?.enabled && (
+        {gmail.data?.connected && (automationSync.needsAttention || automationStatus.data?.enabled === false) && (
           <p className="mt-5 rounded-xl bg-amber-50 px-4 py-3 text-sm leading-6 text-amber-800">
-            {automationStatus.isError ? "目前無法確認背景同步狀態，請重新載入設定。" : "背景同步尚未啟用；請按「立即同步」更新信用卡資料。"}
+            {automationSync.description}
           </p>
         )}
 

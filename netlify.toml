@@ -1,7 +1,10 @@
 [build]
   base = "frontend"
   command = "npm run build"
-  publish = "frontend/dist"
+  publish = "dist"
+
+[functions]
+  directory = "netlify/functions"
 
 [build.environment]
   NODE_VERSION = "22"

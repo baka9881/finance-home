@@ -64,7 +64,7 @@ Market data and the financial health score are provided for personal financial m
 
 ## Scheduled cloud updates
 
-The production setup uses a Netlify Scheduled Function to call the Render backend once per hour. This allows connected Binance accounts, available market prices, exchange rates, and daily asset snapshots to be updated even when the website is not open.
+The production setup uses a Netlify Scheduled Function once per hour. It dispatches an authenticated background function on the same Netlify site, which waits for the Render backend to wake up and requests synchronization. The background worker retries temporary connection failures, HTTP 429, and HTTP 502/503/504 with bounded backoff, honoring `Retry-After`. Every retry carries the same request ID; the backend persists acceptance under a unique database key before enqueueing a run, preventing duplicate acceptance if an HTTP response is lost. This allows connected Binance accounts, credit-card email imports, available market prices, exchange rates, and daily asset snapshots to be updated even when the website is not open.
 
 Set the same `FINANCE_AUTOMATION_TOKEN` in both Render and Netlify. The following variables are required in Netlify:
 
@@ -73,7 +73,9 @@ FINANCE_AUTOMATION_URL=https://finance-home-api-sg.onrender.com
 FINANCE_AUTOMATION_TOKEN=use-a-long-random-secret
 ```
 
-Secrets must be stored in platform environment variables. Never place them in `netlify.toml` or commit them to Git. The Settings page shows whether scheduling is enabled, when it last ran, and whether an error occurred.
+Secrets must be stored in platform environment variables with the Functions scope. Never place them in `netlify.toml` or commit them to Git. Both `finance-sync` and `finance-sync-worker` must be included in a production deploy. A queued worker or an accepted backend request is not proof that imports completed: verify the backend's completion timestamp and results. The Settings page reports delayed synchronization when the hourly job has not completed for more than two hours, rather than treating a configured token as proof of a working schedule.
+
+If the worker continues to receive HTTP 429 and no request reaches the Render application's access log, use the worker's response request IDs and timestamps to investigate the hosting provider's ingress limits. Do not change credentials, disable authentication, or assume that longer retries have fixed a persistent platform block. Existing manual synchronization remains available in Settings.
 
 ## Cloud login protection
 
