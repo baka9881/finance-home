@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import io
+import json
 from datetime import date, datetime, timedelta, timezone
 
 import pytest
@@ -11,7 +12,7 @@ from sqlalchemy.pool import StaticPool
 
 from app import main as main_module
 from app import services as services_module
-from app.database import Base, get_db
+from app.database import AppSetting, Base, get_db
 from app.main import app
 from app.services import seed_defaults
 
@@ -407,9 +408,22 @@ def test_binance_futures_wallet_balance_overlays_spot_remainder():
     assert merged[0]["_spot_quantity"] == services_module.Decimal("0.00202797")
 
 
-def test_binance_portfolio_margin_updates_tradfi_position(
+@pytest.mark.parametrize(
+    ("position_amount", "position_side", "storage_symbol", "signed_quantity"),
+    [
+        ("4.3", "BOTH", "MSTRUSDT", 4.3),
+        ("-4.3", "BOTH", "MSTRUSDT", -4.3),
+        ("4.3", "SHORT", "MSTRUSDT:SHORT", -4.3),
+        ("-4.3", "LONG", "MSTRUSDT:LONG", 4.3),
+    ],
+)
+def test_binance_portfolio_margin_keeps_tradfi_contract_separate_from_stock(
     client: TestClient,
     monkeypatch: pytest.MonkeyPatch,
+    position_amount: str,
+    position_side: str,
+    storage_symbol: str,
+    signed_quantity: float,
 ):
     monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
     client.post(
@@ -444,6 +458,7 @@ def test_binance_portfolio_margin_updates_tradfi_position(
             "quantity": 3.2758,
             "average_cost": 92.39,
             "currency": "USD",
+            "manual_price": 94.64,
         },
     )
 
@@ -463,10 +478,10 @@ def test_binance_portfolio_margin_updates_tradfi_position(
                     "baseAsset": "MSTR",
                     "contractType": "TRADIFI_PERPETUAL",
                     "underlyingType": "EQUITY",
-                    "positionAmt": "4.3",
+                    "positionAmt": position_amount,
                     "entryPrice": "91.25",
                     "markPrice": "94.86",
-                    "positionSide": "BOTH",
+                    "positionSide": position_side,
                 }
             ],
             None,
@@ -485,13 +500,31 @@ def test_binance_portfolio_margin_updates_tradfi_position(
     assert connected.status_code == 200, connected.text
 
     positions = client.get("/api/positions").json()
-    assert len(positions) == 1
-    assert positions[0]["symbol"] == "MSTR"
-    assert positions[0]["quantity"] == 4.3
-    assert positions[0]["average_cost"] == 91.25
-    assert positions[0]["price"] == 94.86
-    assert positions[0]["price_source"] == "Binance Futures"
-    assert positions[0]["cost_status"] == "automatic"
+    assert len(positions) == 2
+    stock = next(item for item in positions if item["market"] == "US")
+    contract = next(item for item in positions if item["market"] == "BINANCE_FUTURES")
+    assert stock["symbol"] == "MSTR"
+    assert stock["quantity"] == 3.2758
+    assert stock["average_cost"] == 92.39
+    assert stock["price"] == 94.64
+    assert stock["cost_status"] == "confirmed"
+    assert contract["symbol"] == storage_symbol
+    assert contract["quantity"] == signed_quantity
+    assert contract["average_cost"] == 91.25
+    assert contract["price"] == 94.86
+    assert contract["price_source"] == "Binance Futures"
+    assert contract["cost_status"] == "automatic"
+    assert contract["instrument_type"] == "futures"
+    assert contract["direction"] == ("short" if signed_quantity < 0 else "long")
+    assert contract["profit_twd"] == pytest.approx(signed_quantity * (94.86 - 91.25) * 32)
+    assert contract["included_in_totals"] is False
+    assert contract["asset_value_twd"] == 0
+
+    refreshed = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert refreshed.status_code == 200, refreshed.text
+    positions = client.get("/api/positions").json()
+    assert len(positions) == 2
+    assert next(item for item in positions if item["market"] == "US")["average_cost"] == 92.39
 
 
 def test_binance_contract_sync_keeps_crypto_futures_out_of_asset_totals(
@@ -1125,6 +1158,442 @@ def test_binance_stock_trades_apply_only_new_fills_after_baseline(
     assert len(positions) == 1
     assert positions[0]["quantity"] == 4.3
     assert positions[0]["price"] == 94.64
+
+
+@pytest.fixture()
+def binance_stock_sync_state(client: TestClient, monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
+    monkeypatch.setattr(services_module, "BINANCE_COST_SYNC_INTERVAL", timedelta(0))
+    client.post(
+        "/api/fx/manual",
+        json={"currency": "USD", "rate_date": date.today().isoformat(), "rate_to_twd": 32},
+    )
+    account = client.post(
+        "/api/accounts",
+        json={
+            "name": "幣安股票帳戶", "institution": "Binance", "account_type": "crypto",
+            "nature": "asset", "currency": "TWD", "is_liquid": True,
+            "opening_balance": 0, "opening_date": date.today().isoformat(),
+        },
+    )
+    account_id = account.json()["id"]
+    position = client.post(
+        "/api/positions",
+        json={
+            "account_id": account_id, "market": "US", "symbol": "MSTR",
+            "quantity": 4, "average_cost": 100, "currency": "USD", "manual_price": 125,
+        },
+    )
+    state = {
+        "account_id": account_id,
+        "position_id": position.json()["id"],
+        "funding": [{"asset": "MSTRB", "free": "4", "locked": "0", "freeze": "0"}],
+        # A reconciled manual cost must survive the first historical baseline.
+        "trades": [{
+            "executionId": "old-fill", "symbol": "MSTRB", "side": "BUY",
+            "qty": "4", "price": "80", "executionAt": 1,
+        }],
+    }
+
+    def snapshot(_key, _secret, *, include_cost_details=True):
+        return (
+            [{"asset": "USDT", "free": "100", "locked": "0"}], {},
+            services_module.Decimal("1000"), state["funding"], {},
+            state["trades"] if include_cost_details else [], [], None, [],
+        )
+
+    monkeypatch.setattr(services_module, "_fetch_binance_spot_snapshot", snapshot)
+    connected = client.post(
+        "/api/exchanges/binance/connect",
+        json={"account_id": account_id, "api_key": "test-key", "api_secret": "test-secret"},
+    )
+    assert connected.status_code == 200, connected.text
+    baseline = client.get("/api/positions").json()
+    assert len(baseline) == 1
+    assert baseline[0]["quantity"] == 4
+    assert baseline[0]["average_cost"] == 100
+    assert baseline[0]["cost_status"] == "confirmed"
+    return state
+
+
+@pytest.mark.parametrize(
+    ("fills", "final_quantity", "expected_average"),
+    [
+        ([("BUY", "1", "120")], "5", 104),
+        ([("SELL", "1", "120")], "3", 100),
+        ([("SELL", "2", "110"), ("BUY", "1", "150")], "3", 116.666667),
+        ([("SELL", "4", "110"), ("BUY", "2", "80")], "2", 80),
+        ([("SELL", "4", "110")], "0", 100),
+    ],
+)
+def test_binance_stock_fills_reconcile_funding_once(
+    client: TestClient, binance_stock_sync_state,
+    fills, final_quantity: str, expected_average: float,
+):
+    state = binance_stock_sync_state
+    new_trades = [
+        {
+            "executionId": f"new-fill-{index}", "symbol": "MSTRB", "side": side,
+            "qty": quantity, "price": price, "executionAt": index + 2,
+        }
+        for index, (side, quantity, price) in enumerate(fills)
+    ]
+    # API pages can overlap and arrive out of chronological order.
+    state["trades"].extend([*reversed(new_trades), new_trades[-1]])
+    state["funding"][0]["free"] = final_quantity
+
+    for _ in range(2):
+        refreshed = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+        assert refreshed.status_code == 200, refreshed.text
+        positions = client.get("/api/positions?include_archived=true").json()
+        assert len(positions) == 1
+        position = positions[0]
+        assert position["symbol"] == "MSTR"
+        assert position["quantity"] == float(final_quantity)
+        assert position["average_cost"] == expected_average
+        active = client.get("/api/positions").json()
+        assert len(active) == (0 if float(final_quantity) == 0 else 1)
+
+
+def test_binance_stock_full_sync_cost_uses_quantity_before_light_sync(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, binance_stock_sync_state,
+):
+    state = binance_stock_sync_state
+    state["funding"][0]["free"] = "5"
+    state["trades"].append({
+        "executionId": "new-buy", "symbol": "MSTRB", "side": "BUY",
+        "qty": "1", "price": "120", "executionAt": 2,
+    })
+    monkeypatch.setattr(services_module, "BINANCE_COST_SYNC_INTERVAL", timedelta(days=1))
+    light_sync = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+    assert light_sync.status_code == 200, light_sync.text
+    pending = client.get("/api/positions").json()[0]
+    assert pending["quantity"] == 5
+    assert pending["average_cost"] == 100
+    assert pending["cost_status"] == "estimated"
+
+    monkeypatch.setattr(services_module, "BINANCE_COST_SYNC_INTERVAL", timedelta(0))
+    for _ in range(2):
+        full_sync = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+        assert full_sync.status_code == 200, full_sync.text
+        position = client.get("/api/positions").json()[0]
+        assert position["quantity"] == 5
+        assert position["average_cost"] == 104
+        assert position["cost_status"] == "automatic"
+
+
+def test_binance_stock_alias_balances_aggregate_and_verified_cost_replaces_fallback(
+    client: TestClient, binance_stock_sync_state,
+):
+    state = binance_stock_sync_state
+    state["funding"] = [
+        {"asset": "MSTR", "free": "1", "locked": "1", "_average_cost": "90", "_cost_status": "automatic"},
+        {"asset": "MSTRB", "free": "2", "locked": "0", "freeze": "1", "_average_cost": "110", "_cost_status": "automatic"},
+    ]
+    for _ in range(2):
+        refreshed = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+        assert refreshed.status_code == 200, refreshed.text
+        positions = client.get("/api/positions").json()
+        assert len(positions) == 1
+        assert positions[0]["quantity"] == 5
+        assert positions[0]["average_cost"] == 102
+        assert positions[0]["cost_status"] == "automatic"
+
+
+def test_binance_stock_manual_quantity_correction_resets_cost_checkpoint(
+    client: TestClient, binance_stock_sync_state,
+):
+    state = binance_stock_sync_state
+    corrected = client.patch(
+        f"/api/positions/{state['position_id']}", json={"quantity": 2, "average_cost": 100},
+    )
+    assert corrected.status_code == 200, corrected.text
+    state["funding"][0]["free"] = "3"
+    state["trades"].append({
+        "executionId": "after-correction", "symbol": "MSTRB", "side": "BUY",
+        "qty": "1", "price": "120", "executionAt": 2,
+    })
+    refreshed = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+    assert refreshed.status_code == 200, refreshed.text
+    position = client.get("/api/positions").json()[0]
+    assert position["quantity"] == 3
+    assert position["average_cost"] == 106.666667
+    assert position["cost_status"] == "automatic"
+
+
+def test_binance_stock_legacy_sync_infers_quantity_before_unseen_fills(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, binance_stock_sync_state,
+):
+    state = binance_stock_sync_state
+    # Simulate a deployment that saved trade IDs before quantity checkpoints
+    # existed. This is the test client's isolated in-memory database.
+    db_generator = app.dependency_overrides[get_db]()
+    db = next(db_generator)
+    try:
+        checkpoint = db.get(AppSetting, f"binance:{state['account_id']}:stock_cost_basis")
+        db.delete(checkpoint)
+        db.commit()
+    finally:
+        db_generator.close()
+    state["funding"][0]["free"] = "5"
+    state["trades"].append({
+        "executionId": "legacy-new-buy", "symbol": "MSTRB", "side": "BUY",
+        "qty": "1", "price": "120", "executionAt": 2,
+    })
+    monkeypatch.setattr(services_module, "BINANCE_COST_SYNC_INTERVAL", timedelta(days=1))
+    light = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+    assert light.status_code == 200, light.text
+    assert client.get("/api/positions").json()[0]["quantity"] == 5
+    monkeypatch.setattr(services_module, "BINANCE_COST_SYNC_INTERVAL", timedelta(0))
+    for _ in range(2):
+        full = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+        assert full.status_code == 200, full.text
+        position = client.get("/api/positions").json()[0]
+        assert position["quantity"] == 5
+        assert position["average_cost"] == 104
+        assert position["cost_status"] == "automatic"
+
+
+def test_binance_stock_incomplete_alias_costs_preserve_confirmed_average(
+    client: TestClient, binance_stock_sync_state,
+):
+    state = binance_stock_sync_state
+    state["funding"] = [
+        {"asset": "MSTR", "free": "2", "locked": "0", "_average_cost": "90", "_cost_status": "automatic"},
+        {"asset": "MSTRB", "free": "2", "locked": "0"},
+    ]
+    refreshed = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+    assert refreshed.status_code == 200, refreshed.text
+    position = client.get("/api/positions").json()[0]
+    assert position["quantity"] == 4
+    assert position["average_cost"] == 100
+    assert position["cost_status"] == "confirmed"
+
+
+def test_binance_stock_quantity_mismatch_keeps_cost_checkpoint_at_processed_fills(
+    client: TestClient, binance_stock_sync_state,
+):
+    state = binance_stock_sync_state
+    state["funding"][0]["free"] = "6"
+    state["trades"].append({
+        "executionId": "known-buy", "symbol": "MSTRB", "side": "BUY",
+        "qty": "1", "price": "120", "executionAt": 2,
+    })
+    for _ in range(2):
+        refreshed = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+        assert refreshed.status_code == 200, refreshed.text
+        position = client.get("/api/positions").json()[0]
+        assert position["quantity"] == 6
+        assert position["average_cost"] == 104
+        assert position["cost_status"] == "estimated"
+    # Once the authoritative balance catches up with the same processed
+    # fills, the known cost is confirmed without applying that BUY again.
+    state["funding"][0]["free"] = "5"
+    refreshed = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+    assert refreshed.status_code == 200, refreshed.text
+    position = client.get("/api/positions").json()[0]
+    assert position["quantity"] == 5
+    assert position["average_cost"] == 104
+    assert position["cost_status"] == "automatic"
+
+
+def synthetic_binance_stock_history():
+    trades, orders = [], []
+    for index, total in enumerate((80, 90, 100, 110, 120, 130, 140)):
+        order_id = f"order-{index}"
+        orders.append({
+            "orderId": order_id, "filledQty": "1", "filledTotal": str(total), "fee": "0.17",
+        })
+        pieces = ("0.25", "0.75") if index == 6 else ("1",)
+        for part, quantity in enumerate(pieces):
+            trades.append({
+                "executionId": f"fill-{index}-{part}", "orderId": order_id,
+                "symbol": "MSTR", "quote": "USDC", "side": "BUY",
+                "price": str(total), "qty": quantity,
+                "executionAt": int(datetime(2026, 6 if index < 2 else 8, 25, tzinfo=timezone.utc).timestamp() * 1000) + index,
+            })
+    return trades, orders
+
+
+@pytest.mark.parametrize("fees_available", [True, False])
+def test_binance_stock_rebuilds_all_history_when_old_june_fills_are_backfilled(
+    client: TestClient, binance_stock_sync_state, fees_available: bool,
+):
+    state = binance_stock_sync_state
+    corrected = client.patch(
+        f"/api/positions/{state['position_id']}", json={"quantity": 7, "average_cost": 137.91},
+    )
+    assert corrected.status_code == 200, corrected.text
+    trades, orders = synthetic_binance_stock_history()
+    assert len(trades) == 8
+    assert len(orders) == 7
+    db_generator = app.dependency_overrides[get_db]()
+    db = next(db_generator)
+    try:
+        ids = db.get(AppSetting, f"binance:{state['account_id']}:stock_trade_ids")
+        ids.value = json.dumps([item["executionId"] for item in trades[2:]])
+        db.commit()
+    finally:
+        db_generator.close()
+    services_module._attach_binance_equity_order_costs(trades, orders if fees_available else [])
+    state["trades"] = trades
+    state["funding"][0]["free"] = "7"
+    for _ in range(2):
+        refreshed = client.post(f"/api/exchanges/sync?account_id={state['account_id']}&force=true")
+        assert refreshed.status_code == 200, refreshed.text
+        position = client.get("/api/positions").json()[0]
+        assert position["quantity"] == 7
+        # Seven orders, one split into two executions: fee is charged seven
+        # times, not eight. The two June purchases are part of existing shares.
+        assert position["average_cost"] == (110.17 if fees_available else 137.91)
+        assert position["cost_status"] == ("automatic" if fees_available else "estimated")
+
+
+def test_binance_stock_order_fees_and_wallet_rounding_preserve_total_basis():
+    trades, orders = synthetic_binance_stock_history()
+    services_module._attach_binance_equity_order_costs(trades, orders)
+    wallet_quantity = services_module.Decimal("6.99999996")
+    average = services_module._binance_equity_average_cost(trades, "MSTR", wallet_quantity)
+    assert average is not None
+    assert average * wallet_quantity == pytest.approx(services_module.Decimal("771.19"))
+
+
+def test_binance_stock_order_history_replay_keeps_remaining_cost_after_sale():
+    trades = [
+        {"executionId": "buy-a", "orderId": "a", "side": "BUY", "qty": "1", "price": "100", "executionAt": 1},
+        {"executionId": "buy-b", "orderId": "a", "side": "BUY", "qty": "1", "price": "100", "executionAt": 2},
+        {"executionId": "sell", "orderId": "b", "side": "SELL", "qty": "1", "price": "130", "executionAt": 3},
+        {"executionId": "buy-c", "orderId": "c", "side": "BUY", "qty": "1", "price": "150", "executionAt": 4},
+    ]
+    orders = [
+        {"orderId": "a", "filledQty": "2", "filledTotal": "200", "fee": "1"},
+        {"orderId": "c", "filledQty": "1", "filledTotal": "150", "fee": "0.5"},
+    ]
+    services_module._attach_binance_equity_order_costs(trades, orders)
+    assert services_module._binance_equity_average_cost(
+        trades, "MSTR", services_module.Decimal("2")
+    ) == services_module.Decimal("125.5")
+
+
+def test_binance_stock_split_order_preserves_execution_prices_around_sale():
+    trades = [
+        {"executionId": "a-first", "orderId": "a", "side": "BUY", "qty": "1", "price": "100", "total": "100", "executionAt": 1},
+        {"executionId": "sell", "orderId": "b", "side": "SELL", "qty": "0.5", "price": "150", "executionAt": 2},
+        {"executionId": "a-last", "orderId": "a", "side": "BUY", "qty": "1", "price": "200", "total": "200", "executionAt": 3},
+    ]
+    services_module._attach_binance_equity_order_costs(
+        trades, [{"orderId": "a", "filledQty": "2", "filledTotal": "300", "fee": "2"}],
+    )
+    average = services_module._binance_equity_average_cost(
+        trades, "MSTR", services_module.Decimal("1.5"),
+    )
+    # First unit costs 101; selling half leaves 50.5 of basis. The later unit
+    # costs 201, so the remaining 1.5 shares carry exactly 251.5 of basis.
+    assert average is not None
+    assert average * services_module.Decimal("1.5") == services_module.Decimal("251.5")
+
+
+@pytest.mark.parametrize("path,identity", [
+    ("/sapi/v1/equity/trade/history", "executionId"),
+    ("/sapi/v1/equity/order/history", "orderId"),
+])
+def test_binance_stock_histories_start_at_zero_and_read_every_page(path: str, identity: str):
+    seen_pages = []
+
+    def handler(request):
+        assert request.url.path == path
+        assert request.url.params["startTime"] == "0"
+        page = int(request.url.params["current"])
+        seen_pages.append(page)
+        return services_module.httpx.Response(
+            200, json={"rows": [{identity: str(page)}], "total": 2}, request=request,
+        )
+
+    with services_module.httpx.Client(transport=services_module.httpx.MockTransport(handler)) as http_client:
+        rows = services_module._fetch_binance_equity_history(
+            http_client, "test-secret", 0, path, identity, 1_800_000_000_000,
+        )
+    assert seen_pages == [1, 2]
+    assert [item[identity] for item in rows] == ["1", "2"]
+
+
+def test_binance_stock_history_rejects_partial_or_repeating_pages():
+    def handler(request):
+        return services_module.httpx.Response(
+            200, json={"rows": [{"executionId": "only-one"}], "total": 2}, request=request,
+        )
+
+    with services_module.httpx.Client(transport=services_module.httpx.MockTransport(handler)) as http_client:
+        with pytest.raises(ValueError, match="分頁沒有繼續前進"):
+            services_module._fetch_binance_equity_history(
+                http_client, "test-secret", 0, "/sapi/v1/equity/trade/history",
+                "executionId", 1_800_000_000_000,
+            )
+
+
+@pytest.mark.parametrize("history_kind", ["complete", "incomplete", "saturated"])
+def test_binance_funding_bstock_cost_history_is_read_without_spot_balance(
+    monkeypatch: pytest.MonkeyPatch, history_kind: str,
+):
+    real_client = services_module.httpx.Client
+    response = services_module.httpx.Response
+    requests = []
+
+    def handler(request):
+        path = request.url.path
+        if path == "/api/v3/time":
+            payload = {"serverTime": 1_800_000_000_000}
+        elif path == "/api/v3/account":
+            payload = {"balances": [{"asset": "USDT", "free": "100", "locked": "0"}]}
+        elif path == "/sapi/v1/asset/wallet/balance":
+            payload = [{
+                "activate": True, "balance": "600", "walletName": "Funding",
+                "assetBalances": [{"asset": "MSTRB", "free": "4", "locked": "0"}],
+            }]
+        elif path == "/sapi/v1/asset/get-funding-asset":
+            payload = [{"asset": "MSTRB", "free": "4", "locked": "0", "freeze": "0"}]
+        elif path == "/sapi/v1/equity/market/exchangeInfo":
+            payload = {"symbols": [{"symbol": "MSTR"}]}
+        elif path == "/sapi/v1/equity/market/tokenized-assets":
+            payload = [{"tokenizedAsset": "MSTRB", "underlyingAsset": "MSTR"}]
+        elif path == "/sapi/v1/equity/trade/history":
+            payload = {"rows": [], "total": 0}
+        elif path in {"/papi/v1/um/positionRisk", "/fapi/v3/balance", "/dapi/v1/balance"}:
+            payload = []
+        elif path == "/api/v3/ticker/price":
+            # Cost retrieval should work even when the token quote is absent.
+            payload = []
+        elif path == "/api/v3/myTrades":
+            requests.append(request.url.params["symbol"])
+            payload = [{
+                "id": 1, "time": 1, "qty": "3" if history_kind == "incomplete" else "4",
+                "quoteQty": "300" if history_kind == "incomplete" else "400", "price": "100",
+                "commission": "0", "commissionAsset": "USDT", "isBuyer": True,
+            }]
+            if history_kind == "saturated":
+                payload.extend({"id": index, "time": index, "qty": "0"} for index in range(2, 1001))
+        else:
+            raise AssertionError(f"Unexpected Binance request path: {path}")
+        return response(200, json=payload, request=request)
+
+    transport = services_module.httpx.MockTransport(handler)
+    monkeypatch.setattr(
+        services_module.httpx, "Client",
+        lambda **kwargs: real_client(transport=transport, **kwargs),
+    )
+    snapshot = services_module._fetch_binance_spot_snapshot("test-key", "test-secret")
+    assert requests == ["MSTRBUSDT"]
+    funding = snapshot[3][0]
+    wallet = snapshot[7][0]
+    if history_kind == "complete":
+        assert funding["_average_cost"] == "100"
+        assert funding["_cost_status"] == "automatic"
+        assert wallet["_average_cost"] == "100"
+    else:
+        assert "_average_cost" not in funding
+        assert "_cost_status" not in funding
+        assert "_average_cost" not in wallet
+        assert any("成本需確認" in item for item in snapshot[8])
 
 
 def test_binance_credentials_remove_pasted_whitespace_and_invisible_characters():

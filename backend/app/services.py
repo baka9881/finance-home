@@ -2086,6 +2086,39 @@ def _set_setting_value(db: Session, key: str, value: str) -> None:
     row.value = value
 
 
+def _binance_stock_cost_basis(db: Session, account_id: int) -> dict[str, dict[str, Any]]:
+    try:
+        value = json.loads(
+            _get_setting_value(db, _binance_setting_key(account_id, "stock_cost_basis"))
+            or "{}"
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return {}
+    if not isinstance(value, dict):
+        return {}
+    return {symbol: item for symbol, item in value.items() if isinstance(item, dict)}
+
+
+def _binance_stock_cost_checkpoint(db: Session, position: Position) -> dict[str, Any]:
+    status, _ = position_cost_status(db, position, "")
+    return {
+        "position_id": position.id,
+        "quantity": str(position.quantity),
+        "average_cost": str(position.average_cost),
+        "cost_status": status,
+    }
+
+
+def reset_binance_stock_cost_basis(db: Session, position: Position) -> None:
+    """Keep an existing exchange checkpoint aligned with a manual correction."""
+    key = _binance_setting_key(position.account_id, "stock_cost_basis")
+    if position.market != "US" or not db.get(AppSetting, key):
+        return
+    basis = _binance_stock_cost_basis(db, position.account_id)
+    basis[position.symbol.upper()] = _binance_stock_cost_checkpoint(db, position)
+    _set_setting_value(db, key, json.dumps(basis))
+
+
 def _credential_cipher() -> Fernet:
     secret = (
         os.getenv("FINANCE_CREDENTIAL_SECRET", "").strip()
@@ -2157,6 +2190,7 @@ def disconnect_binance_account(db: Session, account_id: int) -> None:
             "last_cost_sync_at",
             "position_ids",
             "stock_trade_ids",
+            "stock_cost_basis",
         )
     ]
     db.execute(delete(AppSetting).where(AppSetting.key.in_(keys)))
@@ -2487,6 +2521,119 @@ def _binance_spot_average_cost(
     return running_cost / running_quantity if running_cost > 0 else None
 
 
+def _binance_equity_execution_id(item: dict[str, Any]) -> str:
+    return str(
+        item.get("executionId")
+        or "|".join(
+            str(item.get(key) or "")
+            for key in ("orderId", "symbol", "side", "qty", "price", "executionAt")
+        )
+    )
+
+
+def _fetch_binance_equity_history(
+    client: httpx.Client, api_secret: str, server_time_offset: int,
+    path: str, identity_field: str, history_end: int,
+) -> list[dict[str, Any]]:
+    rows_by_id: dict[str, dict[str, Any]] = {}
+    for page in range(1, 1001):
+        query = _binance_signed_query(
+            api_secret, int(time.time() * 1000) + server_time_offset,
+            ("startTime", "0"), ("endTime", str(history_end)),
+            ("current", str(page)), ("size", "100"),
+        )
+        response = client.get(f"https://api.binance.com{path}?{query}")
+        payload = _binance_response_payload(response)
+        if not isinstance(payload, dict) or not isinstance(payload.get("rows"), list):
+            raise ValueError("Binance 股票歷史紀錄格式不完整")
+        rows = payload["rows"]
+        total = int(payload["total"]) if payload.get("total") is not None else None
+        before = len(rows_by_id)
+        for item in rows:
+            if not isinstance(item, dict):
+                continue
+            identity = str(item.get(identity_field) or _binance_equity_execution_id(item))
+            rows_by_id[identity] = item
+        if total is not None and len(rows_by_id) >= total:
+            return list(rows_by_id.values())
+        if not rows or (total is None and len(rows) < 100):
+            if total is None:
+                return list(rows_by_id.values())
+            raise ValueError("Binance 股票歷史紀錄尚未完整讀取")
+        if len(rows_by_id) == before:
+            raise ValueError("Binance 股票歷史分頁沒有繼續前進")
+    raise ValueError("Binance 股票歷史超過可完整讀取的分頁數")
+
+
+def _attach_binance_equity_order_costs(
+    trades: list[dict[str, Any]], orders: list[dict[str, Any]],
+) -> None:
+    orders_by_id = {str(item.get("orderId")): item for item in orders if item.get("orderId")}
+    quantities_by_order: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    notionals_by_order: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    for item in trades:
+        order_id = str(item.get("orderId"))
+        quantities_by_order[order_id] += decimal_value(item.get("qty"))
+        notional = decimal_value(item.get("total"))
+        if notional <= 0:
+            notional = decimal_value(item.get("qty")) * decimal_value(item.get("price"))
+        notionals_by_order[order_id] += notional
+    for item in trades:
+        item["_cost_details_complete"] = False
+        side = str(item.get("side") or "").upper()
+        if side == "SELL":
+            # Selling removes the moving-average basis; proceeds and selling
+            # fees do not change the unit cost of the remaining shares.
+            item["_cost_details_complete"] = True
+            continue
+        order_id = str(item.get("orderId"))
+        order = orders_by_id.get(order_id, {})
+        filled_quantity = decimal_value(order.get("filledQty"))
+        filled_total = decimal_value(order.get("filledTotal"))
+        fee = decimal_value(order.get("fee"))
+        notional = decimal_value(item.get("total"))
+        if notional <= 0:
+            notional = decimal_value(item.get("qty")) * decimal_value(item.get("price"))
+        if (
+            side != "BUY" or filled_quantity <= 0 or filled_total <= 0
+            or notional <= 0 or notionals_by_order[order_id] <= 0
+            or order.get("fee") is None or fee < 0
+            or str(item.get("quote") or "USD").upper() not in {"USD", "USDT", "USDC"}
+            or abs(quantities_by_order[order_id] - filled_quantity) > Decimal("0.0000001")
+        ):
+            continue
+        # Keep differently priced executions distinct for an intervening SELL,
+        # while conserving the order's final reported consideration and fee.
+        item["_quote_quantity"] = str(filled_total * notional / notionals_by_order[order_id])
+        item["_commission"] = str(fee * decimal_value(item.get("qty")) / filled_quantity)
+        item["_cost_details_complete"] = True
+
+
+def _binance_equity_average_cost(
+    trades: list[dict[str, Any]], symbol: str, current_quantity: Decimal,
+) -> Decimal | None:
+    if not trades or not all(item.get("_cost_details_complete") is True for item in trades):
+        return None
+    spot_trades = []
+    net_quantity = ZERO
+    for index, item in enumerate(trades):
+        side = str(item.get("side") or "").upper()
+        quantity = decimal_value(item.get("qty"))
+        if side not in {"BUY", "SELL"} or quantity <= 0:
+            return None
+        net_quantity += quantity if side == "BUY" else -quantity
+        spot_trades.append({
+            "id": index, "time": item.get("executionAt"), "qty": quantity,
+            "price": item.get("price"), "quoteQty": item.get("_quote_quantity"),
+            "commission": item.get("_commission", "0"),
+            "commissionAsset": "USDT", "isBuyer": side == "BUY",
+        })
+    average = _binance_spot_average_cost(spot_trades, symbol, current_quantity)
+    # The exchange rounds executions and wallet quantities independently.
+    # Preserve the reconstructed total basis on the exact wallet quantity.
+    return average * net_quantity / current_quantity if average is not None else None
+
+
 def _fetch_binance_spot_snapshot(
     api_key: str,
     api_secret: str,
@@ -2646,42 +2793,23 @@ def _fetch_binance_spot_snapshot(
         equity_trades: list[dict[str, Any]] = []
         if include_cost_details:
             try:
-                # Binance Stocks Trading launched on 2026-07-20. Reading from its
-                # first day lets us rebuild current share quantities from every
-                # BUY and SELL fill because the API has no direct positions route.
-                stock_history_start = int(
-                    datetime(2026, 7, 20, tzinfo=timezone.utc).timestamp() * 1000
-                )
                 stock_history_end = int(time.time() * 1000) + server_time_offset
-                page = 1
-                while page <= 20:
-                    trade_timestamp = int(time.time() * 1000) + server_time_offset
-                    trade_query = _binance_signed_query(
-                        api_secret,
-                        trade_timestamp,
-                        ("startTime", str(stock_history_start)),
-                        ("endTime", str(stock_history_end)),
-                        ("current", str(page)),
-                        ("size", "100"),
-                    )
-                    trade_response = client.get(
-                        f"https://api.binance.com/sapi/v1/equity/trade/history?{trade_query}"
-                    )
-                    trade_payload = _binance_response_payload(trade_response)
-                    rows = (
-                        trade_payload.get("rows", [])
-                        if isinstance(trade_payload, dict)
-                        else []
-                    )
-                    if not isinstance(rows, list):
-                        break
-                    equity_trades.extend(
-                        item for item in rows if isinstance(item, dict)
-                    )
-                    total = int(trade_payload.get("total") or len(equity_trades))
-                    if page * 100 >= total or not rows:
-                        break
-                    page += 1
+                equity_trades = _fetch_binance_equity_history(
+                    client, api_secret, server_time_offset,
+                    "/sapi/v1/equity/trade/history", "executionId", stock_history_end,
+                )
+                if equity_trades:
+                    orders: list[dict[str, Any]] = []
+                    try:
+                        orders = _fetch_binance_equity_history(
+                            client, api_secret, server_time_offset,
+                            "/sapi/v1/equity/order/history", "orderId", stock_history_end,
+                        )
+                    except (ValueError, httpx.HTTPError):
+                        wallet_warnings.append("暫時無法完整讀取 Binance 股票訂單費用，成本需要確認")
+                    _attach_binance_equity_order_costs(equity_trades, orders)
+                    if any(not item.get("_cost_details_complete") for item in equity_trades):
+                        wallet_warnings.append("Binance 股票訂單金額或費用不完整，成本需要確認")
             except (ValueError, httpx.HTTPError):
                 wallet_warnings.append(
                     "暫時無法讀取 Binance 股票成交紀錄，既有股票持倉會先保留"
@@ -2802,7 +2930,44 @@ def _fetch_binance_spot_snapshot(
             and item.get("symbol")
             and decimal_value(item.get("price")) > 0
         }
-        for item in account_payload.get("balances", []) if include_cost_details else []:
+        cost_candidates = {
+            str(item.get("asset") or "").upper(): item
+            for item in account_payload.get("balances", []) if include_cost_details
+            if isinstance(item, dict) and item.get("asset")
+        }
+        if include_cost_details:
+            funding_equity_quantities: dict[str, Decimal] = defaultdict(lambda: ZERO)
+            for item in funding_balances:
+                asset = str(item.get("asset") or "").upper()
+                if asset in equity_asset_map:
+                    funding_equity_quantities[asset] += (
+                        decimal_value(item.get("free"))
+                        + decimal_value(item.get("locked"))
+                        + decimal_value(item.get("freeze"))
+                    )
+            for asset, funding_quantity in funding_equity_quantities.items():
+                spot = cost_candidates.get(asset, {})
+                quantity = (
+                    funding_quantity
+                    + decimal_value(spot.get("free"))
+                    + decimal_value(spot.get("locked"))
+                )
+                wallet_rows = [
+                    item for item in wallet_asset_balances or []
+                    if str(item.get("asset") or "").upper() == asset
+                ]
+                if wallet_rows:
+                    quantity = sum(
+                        decimal_value(item.get("free")) + decimal_value(item.get("locked"))
+                        for item in wallet_rows
+                    )
+                # Funding bStocks are absent from /api/v3/account balances.
+                # Reconstruct their cost against all held tokens, not just
+                # the Spot slice (which can be empty after a transfer).
+                cost_candidates[asset] = {"asset": asset, "free": quantity, "locked": ZERO}
+
+        costs_by_asset: dict[str, dict[str, str]] = {}
+        for item in cost_candidates.values():
             if not isinstance(item, dict):
                 continue
             asset = str(item.get("asset") or "").upper()
@@ -2813,8 +2978,8 @@ def _fetch_binance_spot_snapshot(
                 not asset
                 or asset in BINANCE_CASH_ASSETS
                 or quantity <= 0
-                or not price
-                or quantity * price < Decimal("0.30")
+                or (not price and asset not in equity_asset_map)
+                or (price and quantity * price < Decimal("0.30"))
             ):
                 continue
             try:
@@ -2834,9 +2999,14 @@ def _fetch_binance_spot_snapshot(
                     asset,
                     quantity,
                 )
+                if asset in equity_asset_map and isinstance(trades_payload, list) and len(trades_payload) >= 1000:
+                    average_cost = None
                 if average_cost is not None:
                     item["_average_cost"] = str(average_cost)
                     item["_cost_status"] = "automatic"
+                    costs_by_asset[asset] = {
+                        "_average_cost": str(average_cost), "_cost_status": "automatic"
+                    }
                 elif trades_payload:
                     wallet_warnings.append(
                         f"{asset} 的成交數量與目前餘額不同，成本需確認一次"
@@ -2846,20 +3016,11 @@ def _fetch_binance_spot_snapshot(
                     f"暫時無法讀取 {asset} 的現貨成交紀錄，成本維持原值"
                 )
 
-        if wallet_asset_balances is not None:
-            spot_by_asset = {
-                str(item.get("asset") or "").upper(): item
-                for item in account_payload.get("balances", [])
-                if isinstance(item, dict) and item.get("asset")
-            }
-            for item in wallet_asset_balances:
-                spot_item = spot_by_asset.get(str(item.get("asset") or "").upper())
-                if not spot_item:
-                    continue
-                if spot_item.get("_average_cost"):
-                    item["_average_cost"] = spot_item["_average_cost"]
-                if spot_item.get("_cost_status"):
-                    item["_cost_status"] = spot_item["_cost_status"]
+        for collection in (account_payload.get("balances", []), funding_balances, wallet_asset_balances or []):
+            for item in collection:
+                metadata = costs_by_asset.get(str(item.get("asset") or "").upper())
+                if metadata:
+                    item.update(metadata)
 
     balances = account_payload.get("balances", []) if isinstance(account_payload, dict) else []
     prices = {
@@ -3093,6 +3254,10 @@ def sync_binance_account(
         for position in legacy_tokenized_positions:
             position.archived = True
 
+    funding_stock_quantities: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    funding_stock_assets: dict[str, list[str]] = defaultdict(list)
+    funding_stock_costs: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    funding_stock_cost_quantities: dict[str, Decimal] = defaultdict(lambda: ZERO)
     for item in funding_balances:
         asset = str(item.get("asset") or "").upper()
         quantity = (
@@ -3100,30 +3265,14 @@ def sync_binance_account(
             + decimal_value(item.get("locked"))
             + decimal_value(item.get("freeze"))
         )
-        if not asset or quantity <= 0 or asset in BINANCE_CASH_ASSETS:
+        if not asset or quantity < 0 or asset in BINANCE_CASH_ASSETS:
             continue
-
-        # Binance Stocks holdings are kept in the Funding Wallet. When the
-        # user already tracks that US-equity symbol, the Funding Wallet is the
-        # authoritative source for its current quantity; cost and price stay
-        # on the existing position because this endpoint does not return them.
         stock_symbol = equity_asset_map.get(asset, asset)
-        position = db.scalar(
-            select(Position).where(
-                Position.account_id == account.id,
-                Position.market == "US",
-                Position.symbol == stock_symbol,
-            )
-        )
-        if not position:
-            warnings.append(
-                f"資金帳戶資產 {asset} 已讀取，但尚未找到對應的投資持倉"
-            )
-            continue
-        position.quantity = quantity
-        position.archived = False
-        db.flush()
-        seen_position_ids.add(position.id)
+        funding_stock_quantities[stock_symbol] += quantity
+        funding_stock_assets[stock_symbol].append(asset)
+        if item.get("_cost_status") == "automatic" and decimal_value(item.get("_average_cost")) > 0:
+            funding_stock_costs[stock_symbol] += quantity * decimal_value(item["_average_cost"])
+            funding_stock_cost_quantities[stock_symbol] += quantity
 
     stock_trade_ids_key = _binance_setting_key(account.id, "stock_trade_ids")
     processed_trade_ids_row = db.get(AppSetting, stock_trade_ids_key)
@@ -3139,24 +3288,43 @@ def sync_binance_account(
 
     current_trade_ids: set[str] = set()
     new_stock_trades: list[dict[str, Any]] = []
+    stock_trades_by_symbol: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    latest_processed_execution: dict[str, int] = defaultdict(int)
     for item in equity_trades:
-        trade_id = str(
-            item.get("executionId")
-            or "|".join(
-                str(item.get(key) or "")
-                for key in ("orderId", "symbol", "side", "qty", "price", "executionAt")
-            )
-        )
+        trade_id = _binance_equity_execution_id(item)
+        if trade_id in current_trade_ids:
+            continue
         current_trade_ids.add(trade_id)
+        raw_symbol = str(item.get("symbol") or "").upper()
+        symbol = equity_asset_map.get(raw_symbol, raw_symbol)
+        normalized = {**item, "symbol": symbol}
+        stock_trades_by_symbol[symbol].append(normalized)
+        if trade_id in processed_trade_ids:
+            latest_processed_execution[symbol] = max(
+                latest_processed_execution[symbol], int(item.get("executionAt") or 0)
+            )
         if processed_trade_ids_value is not None and trade_id not in processed_trade_ids:
-            new_stock_trades.append(item)
+            new_stock_trades.append(normalized)
+
+    reconstructed_stock_costs: dict[str, Decimal] = {}
+    for symbol, quantity in funding_stock_quantities.items():
+        average = _binance_equity_average_cost(stock_trades_by_symbol[symbol], symbol, quantity)
+        if average is not None:
+            reconstructed_stock_costs[symbol] = average
+    backfilled_stock_symbols = {
+        item["symbol"] for item in new_stock_trades
+        if int(item.get("executionAt") or 0) < latest_processed_execution[item["symbol"]]
+    }
 
     # A stock can have no new fills during this sync and still be an active
     # holding. Keep every existing US position referenced by the trade history
     # in the Binance-managed set so the general stale-position cleanup below
     # does not archive it.
     stock_history_symbols = {
-        str(item.get("symbol") or "").upper()
+        equity_asset_map.get(
+            str(item.get("symbol") or "").upper(),
+            str(item.get("symbol") or "").upper(),
+        )
         for item in equity_trades
         if str(item.get("symbol") or "").strip()
     }
@@ -3175,10 +3343,57 @@ def sync_binance_account(
             if decimal_value(position.quantity) > 0
         )
 
-    # The Stocks API only exposes fills since the product launched; it does
-    # not expose a complete positions endpoint. On the first sync, preserve
-    # the user's reconciled quantity and checkpoint all existing fills. Every
-    # later sync applies only newly seen BUY/SELL executions.
+    stock_cost_basis = _binance_stock_cost_basis(db, account.id)
+    stock_trade_symbols: set[str] = set()
+    stock_net_quantities: dict[str, Decimal] = defaultdict(lambda: ZERO)
+    for item in new_stock_trades:
+        symbol = item["symbol"]
+        side = str(item.get("side") or "").upper()
+        quantity = decimal_value(item.get("qty"))
+        if symbol and quantity > 0 and side in {"BUY", "SELL"}:
+            stock_trade_symbols.add(symbol)
+            stock_net_quantities[symbol] += quantity if side == "BUY" else -quantity
+
+    # Light syncs update displayed balances without fetching fills. Calculate
+    # the next full sync from the quantity paired with the processed fills,
+    # rather than from a Funding balance that may already include those buys.
+    stock_start_statuses: dict[str, str] = {}
+    for symbol in stock_trade_symbols:
+        if symbol in reconstructed_stock_costs or symbol in backfilled_stock_symbols:
+            continue
+        position = db.scalar(
+            select(Position).where(
+                Position.account_id == account.id,
+                Position.market == "US",
+                Position.symbol == symbol,
+            )
+        )
+        if not position:
+            continue
+        status, _ = position_cost_status(db, position, "")
+        checkpoint = stock_cost_basis.get(symbol, {})
+        checkpoint_cost = decimal_value(checkpoint.get("average_cost"))
+        if (
+            checkpoint.get("position_id") == position.id
+            and abs(checkpoint_cost - decimal_value(position.average_cost))
+            <= Decimal("0.0000005")
+        ):
+            position.quantity = decimal_value(checkpoint.get("quantity"))
+            position.average_cost = checkpoint_cost
+            status = str(checkpoint.get("cost_status") or status)
+        elif symbol in funding_stock_quantities:
+            # Existing installations have no quantity checkpoint yet. Infer
+            # the pre-fill quantity from the authoritative final balance.
+            starting_quantity = funding_stock_quantities[symbol] - stock_net_quantities[symbol]
+            if starting_quantity >= 0:
+                position.quantity = starting_quantity
+            else:
+                status = "estimated"
+                warnings.append(f"{symbol} 的成交數量與資金帳戶餘額不符，成本需要確認")
+        stock_start_statuses[symbol] = status
+
+    # On the first full sync preserve reconciled costs and checkpoint existing
+    # fills. Later syncs apply each unseen execution once, in execution order.
     for item in sorted(new_stock_trades, key=lambda row: int(row.get("executionAt") or 0)):
         symbol = str(item.get("symbol") or "").upper()
         side = str(item.get("side") or "").upper()
@@ -3186,6 +3401,15 @@ def sync_binance_account(
         price = decimal_value(item.get("price"))
         if not symbol or quantity <= 0 or side not in {"BUY", "SELL"}:
             continue
+        if symbol in reconstructed_stock_costs or symbol in backfilled_stock_symbols:
+            # Full replay already includes these executions. Older fills
+            # discovered after fixing a truncated date range are not new buys.
+            continue
+        added_cost = quantity * price
+        if item.get("_cost_details_complete") is True:
+            added_cost = decimal_value(item.get("_quote_quantity")) + decimal_value(item.get("_commission"))
+        elif item.get("_cost_details_complete") is False:
+            stock_start_statuses[symbol] = "estimated"
         position = db.scalar(
             select(Position).where(
                 Position.account_id == account.id,
@@ -3203,7 +3427,7 @@ def sync_binance_account(
                 symbol=symbol,
                 name=symbol,
                 quantity=quantity,
-                average_cost=price,
+                average_cost=added_cost / quantity,
                 currency="USD",
             )
             db.add(position)
@@ -3215,10 +3439,13 @@ def sync_binance_account(
             if new_quantity > 0 and price > 0:
                 position.average_cost = (
                     old_quantity * decimal_value(position.average_cost)
-                    + quantity * price
+                    + added_cost
                 ) / new_quantity
             position.quantity = new_quantity
         else:
+            if quantity > decimal_value(position.quantity):
+                stock_start_statuses[symbol] = "estimated"
+                warnings.append(f"{symbol} 的賣出數量超過可還原持股，成本需要確認")
             position.quantity = max(ZERO, decimal_value(position.quantity) - quantity)
             position.archived = position.quantity <= 0
         position.currency = "USD"
@@ -3228,18 +3455,103 @@ def sync_binance_account(
         if not position.archived:
             seen_position_ids.add(position.id)
 
-    processed_trade_ids.update(current_trade_ids)
-    _set_setting_value(
-        db,
-        stock_trade_ids_key,
-        json.dumps(sorted(processed_trade_ids)),
-    )
+    if include_cost_details:
+        for symbol in stock_trade_symbols:
+            if symbol in reconstructed_stock_costs or symbol in backfilled_stock_symbols:
+                continue
+            position = db.scalar(
+                select(Position).where(
+                    Position.account_id == account.id,
+                    Position.market == "US",
+                    Position.symbol == symbol,
+                )
+            )
+            if not position:
+                continue
+            if stock_start_statuses.get(symbol) in {"estimated", "missing"}:
+                set_position_cost_status(db, position, "estimated")
+            else:
+                set_position_cost_status(db, position, "automatic")
+            stock_cost_basis[symbol] = _binance_stock_cost_checkpoint(db, position)
+
+    # Funding is authoritative for the final share quantity only. Reconcile
+    # it after costing fills, and aggregate tokens that map to the same stock.
+    for symbol, quantity in funding_stock_quantities.items():
+        position = db.scalar(
+            select(Position).where(
+                Position.account_id == account.id,
+                Position.market == "US",
+                Position.symbol == symbol,
+            )
+        )
+        if not position:
+            if symbol in reconstructed_stock_costs:
+                position = Position(
+                    account_id=account.id, market="US", symbol=symbol, name=symbol,
+                    quantity=quantity, average_cost=reconstructed_stock_costs[symbol], currency="USD",
+                )
+                db.add(position)
+                db.flush()
+            else:
+                assets = ", ".join(funding_stock_assets[symbol])
+                warnings.append(f"資金帳戶資產 {assets} 已讀取，但尚未找到對應的投資持倉")
+                continue
+        checkpoint = stock_cost_basis.get(symbol)
+        matched_funding_cost = (
+            quantity > 0 and funding_stock_cost_quantities[symbol] == quantity
+        )
+        if symbol in reconstructed_stock_costs:
+            position.average_cost = reconstructed_stock_costs[symbol]
+            set_position_cost_status(db, position, "automatic")
+            matched_funding_cost = True
+        elif matched_funding_cost:
+            position.average_cost = funding_stock_costs[symbol] / quantity
+            set_position_cost_status(db, position, "automatic")
+        elif symbol in backfilled_stock_symbols:
+            set_position_cost_status(db, position, "estimated")
+            if checkpoint:
+                checkpoint["cost_status"] = "estimated"
+            warnings.append(f"{symbol} 已補回較早成交，但完整訂單費用尚未核對，成本需要確認")
+        elif checkpoint and decimal_value(checkpoint.get("quantity")) != quantity:
+            set_position_cost_status(db, position, "estimated")
+            warnings.append(f"{symbol} 的持股數量已更新，成本等待完整成交紀錄確認")
+        elif checkpoint and checkpoint.get("cost_status") in {
+            "automatic", "calculated", "confirmed", "estimated", "missing"
+        }:
+            set_position_cost_status(db, position, checkpoint["cost_status"])
+        elif include_cost_details and not checkpoint:
+            status, _ = position_cost_status(db, position, "")
+            if status == "automatic":
+                # Old releases could put a perpetual's entry price onto the
+                # real stock. Without matched fills that value is unverified.
+                set_position_cost_status(db, position, "estimated")
+        position.quantity = quantity
+        position.archived = quantity <= 0
+        db.flush()
+        if position.archived:
+            seen_position_ids.discard(position.id)
+        else:
+            seen_position_ids.add(position.id)
+        if include_cost_details and (matched_funding_cost or not checkpoint):
+            stock_cost_basis[symbol] = _binance_stock_cost_checkpoint(db, position)
+
+    if include_cost_details:
+        # Baseline history-only stocks too, so a later light sync cannot move
+        # the cost quantity forward before its corresponding fills are read.
+        for position in existing_stock_positions if stock_history_symbols else []:
+            if position.symbol not in stock_cost_basis:
+                stock_cost_basis[position.symbol] = _binance_stock_cost_checkpoint(db, position)
+        processed_trade_ids.update(current_trade_ids)
+        _set_setting_value(db, stock_trade_ids_key, json.dumps(sorted(processed_trade_ids)))
+        _set_setting_value(
+            db,
+            _binance_setting_key(account.id, "stock_cost_basis"),
+            json.dumps(stock_cost_basis),
+        )
 
     for item in um_positions or []:
         raw_symbol = str(item.get("symbol") or "").upper()
         base_asset = str(item.get("baseAsset") or "").upper()
-        contract_type = str(item.get("contractType") or "").upper()
-        underlying_type = str(item.get("underlyingType") or "").upper()
         if not base_asset:
             for quote_asset in ("USDT", "USDC"):
                 if raw_symbol.endswith(quote_asset):
@@ -3254,50 +3566,8 @@ def sync_binance_account(
         if signed_quantity == ZERO or mark_price <= 0:
             continue
 
-        is_tradifi = (
-            underlying_type == "EQUITY"
-            or contract_type == "TRADIFI_PERPETUAL"
-        )
-        if is_tradifi:
-            quantity = abs(signed_quantity)
-            position = db.scalar(
-                select(Position).where(
-                    Position.account_id == account.id,
-                    Position.market == "US",
-                    Position.symbol == base_asset,
-                )
-            )
-            if not position:
-                position = Position(
-                    account_id=account.id,
-                    market="US",
-                    symbol=base_asset,
-                    name=f"{base_asset}（Binance 合約）",
-                    quantity=quantity,
-                    average_cost=entry_price or mark_price,
-                    currency="USD",
-                )
-                db.add(position)
-            else:
-                position.quantity = quantity
-                position.average_cost = entry_price or position.average_cost
-                position.currency = "USD"
-                position.manual_price = None
-                position.archived = False
-            db.flush()
-            set_position_cost_status(db, position, "automatic")
-            seen_position_ids.add(position.id)
-            _upsert_price(
-                db,
-                "US",
-                base_asset,
-                date.today(),
-                mark_price,
-                "USD",
-                "Binance Futures",
-            )
-            continue
-
+        # Equity perpetuals are contracts too. Keep them separate from real
+        # US-stock holdings, including their entry cost, direction and quote.
         position_side = str(item.get("positionSide") or "BOTH").upper()
         if position_side == "SHORT":
             signed_quantity = -abs(signed_quantity)

@@ -118,6 +118,7 @@ from .services import (
     recurring_expense_signature,
     repair_cross_source_card_duplicates,
     repair_linked_transfer_kinds,
+    reset_binance_stock_cost_basis,
     restore_backup,
     seed_defaults,
     seed_demo,
@@ -2006,6 +2007,8 @@ def update_position(position_id: int, payload: PositionUpdate, db: DB):
     db.flush()
     if "average_cost" in changes:
         set_position_cost_status(db, row, "confirmed")
+    if "average_cost" in changes or "quantity" in changes:
+        reset_binance_stock_cost_basis(db, row)
     recalibrate_auto_base_if_needed(db, row.account)
     record_valuation(db)
     db.commit()
