@@ -16,6 +16,14 @@ export type AuthStatus = {
 export type AuthGateState = "authenticated" | "anonymous" | "configuration-error";
 
 export function resolveAuthGate(status: AuthStatus, cloudAuthExpected: boolean): AuthGateState {
+  if (
+    !status
+    || typeof status.required !== "boolean"
+    || typeof status.authenticated !== "boolean"
+    || (status.data_location !== "local" && status.data_location !== "cloud")
+  ) {
+    return "configuration-error";
+  }
   if (cloudAuthExpected && (!status.required || status.data_location !== "cloud")) {
     return "configuration-error";
   }
@@ -66,7 +74,12 @@ async function apiResponse(
     } catch {
       // Keep the generic message when the server did not return JSON.
     }
-    if (response.status === 401 && path !== "/auth/login") clearAuthToken();
+    if (
+      response.status === 401
+      && path !== "/auth/login"
+      && !options.signal?.aborted
+      && getAuthToken() === token
+    ) clearAuthToken();
     throw new ApiError(response.status, message);
   }
   return response;
