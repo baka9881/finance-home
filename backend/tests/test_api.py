@@ -1582,7 +1582,7 @@ def test_binance_funding_bstock_cost_history_is_read_without_spot_balance(
         lambda **kwargs: real_client(transport=transport, **kwargs),
     )
     snapshot = services_module._fetch_binance_spot_snapshot("test-key", "test-secret")
-    assert requests == ["MSTRBUSDT"]
+    assert requests == ["MSTRBUSDT"] * (2 if history_kind == "saturated" else 1)
     funding = snapshot[3][0]
     wallet = snapshot[7][0]
     if history_kind == "complete":
@@ -1591,9 +1591,70 @@ def test_binance_funding_bstock_cost_history_is_read_without_spot_balance(
         assert wallet["_average_cost"] == "100"
     else:
         assert "_average_cost" not in funding
-        assert "_cost_status" not in funding
+        assert funding["_cost_status"] == "estimated"
         assert "_average_cost" not in wallet
         assert any("成本需確認" in item for item in snapshot[8])
+
+
+@pytest.mark.parametrize("confirmed", [False, True])
+@pytest.mark.parametrize("incomplete", [False, True])
+def test_binance_crypto_cost_requires_full_wallet_quantity_and_preserves_confirmed_basis(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, confirmed: bool, incomplete: bool,
+):
+    monkeypatch.setenv("FINANCE_CREDENTIAL_SECRET", "test-credential-secret")
+    client.post("/api/fx/manual", json={
+        "currency": "USD", "rate_date": date.today().isoformat(), "rate_to_twd": 32,
+    })
+    account_response = client.post("/api/accounts", json={
+        "name": "Binance", "institution": "Binance", "account_type": "crypto",
+        "nature": "asset", "currency": "TWD", "is_liquid": True,
+        "opening_balance": 0, "opening_date": date.today().isoformat(),
+    })
+    assert account_response.status_code == 201, account_response.text
+    account_id = account_response.json()["id"]
+    row = {
+        "asset": "BTC", "free": "0.01500421", "locked": "0",
+        "_average_cost": "70000", "_cost_status": "automatic", "_cost_quantity": "0.01500421",
+    }
+    monkeypatch.setattr(services_module, "_fetch_binance_spot_snapshot", lambda *args, **kwargs: (
+        [{"asset": "BTC", "free": "0.00412587", "locked": "0"}],
+        {"BTCUSDT": services_module.Decimal("80000")},
+        services_module.Decimal("1200"), [], {}, [], [], [dict(row)], [],
+    ))
+    connected = client.post("/api/exchanges/binance/connect", json={
+        "account_id": account_id, "api_key": "test-key", "api_secret": "test-secret",
+    })
+    assert connected.status_code == 200, connected.text
+    original = client.get("/api/positions").json()[0]
+    assert original["average_cost"] == 70000
+    assert original["cost_status"] == "automatic"
+    if confirmed:
+        updated = client.patch(f"/api/positions/{original['id']}", json={"average_cost": 71000})
+        assert updated.status_code == 200, updated.text
+    if incomplete:
+        row.pop("_average_cost")
+        row.pop("_cost_quantity")
+        row["_cost_status"] = "estimated"
+    else:
+        row["_average_cost"] = "65771.30"
+        row["_cost_quantity"] = "0.00412587"
+    synced = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert synced.status_code == 200, synced.text
+    position = client.get("/api/positions").json()[0]
+    assert position["quantity"] == 0.01500421
+    assert position["average_cost"] == (71000 if confirmed else 70000)
+    assert position["cost_status"] == ("confirmed" if confirmed else "estimated")
+
+    # Complete history after a genuine acquisition can update the saved basis.
+    row.update({
+        "free": "0.02", "_average_cost": "72000", "_cost_status": "automatic", "_cost_quantity": "0.02",
+    })
+    synced = client.post(f"/api/exchanges/sync?account_id={account_id}&force=true")
+    assert synced.status_code == 200, synced.text
+    position = client.get("/api/positions").json()[0]
+    assert position["quantity"] == 0.02
+    assert position["average_cost"] == 72000
+    assert position["cost_status"] == "automatic"
 
 
 def test_binance_credentials_remove_pasted_whitespace_and_invisible_characters():

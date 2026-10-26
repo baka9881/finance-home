@@ -155,7 +155,7 @@ BINANCE_ASSET_SYMBOLS = {
 BINANCE_TOKENIZED_EQUITY_ASSET_ALIASES = {
     "MSTRB": "MSTR",
 }
-BINANCE_CASH_ASSETS = {"USDT", "USDC", "FDUSD", "TUSD", "USDP", "DAI", "BUSD"}
+BINANCE_CASH_ASSETS = {"USDT", "USDC", "USD1", "FDUSD", "TUSD", "USDP", "DAI", "BUSD"}
 BINANCE_FUTURES_MARKET = "BINANCE_FUTURES"
 BINANCE_MIN_POSITION_VALUE_TWD = Decimal("10")
 BINANCE_FULL_SYNC_INTERVAL = timedelta(hours=1)
@@ -2474,6 +2474,47 @@ def _merge_binance_futures_wallet_balances(
         row["_wallet_names"] = list(futures_row.get("_wallet_names") or [])
         row["_futures_wallet"] = True
     return wallet_asset_balances
+
+
+def _fetch_binance_spot_trades(
+    client: httpx.Client,
+    api_secret: str,
+    server_time_offset: int,
+    pair: str,
+    quote_asset: str,
+) -> list[dict[str, Any]]:
+    """Read every fill, including fills older than the latest 1,000 rows."""
+    rows: list[dict[str, Any]] = []
+    seen: set[tuple[str, int]] = set()
+    from_id = 0
+    while True:
+        timestamp = int(time.time() * 1000) + server_time_offset
+        query = _binance_signed_query(
+            api_secret, timestamp,
+            ("symbol", pair), ("fromId", str(from_id)), ("limit", "1000"),
+        )
+        response = client.get(f"https://api.binance.com/api/v3/myTrades?{query}")
+        payload = _binance_response_payload(response)
+        if not isinstance(payload, list):
+            raise ValueError("Binance 現貨成交紀錄格式不完整")
+        next_id = from_id
+        for item in payload:
+            if not isinstance(item, dict) or item.get("id") is None:
+                raise ValueError("Binance 現貨成交紀錄缺少成交編號")
+            trade_id = int(item["id"])
+            next_id = max(next_id, trade_id + 1)
+            identity = (pair, trade_id)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            rows.append({**item, "symbol": pair, "_quote_asset": quote_asset})
+        if len(payload) < 1000:
+            return rows
+        if next_id <= from_id:
+            raise ValueError("Binance 現貨成交紀錄分頁沒有繼續前進")
+        from_id = next_id
+
+
 def _binance_spot_average_cost(
     trades: Any,
     asset: str,
@@ -2486,7 +2527,10 @@ def _binance_spot_average_cost(
     running_cost = ZERO
     for item in sorted(
         (row for row in trades if isinstance(row, dict)),
-        key=lambda row: (int(row.get("time") or 0), int(row.get("id") or 0)),
+        key=lambda row: (
+            int(row.get("time") or 0), str(row.get("symbol") or ""),
+            int(row.get("id") or 0),
+        ),
     ):
         quantity = decimal_value(item.get("qty"))
         quote_quantity = decimal_value(item.get("quoteQty"))
@@ -2496,6 +2540,15 @@ def _binance_spot_average_cost(
             quote_quantity = quantity * decimal_value(item.get("price"))
         commission = decimal_value(item.get("commission"))
         commission_asset = str(item.get("commissionAsset") or "").upper()
+        quote_asset = str(item.get("_quote_asset") or "USDT").upper()
+        # Prices and quote quantities from the supported dollar stablecoin
+        # markets share the USD accounting unit used for Binance cash here.
+        # A BNB/other-asset fee needs its execution-time conversion; a current
+        # ticker would manufacture a historical cost, so leave it unverified.
+        if quote_asset not in BINANCE_CASH_ASSETS or (
+            commission > 0 and commission_asset not in {asset, quote_asset}
+        ):
+            return None
         is_buyer = item.get("isBuyer") is True or str(item.get("isBuyer")).lower() == "true"
 
         if is_buyer:
@@ -2504,7 +2557,7 @@ def _binance_spot_average_cost(
                 continue
             running_quantity += acquired_quantity
             running_cost += quote_quantity
-            if commission_asset == "USDT":
+            if commission_asset == quote_asset:
                 running_cost += commission
             continue
 
@@ -2932,7 +2985,13 @@ def _fetch_binance_spot_snapshot(
         }
         cost_candidates = {
             str(item.get("asset") or "").upper(): item
-            for item in account_payload.get("balances", []) if include_cost_details
+            # The imported quantity comes from all wallets. Spot is only a
+            # slice after transfers to Unified/Funding/contract wallets.
+            for item in (
+                wallet_asset_balances
+                if wallet_asset_balances is not None
+                else account_payload.get("balances", [])
+            ) if include_cost_details
             if isinstance(item, dict) and item.get("asset")
         }
         if include_cost_details:
@@ -2973,7 +3032,11 @@ def _fetch_binance_spot_snapshot(
             asset = str(item.get("asset") or "").upper()
             quantity = decimal_value(item.get("free")) + decimal_value(item.get("locked"))
             pair = f"{asset}USDT"
-            price = prices_for_cost.get(pair)
+            price = next((
+                prices_for_cost[f"{asset}{quote}"]
+                for quote in sorted(BINANCE_CASH_ASSETS)
+                if f"{asset}{quote}" in prices_for_cost
+            ), None)
             if (
                 not asset
                 or asset in BINANCE_CASH_ASSETS
@@ -2983,37 +3046,39 @@ def _fetch_binance_spot_snapshot(
             ):
                 continue
             try:
-                trade_timestamp = int(time.time() * 1000) + server_time_offset
-                trades_query = _binance_signed_query(
-                    api_secret,
-                    trade_timestamp,
-                    ("symbol", pair),
-                    ("limit", "1000"),
+                pairs = sorted(
+                    (f"{asset}{quote}", quote)
+                    for quote in BINANCE_CASH_ASSETS
+                    if f"{asset}{quote}" in prices_for_cost
                 )
-                trades_response = client.get(
-                    f"https://api.binance.com/api/v3/myTrades?{trades_query}"
-                )
-                trades_payload = _binance_response_payload(trades_response)
+                if not pairs and asset in equity_asset_map:
+                    pairs = [(pair, "USDT")]
+                trades_payload = []
+                for trade_pair, quote_asset in pairs:
+                    trades_payload.extend(_fetch_binance_spot_trades(
+                        client, api_secret, server_time_offset, trade_pair, quote_asset,
+                    ))
                 average_cost = _binance_spot_average_cost(
                     trades_payload,
                     asset,
                     quantity,
                 )
-                if asset in equity_asset_map and isinstance(trades_payload, list) and len(trades_payload) >= 1000:
-                    average_cost = None
                 if average_cost is not None:
                     item["_average_cost"] = str(average_cost)
                     item["_cost_status"] = "automatic"
                     costs_by_asset[asset] = {
-                        "_average_cost": str(average_cost), "_cost_status": "automatic"
+                        "_average_cost": str(average_cost), "_cost_status": "automatic",
+                        "_cost_quantity": str(quantity),
                     }
-                elif trades_payload:
+                else:
+                    costs_by_asset[asset] = {"_cost_status": "estimated"}
                     wallet_warnings.append(
-                        f"{asset} 的成交數量與目前餘額不同，成本需確認一次"
+                        f"{asset} 的完整成交、費用與全部錢包餘額未能核對，成本需確認一次"
                     )
             except (ValueError, httpx.HTTPError):
+                costs_by_asset[asset] = {"_cost_status": "estimated"}
                 wallet_warnings.append(
-                    f"暫時無法讀取 {asset} 的現貨成交紀錄，成本維持原值"
+                    f"暫時無法完整讀取 {asset} 的現貨成交紀錄，成本需確認，已保留原值"
                 )
 
         for collection in (account_payload.get("balances", []), funding_balances, wallet_asset_balances or []):
@@ -3198,7 +3263,21 @@ def sync_binance_account(
             continue
         positions_twd += position_value_twd
         synced_average_cost = decimal_value(item.get("_average_cost"))
-        synced_cost_status = str(item.get("_cost_status") or "estimated")
+        cost_quantity = decimal_value(item.get("_cost_quantity"))
+        cost_quantity_tolerance = max(Decimal("0.00000001"), quantity * Decimal("0.0001"))
+        verified_cost = (
+            synced_average_cost > 0
+            and item.get("_cost_status") == "automatic"
+            and cost_quantity > 0
+            and abs(cost_quantity - quantity) <= cost_quantity_tolerance
+        )
+        if synced_average_cost > 0 and not verified_cost:
+            warnings.append(f"{asset} 的成本涵蓋數量與全部錢包餘額不符，已保留原成本")
+        previous_quantity = decimal_value(position.quantity) if position else ZERO
+        previous_cost_status = (
+            _get_setting_value(db, _position_cost_setting_key(position.id))
+            if position else ""
+        )
         if not position:
             position = Position(
                 account_id=account.id,
@@ -3206,12 +3285,12 @@ def sync_binance_account(
                 symbol=symbol,
                 name=f"{asset}（合約錢包）" if is_futures_wallet_asset else asset,
                 quantity=quantity,
-                average_cost=synced_average_cost or price,
+                average_cost=synced_average_cost if verified_cost else price,
                 currency="USD",
             )
             db.add(position)
             db.flush()
-            set_position_cost_status(db, position, synced_cost_status)
+            set_position_cost_status(db, position, "automatic" if verified_cost else "estimated")
         else:
             position.quantity = quantity
             if is_futures_wallet_asset:
@@ -3221,11 +3300,20 @@ def sync_binance_account(
             position.currency = "USD"
             position.manual_price = None
             position.archived = False
-            if synced_average_cost > 0:
+            if verified_cost:
                 position.average_cost = synced_average_cost
                 set_position_cost_status(db, position, "automatic")
             elif decimal_value(position.average_cost) <= 0:
                 position.average_cost = price
+                set_position_cost_status(db, position, "estimated")
+            elif previous_cost_status != "confirmed" and (
+                item.get("_cost_status") == "estimated"
+                or synced_average_cost > 0
+                or previous_quantity != quantity
+            ):
+                # Retain the numeric basis until complete history is available,
+                # but do not keep calling an unverified old basis automatic.
+                set_position_cost_status(db, position, "estimated")
         db.flush()
         seen_position_ids.add(position.id)
         _upsert_price(db, "CRYPTO", symbol, date.today(), price, "USD", "Binance")
