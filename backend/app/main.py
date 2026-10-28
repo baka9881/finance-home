@@ -116,6 +116,7 @@ from .services import (
     refresh_fx_rates,
     refresh_market_prices,
     recurring_expense_signature,
+    recurring_ignore_signature,
     repair_cross_source_card_duplicates,
     repair_linked_transfer_kinds,
     reset_binance_stock_cost_basis,
@@ -2420,13 +2421,27 @@ def create_recurring_expense(payload: RecurringExpenseCreate, db: DB):
     if payload.owner not in {"me", "partner", "shared"}:
         raise HTTPException(422, "固定花費所有人必須是 me、partner 或 shared")
     validate_recurring_expense_links(db, payload.account_id, payload.category_id)
+    candidates = db.scalars(select(RecurringExpense).where(
+        RecurringExpense.account_id == payload.account_id,
+        RecurringExpense.owner == payload.owner,
+    )).all()
+    requested_name = payload.match_name or payload.name
+    if payload.account_id is not None:
+        for item in candidates:
+            saved_name = item.match_name or item.name
+            if (
+                recurring_expense_signature(requested_name)
+                and recurring_expense_signature(requested_name) == recurring_expense_signature(saved_name)
+                and (payload.match_name is None or requested_name.strip().casefold() != saved_name.strip().casefold())
+                and item.amount == payload.amount
+                and (item.due_day is None or payload.due_day is None or item.due_day == payload.due_day)
+            ):
+                raise HTTPException(409, "這個帳戶已有相同的固定花費，請編輯原有項目")
     if payload.match_name:
         # Confirming or renaming the same detected merchant must not double count it.
-        signature = recurring_expense_signature(payload.match_name)
-        existing = next((item for item in db.scalars(select(RecurringExpense).where(
-            RecurringExpense.account_id == payload.account_id,
-            RecurringExpense.owner == payload.owner,
-        )).all() if recurring_expense_signature(item.match_name or item.name) == signature), None)
+        existing = next((item for item in candidates if
+            (item.match_name or item.name).strip().casefold() == payload.match_name.strip().casefold()
+        ), None)
         if existing:
             for key, value in payload.model_dump().items():
                 setattr(existing, key, value)
@@ -2492,15 +2507,12 @@ def ignore_detected_recurring_expense(
 ):
     account = require_account(db, payload.account_id)
     display_name = payload.name.strip()
-    normalized_name = recurring_expense_signature(display_name)
+    normalized_name = recurring_ignore_signature(display_name)
     if not normalized_name:
         raise HTTPException(422, "固定花費名稱不能為空")
-    existing = db.scalar(
-        select(IgnoredRecurringExpense).where(
-            IgnoredRecurringExpense.account_id == account.id,
-            IgnoredRecurringExpense.normalized_name == normalized_name,
-        )
-    )
+    existing = next((item for item in db.scalars(
+        select(IgnoredRecurringExpense).where(IgnoredRecurringExpense.account_id == account.id)
+    ).all() if recurring_ignore_signature(item.normalized_name) == normalized_name), None)
     if existing:
         return {"ok": True, "id": existing.id}
     row = IgnoredRecurringExpense(

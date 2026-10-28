@@ -768,6 +768,39 @@ def _recurring_display_name(description: str) -> str:
 
 
 def recurring_expense_signature(description: str) -> str:
+    normalized = _recurring_display_name(description).casefold()
+    compact = "".join(char for char in normalized if char.isalnum() or char == "+")
+    # Explicit issuer descriptors only: other OpenAI and YouTube products can
+    # be separate subscriptions, so a substring match would merge real bills.
+    if compact in {"openaichatgpt", "openaichatgptsubscr", "openaichatgptsubscription"}:
+        return "openaichatgptsubscription"
+    if compact in {"youtubepremium", "googleyoutubepremium"}:
+        return "youtubepremium"
+    return normalized
+
+
+def recurring_expense_matches(description: str, saved_name: str, account_id: int | None) -> bool:
+    """Allow known billing aliases only when a specific account is selected."""
+    if _recurring_display_name(description).casefold() == _recurring_display_name(saved_name).casefold():
+        return True
+    return account_id is not None and recurring_expense_signature(description) == recurring_expense_signature(saved_name)
+
+
+def _recurring_amounts_compatible(first: Any, second: Any) -> bool:
+    first_amount, second_amount = decimal_value(first), decimal_value(second)
+    return first_amount > 0 and second_amount > 0 and abs(first_amount - second_amount) <= max(first_amount, second_amount) * Decimal("0.1")
+
+
+def _known_recurring_alias(description: str) -> bool:
+    return recurring_expense_signature(description) in {"openaichatgptsubscription", "youtubepremium"}
+
+
+def recurring_ignore_signature(description: str) -> str:
+    # Legacy ignored values were saved as the literal case-folded description.
+    # Expand only aliases we can identify confidently; punctuation in other
+    # merchant names can carry meaning.
+    if _known_recurring_alias(description):
+        return recurring_expense_signature(description)
     return _recurring_display_name(description).casefold()
 
 
@@ -850,14 +883,14 @@ def _recurring_detection_signature(description: str) -> str:
     normalized = recurring_expense_signature(description)
     normalized = re.sub(r"(?:網路購票?|網購)$", "", normalized)
     normalized = re.sub(r"\d{4,}", "", normalized)
-    return re.sub(r"[^0-9a-z\u4e00-\u9fff]+", "", normalized)
+    return re.sub(r"[^0-9a-z+\u4e00-\u9fff]+", "", normalized)
 
 
 def _recurring_keyword_signature(value: str) -> str:
     return re.sub(
         r"[^0-9a-z\u4e00-\u9fff]+",
         "",
-        recurring_expense_signature(value),
+        _recurring_display_name(value).casefold(),
     )
 
 
@@ -889,7 +922,7 @@ def _recurring_dates_are_consistent(
 def _is_detected_recurring_group(group: dict[str, Any]) -> bool:
     monthly = group["months"]
     category_name = max(group["categories"], key=group["categories"].get)
-    normalized_name = _recurring_detection_signature(group["name"])
+    normalized_name = _recurring_keyword_signature(group["name"])
     known_subscription_signal = (
         group["categories"].get("訂閱", 0) > 0
         or any(
@@ -999,9 +1032,44 @@ def calculate_spending_analysis(
     recurring_rows = [
         row for row in db.scalars(recurring_query).all() if row.id not in linked_ids
     ]
+    custom_query = select(RecurringExpense)
+    if owner != "all":
+        custom_query = custom_query.where(RecurringExpense.owner == owner)
+    custom_rows = db.scalars(custom_query.order_by(RecurringExpense.id)).all()
+
+    def matching_candidates(name: str, account_id: int) -> list[RecurringExpense]:
+        return [row for row in custom_rows if row.active
+            and (row.account_id is None or row.account_id == account_id)
+            and recurring_expense_matches(name, row.match_name or row.name, row.account_id)]
+
+    def matching_definition(name: str, account_id: int, amount: Any) -> RecurringExpense | None:
+        candidates = matching_candidates(name, account_id)
+        if len(candidates) == 1:
+            return candidates[0]
+        compatible = [row for row in candidates if _recurring_amounts_compatible(amount, row.amount)]
+        if not compatible:
+            return None
+        distances = [(abs(decimal_value(amount) - decimal_value(row.amount)), row) for row in compatible]
+        shortest = min(distance for distance, _ in distances)
+        closest = [row for distance, row in distances if distance == shortest]
+        return closest[0] if len(closest) == 1 else None
+
+    def transaction_is_covered(transaction: Transaction) -> bool:
+        candidates = matching_candidates(transaction.description, transaction.account_id)
+        amount = abs(decimal_value(transaction.base_amount))
+        if len(candidates) == 1 or any(_recurring_amounts_compatible(amount, row.amount) for row in candidates):
+            return True
+        return any(not row.active
+            and (row.account_id is None or row.account_id == transaction.account_id)
+            and recurring_expense_matches(transaction.description, row.match_name or row.name, row.account_id)
+            for row in custom_rows)
 
     groups: dict[tuple[int, str], dict[str, Any]] = {}
     for row in recurring_rows:
+        # Suppress only transactions represented by saved definitions before
+        # aggregation, so multiple plans do not produce an extra combined row.
+        if transaction_is_covered(row):
+            continue
         display_name = _recurring_display_name(row.description)
         if not display_name:
             continue
@@ -1075,44 +1143,23 @@ def calculate_spending_analysis(
             }
         )
 
-    custom_query = select(RecurringExpense)
-    if owner != "all":
-        custom_query = custom_query.where(RecurringExpense.owner == owner)
-    custom_rows = db.scalars(custom_query.order_by(RecurringExpense.id)).all()
-
     ignored_keys = {
-        (row.account_id, row.normalized_name)
+        (row.account_id, recurring_ignore_signature(row.normalized_name))
         for row in db.scalars(select(IgnoredRecurringExpense)).all()
     }
     recurring_expenses = [
         item
         for item in recurring_expenses
-        if (item.get("account_id"), recurring_expense_signature(item["name"]))
+        if (item.get("account_id"), recurring_ignore_signature(item["name"]))
         not in ignored_keys
     ]
 
-    custom_keys = {
-        (row.account_id, recurring_expense_signature(row.match_name or row.name))
-        for row in custom_rows
-    }
-    recurring_expenses = [
-        item
-        for item in recurring_expenses
-        if (item.get("account_id"), recurring_expense_signature(item["name"]))
-        not in custom_keys
-        and (None, recurring_expense_signature(item["name"]))
-        not in custom_keys
-    ]
-
-    for row in custom_rows:
-        if not row.active:
-            continue
-        normalized_name = recurring_expense_signature(row.match_name or row.name)
+    for row in (r for r in custom_rows if r.active):
         matching_rows = [
             transaction
             for transaction in month_rows
-            if (row.account_id is None or transaction.account_id == row.account_id)
-            and recurring_expense_signature(transaction.description) == normalized_name
+            if matching_definition(transaction.description, transaction.account_id,
+                                   abs(decimal_value(transaction.base_amount))) is row
         ]
         current_amount = sum(
             (abs(decimal_value(transaction.base_amount)) for transaction in matching_rows),
