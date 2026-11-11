@@ -606,15 +606,38 @@ def automation_status(db: DB):
 
 
 @app.post(AUTOMATION_SYNC_PATH, status_code=202)
-def schedule_automatic_sync(request: Request, background_tasks: BackgroundTasks):
+def schedule_automatic_sync(request: Request, background_tasks: BackgroundTasks, db: DB):
     expected_token = _automation_token()
     supplied_token = request.headers.get("X-Automation-Token", "").strip()
     if not expected_token:
         raise HTTPException(503, "伺服器尚未設定自動更新密鑰")
     if not supplied_token or not secrets.compare_digest(supplied_token, expected_token):
         raise HTTPException(401, "自動更新驗證失敗")
+    request_id = request.headers.get("X-Automation-Request-ID", "")
+    if request_id:
+        if len(request_id) > 128 or not request_id.isascii() or not all(
+            char.isalnum() or char in "._:-" for char in request_id
+        ):
+            raise HTTPException(400, "自動更新請求識別碼格式錯誤")
+        request_key = "automation:request:" + hashlib.sha256(request_id.encode()).hexdigest()
+        if db.get(AppSetting, request_key):
+            return {"accepted": False, "status": "already_accepted"}
     if _automation_lock.locked():
         return {"accepted": False, "status": "already_running"}
+    if request_id:
+        # Persist acceptance before replying. A lost HTTP response, a worker
+        # retry, or an overlapping deploy must not start this scheduled run twice.
+        db.add(AppSetting(
+            key=request_key,
+            value=datetime.utcnow().isoformat(timespec="seconds"),
+        ))
+        try:
+            db.commit()
+        except IntegrityError:
+            db.rollback()
+            if db.get(AppSetting, request_key):
+                return {"accepted": False, "status": "already_accepted"}
+            raise
     background_tasks.add_task(run_automatic_updates)
     return {"accepted": True, "status": "scheduled"}
 

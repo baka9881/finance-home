@@ -109,6 +109,96 @@ def test_automation_sync_uses_separate_token(
     assert status.json()["schedule"] == "hourly"
 
 
+def test_automation_retry_is_deduplicated_after_first_job_completes(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    calls: list[str] = []
+    monkeypatch.setenv("FINANCE_AUTOMATION_TOKEN", "test-automation-token")
+    monkeypatch.setattr(main_module, "run_automatic_updates", lambda: calls.append("started"))
+    headers = {
+        "X-Automation-Token": "test-automation-token",
+        "X-Automation-Request-ID": "2026-10-08T10:07:00.000Z",
+    }
+
+    first = client.post("/api/automation/sync", headers=headers)
+    assert first.status_code == 202
+    assert first.json() == {"accepted": True, "status": "scheduled"}
+    assert calls == ["started"]
+
+    retried = client.post("/api/automation/sync", headers=headers)
+    assert retried.status_code == 202
+    assert retried.json() == {"accepted": False, "status": "already_accepted"}
+    assert calls == ["started"]
+
+    next_hour = client.post("/api/automation/sync", headers={
+        **headers, "X-Automation-Request-ID": "2026-10-08T11:07:00.000Z",
+    })
+    assert next_hour.status_code == 202
+    assert next_hour.json()["accepted"] is True
+    assert calls == ["started", "started"]
+
+
+def test_unauthorized_automation_request_cannot_claim_run(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    calls: list[str] = []
+    monkeypatch.setenv("FINANCE_AUTOMATION_TOKEN", "test-automation-token")
+    monkeypatch.setattr(main_module, "run_automatic_updates", lambda: calls.append("started"))
+    request_id = "2026-10-08T10:07:00.000Z"
+    denied = client.post("/api/automation/sync", headers={"X-Automation-Request-ID": request_id})
+    assert denied.status_code == 401
+    assert calls == []
+    accepted = client.post("/api/automation/sync", headers={
+        "X-Automation-Token": "test-automation-token", "X-Automation-Request-ID": request_id,
+    })
+    assert accepted.status_code == 202
+    assert accepted.json()["accepted"] is True
+    assert calls == ["started"]
+
+
+@pytest.mark.parametrize("request_id", ["x" * 129, "bad id", "bad/id"])
+def test_automation_request_rejects_invalid_run_ids(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch, request_id: str
+):
+    monkeypatch.setenv("FINANCE_AUTOMATION_TOKEN", "test-automation-token")
+    calls: list[str] = []
+    monkeypatch.setattr(main_module, "run_automatic_updates", lambda: calls.append("started"))
+    rejected = client.post("/api/automation/sync", headers={
+        "X-Automation-Token": "test-automation-token", "X-Automation-Request-ID": request_id,
+    })
+    assert rejected.status_code == 400
+    assert calls == []
+
+
+def test_automation_deduplication_survives_database_unique_claim_race(
+    client: TestClient, monkeypatch: pytest.MonkeyPatch
+):
+    monkeypatch.setenv("FINANCE_AUTOMATION_TOKEN", "test-automation-token")
+    calls: list[str] = []
+    monkeypatch.setattr(main_module, "run_automatic_updates", lambda: calls.append("started"))
+    headers = {
+        "X-Automation-Token": "test-automation-token", "X-Automation-Request-ID": "run-race",
+    }
+    assert client.post("/api/automation/sync", headers=headers).json()["accepted"] is True
+
+    # Simulate another process committing the claim after this process's initial read.
+    original_get = Session.get
+    missed_initial_read = False
+
+    def miss_first_claim_read(db, entity, ident, *args, **kwargs):
+        nonlocal missed_initial_read
+        if entity is main_module.AppSetting and str(ident).startswith("automation:request:") and not missed_initial_read:
+            missed_initial_read = True
+            return None
+        return original_get(db, entity, ident, *args, **kwargs)
+
+    monkeypatch.setattr(Session, "get", miss_first_claim_read)
+    retry = client.post("/api/automation/sync", headers=headers)
+    assert retry.status_code == 202
+    assert retry.json() == {"accepted": False, "status": "already_accepted"}
+    assert calls == ["started"]
+
+
 def test_account_balance_and_dashboard(client: TestClient):
     create_account(client, "薪轉帳戶")
     create_account(client, "信用卡", "liability")
