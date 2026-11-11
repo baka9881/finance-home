@@ -106,6 +106,7 @@ export default function AnalysisPage() {
   const client = useQueryClient();
   const [ownerFilter] = useOwnerFilter();
   const [selectedMonth, setSelectedMonth] = useState(taipeiMonthInputValue);
+  const [spendingTooltipHost, setSpendingTooltipHost] = useState<HTMLDivElement | null>(null);
   const [recurringOpen, setRecurringOpen] = useState(false);
   const [ignoredRecurringOpen, setIgnoredRecurringOpen] = useState(false);
   const [editingRecurringId, setEditingRecurringId] = useState<number | null>(null);
@@ -355,31 +356,43 @@ export default function AnalysisPage() {
               </div>
             ) : categoryExpenses.length ? (
               <div className="mt-6 grid gap-7 lg:grid-cols-[320px_1fr] lg:items-center">
-                <div className="relative mx-auto h-[250px] w-full max-w-[320px] [&_*]:outline-none">
-                  <ResponsiveContainer width="100%" height="100%">
-                    <PieChart accessibilityLayer={false}>
-                      <Pie
-                        data={categoryExpenses}
-                        dataKey="value"
-                        nameKey="name"
-                        cx="50%"
-                        cy="50%"
-                        innerRadius={70}
-                        outerRadius={105}
-                        paddingAngle={2}
-                        stroke="transparent"
-                      >
-                        {categoryExpenses.map((item) => (
-                          <Cell key={item.name} fill={item.color} />
-                        ))}
-                      </Pie>
-                      <Tooltip formatter={(value) => money(Number(value))} />
-                    </PieChart>
-                  </ResponsiveContainer>
-                  <div className="pointer-events-none absolute inset-0 grid place-content-center text-center">
-                    <p className="text-xs text-slate-400">總消費</p>
-                    <p className="mt-1 text-xl font-bold text-slate-800">{money(totalExpense)}</p>
+                <div className="mx-auto w-full max-w-[320px] [&_*]:outline-none">
+                  <div className="relative h-[250px]">
+                    <ResponsiveContainer width="100%" height="100%">
+                      <PieChart accessibilityLayer={false}>
+                        <Pie
+                          data={categoryExpenses}
+                          dataKey="value"
+                          nameKey="name"
+                          cx="50%"
+                          cy="50%"
+                          innerRadius={70}
+                          outerRadius={105}
+                          paddingAngle={2}
+                          stroke="transparent"
+                        >
+                          {categoryExpenses.map((item) => (
+                            <Cell key={item.name} fill={item.color} />
+                          ))}
+                        </Pie>
+                        {spendingTooltipHost && (
+                          <Tooltip
+                            portal={spendingTooltipHost}
+                            isAnimationActive={false}
+                            wrapperStyle={{ width: "100%", whiteSpace: "normal", pointerEvents: "none" }}
+                            contentStyle={{ borderRadius: 12, borderColor: "#e2e8f0", backgroundColor: "#f8fafc", whiteSpace: "normal", overflowWrap: "anywhere" }}
+                            itemStyle={{ overflowWrap: "anywhere" }}
+                            formatter={(value) => money(Number(value))}
+                          />
+                        )}
+                      </PieChart>
+                    </ResponsiveContainer>
+                    <div className="pointer-events-none absolute inset-0 grid place-content-center text-center">
+                      <p className="text-xs text-slate-400">總消費</p>
+                      <p className="mt-1 text-xl font-bold text-slate-800">{money(totalExpense)}</p>
+                    </div>
                   </div>
+                  <div ref={setSpendingTooltipHost} className="relative mt-2 min-h-16" />
                 </div>
 
                 <div className="space-y-4">

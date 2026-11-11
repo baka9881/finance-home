@@ -53,8 +53,9 @@ const secondaryNavigation = [
 const globalOwnerPaths = new Set(["/", "/accounts", "/transactions", "/investments", "/analysis"]);
 const PROFILE_AVATAR_STORAGE_KEY = "finance.profile-avatar";
 const AUTH_CHECK_SLOW_MS = 10_000;
-const AUTH_CHECK_TIMEOUT_MS = 75_000;
-const AUTH_CHECK_RETRY_DELAYS_MS = [2_000, 4_000];
+const AUTH_CHECK_TIMEOUT_MS = 90_000;
+const AUTH_CHECK_RETRY_DELAYS_MS = [2_000, 4_000, 8_000, 15_000];
+const AUTH_RECOVERY_INTERVAL_MS = 15_000;
 
 function readProfileAvatar() {
   try {
@@ -441,7 +442,7 @@ function LoginScreen() {
 function AuthCheckingScreen({ slow = false }: { slow?: boolean }) {
   return (
     <div className="grid min-h-screen place-items-center bg-canvas px-4">
-      <div className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm text-slate-600 shadow-card">
+      <div role="status" aria-live="polite" className="flex items-center gap-3 rounded-2xl border border-slate-200 bg-white px-5 py-4 text-sm text-slate-600 shadow-card">
         <RefreshCw className="animate-spin text-forest" size={18} />
         {slow ? "雲端連線較慢，正在繼續確認…" : "正在確認登入狀態…"}
       </div>
@@ -460,7 +461,7 @@ function AuthUnavailableScreen({ configurationError = false }: { configurationEr
         <p className="mt-2 text-sm leading-6 text-slate-500">
           {configurationError
             ? "為了保護財務資料，系統已停止顯示內容。請完成雲端前後端的登入設定後再試。"
-            : "目前無法安全確認工作階段，因此暫停顯示財務資料。連線恢復後可重新檢查。"}
+            : "目前尚未連上雲端，系統會自動重新檢查。恢復連線後將自動繼續。"}
         </p>
         <Button className="mt-5" onClick={() => window.dispatchEvent(new Event("finance:auth-changed"))}>
           <RefreshCw size={16} /> 重新檢查
@@ -688,6 +689,11 @@ export default function App() {
         return;
       }
 
+      if (navigator.onLine === false) {
+        setAuthState("unavailable");
+        return;
+      }
+
       let stopped = false;
       let controller: AbortController | null = null;
       const timers = new Set<number>();
@@ -737,10 +743,11 @@ export default function App() {
               setAuthState("anonymous");
               return;
             }
-            const transient = cause instanceof TypeError
-              || (cause instanceof ApiError && [502, 503, 504].includes(cause.status));
-            if (transient && retries < AUTH_CHECK_RETRY_DELAYS_MS.length) {
-              schedule(() => check(retries + 1), AUTH_CHECK_RETRY_DELAYS_MS[retries]);
+            const transient = cause instanceof TypeError || cause instanceof SyntaxError
+              || (cause instanceof ApiError && [408, 500, 502, 503, 504].includes(cause.status));
+            if (transient) {
+              const retryIndex = Math.min(retries, AUTH_CHECK_RETRY_DELAYS_MS.length - 1);
+              schedule(() => check(retries + 1), AUTH_CHECK_RETRY_DELAYS_MS[retryIndex]);
               return;
             }
             stop();
@@ -757,6 +764,29 @@ export default function App() {
       window.removeEventListener("finance:auth-changed", syncAuth);
     };
   }, [queryClient]);
+
+  useEffect(() => {
+    if (authState !== "unavailable") return;
+    let lastRecoveryAt = Number.NEGATIVE_INFINITY;
+    const retryWhenVisible = () => {
+      const now = performance.now();
+      if (now - lastRecoveryAt < 1_000) return;
+      if (navigator.onLine !== false && document.visibilityState !== "hidden") {
+        lastRecoveryAt = now;
+        window.dispatchEvent(new Event("finance:auth-changed"));
+      }
+    };
+    const timer = window.setInterval(retryWhenVisible, AUTH_RECOVERY_INTERVAL_MS);
+    window.addEventListener("online", retryWhenVisible);
+    window.addEventListener("focus", retryWhenVisible);
+    document.addEventListener("visibilitychange", retryWhenVisible);
+    return () => {
+      window.clearInterval(timer);
+      window.removeEventListener("online", retryWhenVisible);
+      window.removeEventListener("focus", retryWhenVisible);
+      document.removeEventListener("visibilitychange", retryWhenVisible);
+    };
+  }, [authState]);
 
   useEffect(() => {
     if (authState !== "authenticated" || !authStatus?.session_expires_at) return;

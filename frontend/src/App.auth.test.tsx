@@ -93,7 +93,7 @@ it.each([
   expect(checks).toBe(1);
 
   await act(async () => {
-    await vi.advanceTimersByTimeAsync(75_000);
+    await vi.advanceTimersByTimeAsync(90_000);
   });
   expect(screen.getByRole("heading", { name: "暫時無法確認登入狀態" })).toBeTruthy();
   expect(screen.getByRole("button", { name: "重新檢查" })).toBeTruthy();
@@ -144,7 +144,7 @@ it("stops a stalled request at the total deadline, keeps the token, and ignores 
   });
   vi.useFakeTimers();
   showApp();
-  await advance(74_999);
+  await advance(89_999);
   expect(signal?.aborted).toBe(false);
   expect(screen.queryByRole("heading", { name: "暫時無法確認登入狀態" })).toBeNull();
   await advance(1);
@@ -188,7 +188,7 @@ it.each([
   expect(localStorage.getItem("finance:authToken")).toBe("saved-token");
 });
 
-it("stops after two transient retries without treating a platform 503 as a configuration error", async () => {
+it("keeps retrying a platform 503 until the total deadline without treating it as a configuration error", async () => {
   localStorage.setItem("finance:authToken", "saved-token");
   let checks = 0;
   vi.mocked(api).mockImplementation(async (path) => {
@@ -202,11 +202,13 @@ it("stops after two transient retries without treating a platform 503 as a confi
   showApp();
   await advance(6_000);
   expect(checks).toBe(3);
+  expect(screen.queryByRole("heading", { name: "暫時無法確認登入狀態" })).toBeNull();
+  await advance(84_000);
+  // Retries back off at 2, 4, 8 and then every 15 seconds until the 90 second deadline.
+  expect(checks).toBe(9);
   expect(screen.getByRole("heading", { name: "暫時無法確認登入狀態" })).toBeTruthy();
   expect(screen.queryByRole("heading", { name: "登入保護設定不一致" })).toBeNull();
   expect(localStorage.getItem("finance:authToken")).toBe("saved-token");
-  await advance(75_000);
-  expect(checks).toBe(3);
 });
 
 it("uses the original total deadline when a slow attempt is retried", async () => {
@@ -218,7 +220,7 @@ it("uses the original total deadline when a slow attempt is retried", async () =
       checks += 1;
       if (checks === 1) {
         return new Promise((_resolve, reject) => {
-          window.setTimeout(() => reject(new ApiError(502, "Server starting")), 70_000);
+          window.setTimeout(() => reject(new ApiError(502, "Server starting")), 85_000);
         }) as never;
       }
       retrySignal = options?.signal as AbortSignal;
@@ -228,7 +230,7 @@ it("uses the original total deadline when a slow attempt is retried", async () =
   });
   vi.useFakeTimers();
   showApp();
-  await advance(72_000);
+  await advance(87_000);
   expect(checks).toBe(2);
   expect(retrySignal?.aborted).toBe(false);
   await advance(3_000);
@@ -268,8 +270,9 @@ it("stops checking safely when the status response is malformed", async () => {
   vi.mocked(api).mockResolvedValue(null as never);
   vi.useFakeTimers();
   showApp();
-  await advance(6_000);
-  expect(screen.getByRole("heading", { name: "暫時無法確認登入狀態" })).toBeTruthy();
+  await advance(0);
+  // A response without the expected shape is blocked as a configuration problem instead of retried.
+  expect(screen.getByRole("heading", { name: "登入保護設定不一致" })).toBeTruthy();
   expect(screen.queryByText("登入後總覽")).toBeNull();
   expect(vi.getTimerCount()).toBe(0);
   expect(localStorage.getItem("finance:authToken")).toBe("saved-token");
